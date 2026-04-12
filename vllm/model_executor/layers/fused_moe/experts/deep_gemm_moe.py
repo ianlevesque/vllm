@@ -44,7 +44,6 @@ from vllm.utils.deep_gemm import (
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
 )
-from vllm.utils.import_utils import has_deep_gemm
 
 logger = init_logger(__name__)
 
@@ -62,7 +61,7 @@ def _valid_deep_gemm(
     gemm kernel.  All of M, N, K and the quantization block_shape must be
     aligned by `dg.get_m_alignment_for_contiguous_layout()`.
     """
-    if not has_deep_gemm():
+    if not is_deep_gemm_supported():
         logger.debug_once("DeepGemm disabled: deep_gemm not available.")
         return False
 
