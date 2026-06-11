@@ -159,7 +159,9 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         self._peer: str | None = None
         self._ring_base = 0
         self._ring_tokens = 0
-        self._aux_row_bytes = self.aux_width * self.staging.element_size()
+        # NOTE: derived from the dtype, not from `staging` — staging is only
+        # allocated on TP rank 0 and this runs on every rank.
+        self._aux_row_bytes = self.aux_width * self.dtype.itemsize
         self._row_off = 0
         self._step_id = 0
         self._pending_finished: set[str] = set()
