@@ -25,6 +25,11 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
 
 class BaseSpeculator(ABC):
+    def update_finished(self, finished_req_ids: set[str]) -> None:
+        """Notification of finished request ids (no-op by default).
+
+        Remote speculators use this to free per-request drafter-side state."""
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass

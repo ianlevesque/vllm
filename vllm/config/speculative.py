@@ -112,6 +112,16 @@ class SpeculativeConfig:
     """Attention backend to use for the draft model. When `None`, the backend is
     automatically selected. Useful when the drafter requires a different attention
     backend (e.g. DFlash needs a non-causal-capable backend like FLASH_ATTN)."""
+    draft_service_url: str | None = None
+    """Bootstrap address ("host:port") of a remote DFlash drafter service. When
+    set with method="dflash", the draft model is NOT loaded in this process;
+    target aux hidden states are shipped to the service over NIXL each step
+    and draft token ids are written back. The draft model repo is still
+    required for its config (aux layer ids, mask token, block size)."""
+    draft_service_timeout_ms: int = Field(default=200, ge=1)
+    """Per-step timeout for the remote drafter service. On timeout the step
+    degrades to zero drafts (output correctness is preserved by rejection
+    sampling; only throughput suffers)."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -1015,6 +1025,19 @@ class SpeculativeConfig:
                 self.draft_parallel_config
             )
 
+        if self.draft_service_url is not None:
+            if self.method != "dflash":
+                raise ValueError(
+                    "draft_service_url (remote drafter) is only supported "
+                    f"with method='dflash', got '{self.method}'."
+                )
+            if self.draft_sample_method != "greedy":
+                raise ValueError(
+                    "The remote DFlash drafter service only supports "
+                    "draft_sample_method='greedy' (token-ids-only wire "
+                    "contract; no draft logits are available remotely)."
+                )
+
         self.verify_equal_vocab_size_if_draft_model()
         return self
 
@@ -1072,6 +1095,9 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_remote_dflash(self) -> bool:
+        return self.method == "dflash" and self.draft_service_url is not None
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

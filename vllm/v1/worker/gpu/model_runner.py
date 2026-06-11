@@ -328,7 +328,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
-            if self.speculator is not None:
+            if isinstance(self.speculator, DraftModelSpeculator):
+                # Remote speculators have no local draft model.
                 prepare_communication_buffer_for_model(self.speculator.model)
 
         # Initialize the components that require the model.
@@ -1425,6 +1426,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            self.speculator.update_finished(finished_req_ids)
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
