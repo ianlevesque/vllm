@@ -411,11 +411,22 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         vllm_cfg = get_current_vllm_config_or_none()
         if vllm_cfg is not None:
             scheduler_cfg = vllm_cfg.scheduler_config
-            # max_num_seqs * (1 + num_spec_tokens) covers spec verify.
+            # Mirror _init_reorder_batch_threshold(supports_spec_as_decode=
+            # True) in v1/attention/backend.py: the MQA path serves uniform
+            # batches up to query_len = 1 + (2 if parallel_drafting else 1)
+            # * num_spec_tokens per request (dflash sets parallel_drafting;
+            # the MRV2 kernel warmup drives a uniform (2+num_spec)-per-req
+            # batch at max_num_seqs through this path). Sizing with the bare
+            # 1+num_spec under-allocates and trips the B<=cg_max assert
+            # below at warmup (B=2304 > 2048 observed, k=7, 2026-06-11).
             spec_cfg = vllm_cfg.speculative_config
-            qpr_max = 1 + (spec_cfg.num_speculative_tokens if spec_cfg is not None
-                           and spec_cfg.num_speculative_tokens is not None
-                           else 0)
+            num_spec = (spec_cfg.num_speculative_tokens
+                        if spec_cfg is not None
+                        and spec_cfg.num_speculative_tokens is not None
+                        else 0)
+            spec_mult = 2 if (spec_cfg is not None and getattr(
+                spec_cfg, "parallel_drafting", False)) else 1
+            qpr_max = 1 + spec_mult * num_spec
             self._cg_max_tokens: int = scheduler_cfg.max_num_seqs * qpr_max
             # Do NOT clamp this to max_cudagraph_capture_size: decode batches
             # larger than the capture max still execute EAGERLY through this
