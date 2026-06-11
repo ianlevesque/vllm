@@ -16,6 +16,12 @@ Wire contract (token-ids-only; greedy drafting):
 Failure mode: any timeout/error degrades to zero drafts for the step (the
 rejection sampler guarantees output correctness regardless of draft content);
 a circuit breaker stops calling an unreachable service and retries periodically.
+
+TP>1: aux hidden states are replicated across TP ranks after the final
+all-reduce, so only TP rank 0 holds the NIXL connection, ships its local copy,
+and broadcasts the returned draft ids [num_reqs, k] to the other ranks each
+step (one tiny int64 broadcast). The other ranks allocate nothing but the
+broadcast target.
 """
 
 import pickle
@@ -28,6 +34,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
@@ -66,11 +73,16 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         sc = vllm_config.speculative_config
         assert sc is not None and sc.draft_service_url is not None
 
-        if vllm_config.parallel_config.tensor_parallel_size != 1:
+        if vllm_config.parallel_config.data_parallel_size != 1:
             raise NotImplementedError(
-                "Remote DFlash drafter currently requires tensor_parallel_size"
-                "==1 (per-rank propose would issue duplicate RPCs)."
+                "Remote DFlash drafter does not support data_parallel_size>1 "
+                "yet (each DP replica would need its own drafter service)."
             )
+        # TP>1: rank 0 owns all service I/O; the other ranks only hold the
+        # draft_tokens broadcast target (see module docstring).
+        self.tp_group = get_tp_group()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = self.tp_group.world_size
 
         host, _, port = sc.draft_service_url.rpartition(":")
         self.host = host.removeprefix("tcp://") or "127.0.0.1"
@@ -99,25 +111,36 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         self.supports_mm_inputs = False
         self.draft_logits: torch.Tensor | None = None
 
-        # The drafter service WRITEs draft ids here (NIXL-registered).
+        # The drafter service WRITEs draft ids here (NIXL-registered on rank
+        # 0); ranks >0 receive it via the per-step TP broadcast.
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
             self.num_speculative_steps,
             dtype=torch.int64,
             device=device,
         )
-        # Aux states are staged here before the RDMA WRITE (NIXL-registered).
-        self.staging = torch.zeros(
-            self.max_num_tokens, self.aux_width, dtype=self.dtype, device=device
-        )
-        # Small-int D2H scratch: rows = num_sampled, num_rejected, bonus.
-        self._scratch_gpu = torch.zeros(
-            3, self.max_num_reqs, dtype=torch.int64, device=device
-        )
-        self._scratch_cpu = torch.zeros(
-            3, self.max_num_reqs, dtype=torch.int64, pin_memory=True
-        )
-        self._copy_event = torch.cuda.Event()
+        if self.tp_rank == 0:
+            # Aux states are staged here before the RDMA WRITE
+            # (NIXL-registered).
+            self.staging = torch.zeros(
+                self.max_num_tokens,
+                self.aux_width,
+                dtype=self.dtype,
+                device=device,
+            )
+            # Small-int D2H scratch: rows = num_sampled, num_rejected, bonus.
+            self._scratch_gpu = torch.zeros(
+                3, self.max_num_reqs, dtype=torch.int64, device=device
+            )
+            self._scratch_cpu = torch.zeros(
+                3, self.max_num_reqs, dtype=torch.int64, pin_memory=True
+            )
+            self._copy_event = torch.cuda.Event()
+        else:
+            self.staging = None
+            self._scratch_gpu = None
+            self._scratch_cpu = None
+            self._copy_event = None
 
         # NIXL state (lazy connect — the service may start after the engine).
         self._agent = None
@@ -138,11 +161,14 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         self._steps_failed = 0
         self._rpc_ms_sum = 0.0
 
-        logger.info(
-            "Remote DFlash speculator: service=%s:%d aux_width=%d k=%d "
-            "(draft model is NOT loaded in this process)",
-            self.host, self.port, self.aux_width, self.num_speculative_steps,
-        )
+        if self.tp_rank == 0:
+            logger.info(
+                "Remote DFlash speculator: service=%s:%d aux_width=%d k=%d "
+                "tp_size=%d (draft model is NOT loaded in this process; "
+                "rank 0 transfers, then broadcasts draft ids)",
+                self.host, self.port, self.aux_width,
+                self.num_speculative_steps, self.tp_size,
+            )
 
     # ------------------------------------------------------------------
     # Runner interface stubs (no local draft model / KV / CUDA graphs).
@@ -154,6 +180,8 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         pass
 
     def update_finished(self, finished_req_ids: set[str]) -> None:
+        if self.tp_rank != 0:
+            return
         if finished_req_ids:
             self._pending_finished.update(finished_req_ids)
 
@@ -302,15 +330,44 @@ class RemoteDFlashSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         if dummy_run or is_profile:
-            # Profiling / DP-padding path: no transfer, no service traffic.
+            # Profiling / DP-padding path: no transfer, no service traffic,
+            # no broadcast (every rank takes this branch together).
             return self.draft_tokens[:num_reqs]
 
+        if self.tp_rank == 0:
+            self._propose_rank0(
+                input_batch,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+            )
+        if self.tp_size > 1 and num_reqs > 0:
+            # Ranks >0 wait here while rank 0 round-trips the service; on
+            # any rank-0 failure the broadcast still runs (zeroed drafts).
+            self.tp_group.broadcast(self.draft_tokens[:num_reqs], src=0)
+        return self.draft_tokens[:num_reqs]
+
+    def _propose_rank0(
+        self,
+        input_batch: InputBatch,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+    ) -> None:
+        """Fill ``self.draft_tokens[:num_reqs]`` via the drafter service
+        (zeros on any failure)."""
+        num_reqs = input_batch.num_reqs
         if time.monotonic() < self._breaker_open_until:
             self.draft_tokens[:num_reqs].zero_()
-            return self.draft_tokens[:num_reqs]
+            return
 
         if not self._connect():
-            return self._fail_step(num_reqs)
+            self._fail_step(num_reqs)
+            return
 
         t0 = time.perf_counter()
         num_tokens = input_batch.num_tokens
@@ -367,7 +424,8 @@ class RemoteDFlashSpeculator(BaseSpeculator):
             logger.warning("Remote DFlash step failed: %s", e)
             # Re-queue the finished ids so the service still frees them.
             self._pending_finished.update(finished)
-            return self._fail_step(num_reqs)
+            self._fail_step(num_reqs)
+            return
 
         self._consecutive_failures = 0
         self._steps_ok += 1
@@ -378,4 +436,3 @@ class RemoteDFlashSpeculator(BaseSpeculator):
                 self._steps_ok, self._steps_failed,
                 self._rpc_ms_sum / self._steps_ok,
             )
-        return self.draft_tokens[:num_reqs]
