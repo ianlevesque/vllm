@@ -417,15 +417,16 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                            and spec_cfg.num_speculative_tokens is not None
                            else 0)
             self._cg_max_tokens: int = scheduler_cfg.max_num_seqs * qpr_max
-            # Also honour the actual cudagraph_capture_sizes max if compilation
-            # config is available (the scheduler max can exceed what CG
-            # actually captures, see max_cudagraph_capture_size).
-            try:
-                cg_max = vllm_cfg.compilation_config.max_cudagraph_capture_size
-                if cg_max is not None:
-                    self._cg_max_tokens = min(self._cg_max_tokens, cg_max)
-            except AttributeError:
-                pass
+            # Do NOT clamp this to max_cudagraph_capture_size: decode batches
+            # larger than the capture max still execute EAGERLY through this
+            # same path with these same persistent buffers. With spec decode,
+            # B = num_reqs * (1 + num_spec_tokens) trivially exceeds a trimmed
+            # capture list (e.g. DFlash num_spec=8: 4 concurrent requests ->
+            # B=36 > capture max 32 -> the buffer-overflow assert below killed
+            # the whole engine, observed 2026-06-11 on GB10/SM121). The
+            # capture-size list decides which batch sizes get graphs, NOT the
+            # buffer capacity; sizing the pool at the scheduler maximum costs
+            # only a few MB per buffer set.
             # Used as the tuning-table key (we store the configured max
             # model_len, since actual seq_len varies per-call and the table
             # rounds down to the nearest tuned bucket).
