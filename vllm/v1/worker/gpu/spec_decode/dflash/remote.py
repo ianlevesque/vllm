@@ -94,14 +94,26 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.dtype = vllm_config.model_config.dtype
 
+        self.method = sc.method
         draft_hf = sc.draft_model_config.hf_config
-        dflash_cfg = getattr(draft_hf, "dflash_config", None) or {}
-        target_layer_ids = dflash_cfg.get("target_layer_ids") or []
-        if not target_layer_ids:
-            raise ValueError(
-                "draft model config has no dflash_config.target_layer_ids; "
-                "not a DFlash drafter?"
+        if self.method == "eagle3":
+            eagle_cfg = getattr(draft_hf, "eagle_config", None) or {}
+            target_layer_ids = (
+                eagle_cfg.get("eagle_aux_hidden_state_layer_ids") or []
             )
+            if not target_layer_ids:
+                raise ValueError(
+                    "draft model config has no eagle_config."
+                    "eagle_aux_hidden_state_layer_ids; not an EAGLE3 head?"
+                )
+        else:
+            dflash_cfg = getattr(draft_hf, "dflash_config", None) or {}
+            target_layer_ids = dflash_cfg.get("target_layer_ids") or []
+            if not target_layer_ids:
+                raise ValueError(
+                    "draft model config has no dflash_config.target_layer_ids;"
+                    " not a DFlash drafter?"
+                )
         per_layer_hidden = getattr(
             draft_hf, "target_hidden_size", draft_hf.hidden_size
         )
@@ -401,6 +413,15 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         start = input_batch.num_computed_tokens_np
         prefill = input_batch.is_prefilling_np
 
+        # EAGLE3 pairs position p with token_{p+1} (the EAGLE shift), so the
+        # service needs each request's scheduled token ids, not just the
+        # bonus. ~4 bytes/token of header next to 21-43 KB/token of aux rows.
+        ids_np = None
+        qsl = None
+        if self.method == "eagle3":
+            ids_np = input_batch.input_ids[:num_tokens].cpu().numpy()
+            qsl = input_batch.query_start_loc_np
+
         reqs = [
             {
                 "id": rid,
@@ -410,6 +431,11 @@ class RemoteDFlashSpeculator(BaseSpeculator):
                 "n_samp": int(ns[i]),
                 "bonus": int(bt[i]),
                 "prefill": bool(prefill[i]),
+                **(
+                    {"ids": ids_np[qsl[i]: qsl[i + 1]].tolist()}
+                    if ids_np is not None
+                    else {}
+                ),
             }
             for i, rid in enumerate(input_batch.req_ids)
         ]

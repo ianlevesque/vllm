@@ -1026,10 +1026,10 @@ class SpeculativeConfig:
             )
 
         if self.draft_service_url is not None:
-            if self.method != "dflash":
+            if self.method not in ("dflash", "eagle3"):
                 raise ValueError(
                     "draft_service_url (remote drafter) is only supported "
-                    f"with method='dflash', got '{self.method}'."
+                    f"with method='dflash' or 'eagle3', got '{self.method}'."
                 )
             if self.draft_sample_method != "greedy":
                 raise ValueError(
