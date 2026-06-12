@@ -201,15 +201,21 @@ class RemoteDFlashSpeculator(BaseSpeculator):
     # NIXL plumbing
     # ------------------------------------------------------------------
     def _connect(self) -> bool:
-        if self._agent is not None:
+        if self._peer is not None:
             return True
         try:
             from nixl._api import nixl_agent, nixl_agent_config
 
-            agent = nixl_agent(
-                f"dflash-target-{self.port}", nixl_agent_config(backends=["UCX"])
-            )
-            agent.register_memory([self.draft_tokens, self.staging])
+            if self._agent is None:
+                # Created once; survives reconnects (local registrations
+                # stay valid — only the peer session is replaced).
+                agent = nixl_agent(
+                    f"dflash-target-{self.port}",
+                    nixl_agent_config(backends=["UCX"]),
+                )
+                agent.register_memory([self.draft_tokens, self.staging])
+                self._agent = agent
+            agent = self._agent
 
             conn = socket.create_connection(
                 (self.host, self.port), timeout=_CONNECT_TIMEOUT_S
@@ -246,14 +252,28 @@ class RemoteDFlashSpeculator(BaseSpeculator):
                     f"drafter block supports k={spec['num_spec_tokens']} but "
                     f"num_speculative_tokens={self.num_speculative_steps}"
                 )
-            self._agent = agent
+            self._row_off = 0
             logger.info("Remote DFlash connected: spec=%s ring_tokens=%d",
                         spec, self._ring_tokens)
             return True
         except Exception as e:
             logger.warning("Remote DFlash connect failed: %s", e)
-            self._agent = None
+            self._peer = None
             return False
+
+    def _disconnect(self) -> None:
+        """Drop the peer session (keep the agent + local registrations) so
+        the next attempt re-bootstraps — the path back from a restarted
+        drafter service, and from transient failures (the service's
+        persistent listener re-handshakes in place)."""
+        peer, self._peer = self._peer, None
+        self._ring_tokens = 0
+        self._row_off = 0
+        if self._agent is not None and peer is not None:
+            try:
+                self._agent.remove_remote_agent(peer)
+            except Exception:
+                pass
 
     def _post_step(self, header: dict, num_tokens: int) -> int:
         import msgpack
@@ -309,9 +329,13 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         self._consecutive_failures += 1
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
             self._breaker_open_until = time.monotonic() + _BREAKER_RETRY_S
+            # Drop the session: when the breaker closes, _connect() runs a
+            # fresh TCP bootstrap (the service may have restarted; its
+            # listener is persistent either way).
+            self._disconnect()
             logger.warning(
                 "Remote DFlash circuit breaker OPEN for %.0fs after %d "
-                "failures (degrading to no-spec drafts).",
+                "failures (session dropped; will re-bootstrap).",
                 _BREAKER_RETRY_S, self._consecutive_failures,
             )
         self.draft_tokens[:num_reqs].zero_()
