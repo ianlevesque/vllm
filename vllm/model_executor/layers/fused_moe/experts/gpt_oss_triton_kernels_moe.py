@@ -48,6 +48,14 @@ _MIMO_MXFP8_ACT = os.environ.get("MIMO_MXFP8_ACT", "0") == "1"
 # activations (no mxfp8 downcast) -> tests whether the StridedLayout *weight* path
 # is itself correct, isolating weight-format bugs from activation-scale bugs.
 _MIMO_MXFP8_ACT_QUANT = os.environ.get("MIMO_MXFP8_ACT_QUANT", "1") == "1"
+# ROUND-TRIP mxfp8 activation: quantize acts to microscaled mxfp8 e4m3 (the SGLang
+# recipe's activation format) then upcast back to bf16 and feed the PROVEN swizzled
+# W4A16 path. The activation carries true mxfp8 quantization (same numerics as the
+# native cutlass mxfp8-act path); only the matmul accumulates in bf16 (moot on
+# memory-bound GB10). Sidesteps the matmul_ogs HOPPER-swizzle-vs-microscaled-x
+# layout incompatibility (no StridedLayout, no act_scale). Routes via the fused
+# class but does NOT force StridedLayout (see mxfp4_utils _swizzle_mxfp4 gate).
+_MIMO_MXFP8_ACT_RT = os.environ.get("MIMO_MXFP8_ACT_RT", "0") == "1"
 
 
 def _triton_kernel_moe_supports_current_device() -> bool:
@@ -259,7 +267,10 @@ if has_triton_kernels():
             ScatterIndx,
             matmul_ogs,
         )
-        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+        from triton_kernels.numerics_details.mxfp import (
+            downcast_to_mxfp,
+            upcast_from_mxfp,
+        )
         from triton_kernels.tensor import (
             BIT,
             Bitmatrix,
@@ -508,7 +519,13 @@ def triton_kernel_fused_experts(
     # scheme (we quantize here, not via the quant_config). Off => bf16 act.
     x1 = hidden_states
     w1_prec = quant_config.w1_precision
-    if _MIMO_MXFP8_ACT and _MIMO_MXFP8_ACT_QUANT:
+    if _MIMO_MXFP8_ACT_RT:
+        # ROUND-TRIP: quantize acts to mxfp8 e4m3 (block-32) then upcast to bf16.
+        # The activation now carries true mxfp8 quantization; the proven swizzled
+        # W4A16 matmul consumes it (bf16 accumulate, moot on memory-bound GB10).
+        _q, _s = downcast_to_mxfp(hidden_states.contiguous(), torch.float8_e4m3fn, axis=-1)
+        x1 = upcast_from_mxfp(_q, _s, torch.bfloat16, axis=-1)
+    elif _MIMO_MXFP8_ACT and _MIMO_MXFP8_ACT_QUANT:
         x1q, x1s = downcast_to_mxfp(
             hidden_states.contiguous(), torch.float8_e4m3fn, axis=-1
         )
@@ -536,7 +553,10 @@ def triton_kernel_fused_experts(
 
     x2 = intermediate_cache.view(M * topk, N // 2)
     w2_prec = quant_config.w2_precision
-    if _MIMO_MXFP8_ACT and _MIMO_MXFP8_ACT_QUANT:
+    if _MIMO_MXFP8_ACT_RT:
+        _q2, _s2 = downcast_to_mxfp(x2.contiguous(), torch.float8_e4m3fn, axis=-1)
+        x2 = upcast_from_mxfp(_q2, _s2, torch.bfloat16, axis=-1)
+    elif _MIMO_MXFP8_ACT and _MIMO_MXFP8_ACT_QUANT:
         x2q, x2s = downcast_to_mxfp(x2.contiguous(), torch.float8_e4m3fn, axis=-1)
         x2 = x2q
         w2_prec = dataclasses.replace(
