@@ -70,6 +70,15 @@ logger = init_logger(__name__)
 
 # #17: gate the instanttensor weight-load diagnostic (see load_weights).
 _MIMO_IT_DEBUG = os.environ.get("MIMO_IT_DEBUG", "0") == "1"
+# #17: once-per-process guard so the inference-time qkv/o_proj param fingerprint
+# in MiMoV2Attention.forward (the [IT-FWD] probe) fires exactly once per sampled
+# layer. The load-time [IT-DEBUG] probe proved the DELIVERED tensors are
+# byte-identical instanttensor-vs-auto; [IT-FWD] reads the FINAL post-load /
+# post-reshard params as actually consumed at inference, to decide whether the
+# instanttensor garble is (a) corrupt params at inference -> a reshard/order bug
+# in MiMo's stateful fused-fp8-qkv consumer (vLLM-side fixable) or (b) byte-correct
+# params -> a non-value GPU-state side-effect of the load (InstantTensor C-ext).
+_MIMO_FWD_PROBED: set = set()
 
 # DFlash draft fidelity: the reference extracts HF output_hidden_states, where
 # the entry after the FINAL target layer is the POST-final-norm hidden state
@@ -363,6 +372,37 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # #17 instanttensor diagnostic (MIMO_IT_DEBUG=1): fingerprint the FINAL
+        # qkv/o_proj params AS CONSUMED AT INFERENCE, once per sampled layer.
+        # Compare [IT-FWD] instanttensor-vs-auto: identical => params byte-correct
+        # at inference (garble is a non-param GPU-state side-effect of the IT load);
+        # different => params corrupted post-delivery (MiMo's order-dependent fused
+        # fp8-qkv reshard mis-consumes IT's DLPack tensors -> a vLLM-side fix).
+        if _MIMO_IT_DEBUG and self.layer_id in (0, 3) and self.layer_id not in _MIMO_FWD_PROBED:
+            _MIMO_FWD_PROBED.add(self.layer_id)
+            for _pn, _mod in (("qkv_proj", self.qkv_proj), ("o_proj", self.o_proj)):
+                for _attr in ("weight", "weight_scale_inv", "weight_scale"):
+                    _pt = getattr(_mod, _attr, None)
+                    if _pt is None:
+                        continue
+                    try:
+                        _t = _pt.data
+                        _flat = _t.reshape(-1)
+                        _n = _flat.numel()
+                        _head = [round(x, 3) for x in _flat[:8].to(torch.float32).tolist()]
+                        _tail = [round(x, 3) for x in _flat[-8:].to(torch.float32).tolist()]
+                        _mid = [round(x, 3) for x in _flat[_n // 2 : _n // 2 + 8].to(torch.float32).tolist()]
+                        _stride = max(1, _n // 4096)
+                        _sweep = _flat[::_stride].to(torch.float32)
+                        logger.info(
+                            "[IT-FWD] L%d %s.%s dtype=%s shape=%s contig=%s head8=%s "
+                            "mid8=%s tail8=%s sweepmean=%.6g sweepabsmax=%.6g sweepsum=%.6g",
+                            self.layer_id, _pn, _attr, _t.dtype, tuple(_t.shape),
+                            _t.is_contiguous(), _head, _mid, _tail,
+                            _sweep.mean().item(), _sweep.abs().max().item(), _sweep.sum().item(),
+                        )
+                    except Exception as _e:  # diagnostic must never break inference
+                        logger.info("[IT-FWD] L%d %s.%s STATS-FAILED: %s", self.layer_id, _pn, _attr, _e)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
