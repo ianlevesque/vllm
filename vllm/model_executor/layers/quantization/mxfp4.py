@@ -531,25 +531,43 @@ class MiMoV2Mxfp4MoEMethod(GptOssMxfp4MoEMethod):
         # Off sm12x, keep the original TRT-LLM modular expert path.
         self._use_sm12x_triton_moe = current_platform.is_device_capability_family(120)
         if self._use_sm12x_triton_moe:
+            import os
+
             from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
                 UnfusedOAITritonExperts,
+                _MiMoSm12xFusedOAITritonExperts,
             )
 
-            # MiMo-local subclass of UnfusedOAITritonExperts that widens the
-            # device gate to SM12x (the only change). backend_to_kernel_cls is
-            # not used directly because the stock device gate would reject the
-            # class on SM120 before selection.
-            class _MiMoUnfusedOAITritonExperts(
-                _MiMoSm12xUnfusedOAITritonExperts, UnfusedOAITritonExperts
-            ):
-                pass
+            if os.environ.get("MIMO_FUSED_MOE", "0") == "1":
+                # FUSED OAI TRITON path (#19 perf): folds silu_and_mul into matmul1
+                # via the beta=0 fused swiglu epilogue (no "+1"; alpha=1, no clamp).
+                # Faster than the unfused path (no separate activation kernel +
+                # intermediate r/w). Same _swizzle_mxfp4 / mxfp4_w4a16 weight prep,
+                # so process_weights_after_loading is reused verbatim. Gated behind
+                # the env toggle so the SAME image A/Bs vs the proven unfused path
+                # and falls back instantly if it regresses.
+                self.mxfp4_backend = Mxfp4MoeBackend.TRITON
+                self.experts_cls = _MiMoSm12xFusedOAITritonExperts
+                logger.info_once(
+                    "MiMo MXFP4 MoE: FUSED OAI TRITON path (beta=0 swiglu, "
+                    "Mxfp4MoeBackend.TRITON) on SM12x [MIMO_FUSED_MOE=1]."
+                )
+            else:
+                # MiMo-local subclass of UnfusedOAITritonExperts that widens the
+                # device gate to SM12x (the only change). backend_to_kernel_cls is
+                # not used directly because the stock device gate would reject the
+                # class on SM120 before selection.
+                class _MiMoUnfusedOAITritonExperts(
+                    _MiMoSm12xUnfusedOAITritonExperts, UnfusedOAITritonExperts
+                ):
+                    pass
 
-            self.mxfp4_backend = Mxfp4MoeBackend.TRITON_UNFUSED
-            self.experts_cls = _MiMoUnfusedOAITritonExperts
-            logger.info_once(
-                "MiMo MXFP4 MoE: routing to the unfused OAI TRITON W4A16 path "
-                "(Mxfp4MoeBackend.TRITON_UNFUSED, bf16 activations) on SM12x."
-            )
+                self.mxfp4_backend = Mxfp4MoeBackend.TRITON_UNFUSED
+                self.experts_cls = _MiMoUnfusedOAITritonExperts
+                logger.info_once(
+                    "MiMo MXFP4 MoE: routing to the unfused OAI TRITON W4A16 path "
+                    "(Mxfp4MoeBackend.TRITON_UNFUSED, bf16 activations) on SM12x."
+                )
         else:
             # MiMo must use vLLM's externally computed grouped sigmoid routing.
             # The monolithic TRT-LLM expert path re-routes internally and drops

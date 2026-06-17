@@ -416,6 +416,7 @@ def triton_kernel_fused_experts(
     quant_config: FusedMoEQuantConfig | None = None,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
@@ -423,9 +424,15 @@ def triton_kernel_fused_experts(
     a1q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of fused expert computation using OAI kernels."""
-    assert activation == MoEActivation.SWIGLUOAI, (
-        "Only SWIGLUOAI activation is supported"
+    assert activation in (MoEActivation.SWIGLUOAI, MoEActivation.SILU), (
+        "Only SWIGLUOAI and SILU activations are supported"
     )
+    # MiMo's STANDARD SwiGLU silu(gate)*up => alpha=1, no clamp, beta=0. The fused
+    # matmul_ogs swiglu epilogue's hardcoded "+1" is gated by beta (see
+    # docker/triton_sm121_fix.py, which adds the beta constexpr to _swiglu_fn /
+    # compute_swiglu). gpt-oss's SWIGLUOAI keeps 1.702 / 7.0 / 1.0.
+    if activation == MoEActivation.SILU:
+        swiglu_alpha, swiglu_limit, swiglu_beta = 1.0, 1e38, 0.0
     assert quant_config is not None
 
     # type check, uint8 means mxfp4
@@ -463,15 +470,15 @@ def triton_kernel_fused_experts(
             FnSpecs(
                 "swiglu",
                 triton_kernels.swiglu.swiglu_fn,
-                ("alpha", "limit"),
+                ("alpha", "limit", "beta"),
                 reduction_n=2,
             ),
-            (swiglu_alpha, swiglu_limit),
+            (swiglu_alpha, swiglu_limit, swiglu_beta),
         )
         if not use_legacy_triton_kernels
         else FusedActivation(
-            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
-            (swiglu_alpha, swiglu_limit),
+            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit", "beta")),
+            (swiglu_alpha, swiglu_limit, swiglu_beta),
             2,
         )
     )
@@ -736,6 +743,29 @@ class OAITritonExperts(BaseOAITritonExperts):
             intermediate_cache=workspace2,
             a1q_scale=a1q_scale,
         )
+
+
+class _MiMoSm12xFusedOAITritonExperts(OAITritonExperts):
+    """sm12x (GB10 DGX Spark) MiMo gate-override for the FUSED OAI Triton MoE.
+
+    Two changes vs OAITritonExperts: (1) widen the device gate to SM120 (the stock
+    gate is (9,0)<=cap<(11,0), excluding SM120); (2) accept MiMo's standard SILU
+    SwiGLU (silu(gate)*up) alongside gpt-oss SWIGLUOAI. The fused matmul_ogs
+    epilogue computes MiMo's activation via beta=0 (no "+1"), alpha=1, no clamp —
+    see triton_kernel_fused_experts + docker/triton_sm121_fix.py. Folds
+    silu_and_mul into matmul1 (vs UnfusedOAITritonExperts' separate activation
+    kernel + intermediate read/write). apply()/workspace_shapes inherited.
+    """
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return (
+            current_platform.is_device_capability_family(120) and has_triton_kernels()
+        )
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation in (MoEActivation.SWIGLUOAI, MoEActivation.SILU)
 
 
 class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
