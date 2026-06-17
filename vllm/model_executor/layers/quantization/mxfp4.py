@@ -538,7 +538,8 @@ class MiMoV2Mxfp4MoEMethod(GptOssMxfp4MoEMethod):
                 _MiMoSm12xFusedOAITritonExperts,
             )
 
-            if os.environ.get("MIMO_FUSED_MOE", "0") == "1":
+            self._mimo_fused_moe = os.environ.get("MIMO_FUSED_MOE", "0") == "1"
+            if self._mimo_fused_moe:
                 # FUSED OAI TRITON path (#19 perf): folds silu_and_mul into matmul1
                 # via the beta=0 fused swiglu epilogue (no "+1"; alpha=1, no clamp).
                 # Faster than the unfused path (no separate activation kernel +
@@ -594,6 +595,33 @@ class MiMoV2Mxfp4MoEMethod(GptOssMxfp4MoEMethod):
             # (gate = first half, up = second half) expects — no extra reorder.
             w13_bias = getattr(layer, "w13_bias", None)
             w2_bias = getattr(layer, "w2_bias", None)
+            if getattr(self, "_mimo_fused_moe", False):
+                # FUSED path: the fused matmul_ogs swiglu splits gate/up INTERLEAVED
+                # per output-tile (a[...,::2]=gate -> silu, a[...,1::2]=up), but MiMo's
+                # w13 is contiguous [gate(0..I-1); up(0..I-1)]. Permute w13's output
+                # rows to interleaved [g0,u0,g1,u1,...] so matmul1 feeds the fused
+                # epilogue correctly. (The unfused path keeps contiguous — its separate
+                # silu_and_mul expects [gate; up] halves.) MXFP4 packs along K, so this
+                # output-dim (dim-1) row reorder is a plain index permute; the per-row
+                # block scales and w13_bias reorder identically.
+                _half = layer.w13_weight.shape[1] // 2
+                _perm = (
+                    torch.stack(
+                        [torch.arange(_half), torch.arange(_half) + _half], dim=1
+                    )
+                    .reshape(-1)
+                    .to(layer.w13_weight.device)
+                )
+                layer.w13_weight.data = layer.w13_weight.data[:, _perm, :].contiguous()
+                layer.w13_weight_scale.data = layer.w13_weight_scale.data[
+                    :, _perm, :
+                ].contiguous()
+                if w13_bias is not None:
+                    w13_bias = w13_bias[:, _perm].contiguous()
+                logger.info_once(
+                    "MiMo MXFP4 MoE: interleaved w13 gate/up rows [g0,u0,...] for "
+                    "the fused swiglu epilogue."
+                )
             GptOssMxfp4MoEMethod._setup_kernel(
                 self,
                 layer,
