@@ -1118,10 +1118,22 @@ def instanttensor_weights_iterator(
 
     device = current_platform.current_device()
 
+    # copy=False yields zero-copy views; we sync + clone below. Rationale: with the
+    # default copy=True, instanttensor.tensors() clones each tensor BEFORE the current
+    # tensor's async distributed (NCCL) transfer completes — its stream.synchronize()
+    # sits at the TOP of the per-tensor loop and only covers the PREVIOUS tensor. For a
+    # remote-file tensor (read by another rank under a TP process_group, e.g. MiMo's
+    # custom-loaded fused-fp8 qkv for layers >= 3) the clone races the fetch and reads
+    # ZEROS -> dead attention -> garbage. Cloning ourselves AFTER an explicit sync makes
+    # the data complete. Harmless single-GPU (process_group=None -> no async transfer).
     with instanttensor.safe_open(
-        hf_weights_files, framework="pt", device=device, process_group=process_group
+        hf_weights_files,
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        copy=False,
     ) as f:
-        yield from tqdm(
+        for name, tensor in tqdm(
             f.tensors(),
             desc="Loading safetensors using InstantTensor loader",
             disable=not enable_tqdm(use_tqdm_on_load),
@@ -1129,7 +1141,9 @@ def instanttensor_weights_iterator(
             position=tqdm._get_free_pos(),
             total=len(f.keys()),
             mininterval=1.0,
-        )
+        ):
+            torch.cuda.current_stream().synchronize()
+            yield name, tensor.clone()
 
 
 def pt_weights_iterator(
