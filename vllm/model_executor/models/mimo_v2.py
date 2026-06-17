@@ -722,7 +722,19 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
-        pending_fp8_qkv_proj: dict[str, dict[str, torch.Tensor]] = {}
+        # #17 ROOT-CAUSE FIX: load_weights is invoked in MULTIPLE passes under the
+        # distributed instanttensor loader (rank-local files first, then NCCL-gathered
+        # remote files -> a 2nd call). The fused-fp8 qkv weight and its weight_scale_inv
+        # for layers >=3 land in DIFFERENT passes (proven by [IT-QKV]: L3 scale recv'd
+        # in pass 1, weight recv'd in pass 2 ~25s later). A per-CALL pending dict drops
+        # the pass-1 half at function return, so the pair never completes and the qkv
+        # param keeps its init value (zero weight / -FLT_MAX scale) -> dead attention ->
+        # garbage. Persist the dict on self so a tensor held in one pass pairs with its
+        # partner in a later pass. (Auto loader: single pass, so this is a no-op there.)
+        pending_fp8_qkv_proj = getattr(self, "_pending_fp8_qkv_proj", None)
+        if pending_fp8_qkv_proj is None:
+            pending_fp8_qkv_proj = {}
+            self._pending_fp8_qkv_proj = pending_fp8_qkv_proj
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
