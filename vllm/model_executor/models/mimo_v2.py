@@ -730,13 +730,23 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 try:
                     _t = loaded_weight
                     _flat = _t.reshape(-1)
-                    _s = _flat[:1_000_000].to(torch.float32)
-                    _head = [round(x, 4) for x in _flat[:8].to(torch.float32).tolist()]
+                    _n = _flat.numel()
+                    # FULL-RANGE fingerprint: the earlier head8/1M-sample only
+                    # covered the first ~0.6% of large tensors; instanttensor
+                    # garbles with a correct START, so sample head/middle/tail +
+                    # a strided sweep over the WHOLE tensor to localize where it
+                    # diverges from auto (cheap: 8+8+8 + <=4096 strided elems).
+                    _head = [round(x, 3) for x in _flat[:8].to(torch.float32).tolist()]
+                    _tail = [round(x, 3) for x in _flat[-8:].to(torch.float32).tolist()]
+                    _mid = [round(x, 3) for x in _flat[_n // 2 : _n // 2 + 8].to(torch.float32).tolist()]
+                    _stride = max(1, _n // 4096)
+                    _sweep = _flat[::_stride].to(torch.float32)
                     logger.info(
-                        "[IT-DEBUG] %s dtype=%s shape=%s contig=%s head8=%s "
-                        "absmax1M=%.6g mean1M=%.6g",
+                        "[IT-DEBUG] %s dtype=%s shape=%s contig=%s head8=%s mid8=%s "
+                        "tail8=%s sweepmean=%.6g sweepabsmax=%.6g sweepsum=%.6g",
                         name, _t.dtype, tuple(_t.shape), _t.is_contiguous(),
-                        _head, _s.abs().max().item(), _s.mean().item(),
+                        _head, _mid, _tail,
+                        _sweep.mean().item(), _sweep.abs().max().item(), _sweep.sum().item(),
                     )
                 except Exception as _e:  # diagnostic must never break load
                     logger.info("[IT-DEBUG] %s STATS-FAILED: %s", name, _e)
