@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 import torch
@@ -81,6 +82,16 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
                 mx_axis=1, num_warps=num_warps
             )
         )
+    # mxfp8-activation (MIMO_MXFP8_ACT): the default (HOPPER) value-swizzle path
+    # in matmul_ogs hard-asserts `not is_x_microscaled` -- it cannot pair a
+    # swizzled mxfp4 weight with a microscaled mxfp8 activation. Force the
+    # non-swizzled StridedLayout for BOTH value and scale so the kernel takes its
+    # microscaled-x-capable branch (SWIZZLE_MX_VALUE / SWIZZLE_MX_SCALE = None).
+    # Slower matmul, but MiMo decode is memory-bound (perf-neutral) and this is the
+    # only non-cutlass route to "mxfp8 activation" on sm_121.
+    if os.environ.get("MIMO_MXFP8_ACT", "0") == "1":
+        value_layout, value_layout_opts = StridedLayout, {}
+        scale_layout, scale_layout_opts = StridedLayout, {}
     if current_platform.is_cuda():
         if current_platform.is_device_capability(90):
             constraints = {
