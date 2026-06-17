@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -473,6 +474,28 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+class _MiMoSm12xUnfusedOAITritonExperts:
+    """sm12x (GB10 / RTX Pro 6000) gate-override for the unfused OAI Triton MoE.
+
+    The OAI triton MoE expert classes gate ``_supports_current_device`` to the
+    CUDA window ``(9,0) <= cap < (11,0)`` (Hopper SM90 + Blackwell SM100),
+    explicitly excluding SM120. The triton_kernels matmul_ogs + swiglu kernels
+    are SM-agnostic and run correctly on SM121, so for the MiMo case we widen
+    that gate to SM12x. Everything else (W4A16 mxfp4 weight scheme, SILU
+    activation via ``swiglu_limit_func`` = silu(gate)*up, routing) is inherited
+    unchanged from ``UnfusedOAITritonExperts``. Kept MiMo-local so gpt-oss and
+    the generic Mxfp4MoEMethod are unaffected.
+    """
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        from vllm.utils.import_utils import has_triton_kernels
+
+        return (
+            current_platform.is_device_capability_family(120) and has_triton_kernels()
+        )
+
+
 class MiMoV2Mxfp4MoEMethod(GptOssMxfp4MoEMethod):
     """MiMo MXFP4 MoE packing compatible with its DFlash checkpoint."""
 
@@ -489,20 +512,82 @@ class MiMoV2Mxfp4MoEMethod(GptOssMxfp4MoEMethod):
         self.w2_precision_config = None
         self._swiglu_limit = swiglu_limit
 
-        # MiMo must use vLLM's externally computed grouped sigmoid routing.
-        # The monolithic TRT-LLM expert path re-routes internally and drops the
-        # MiMo correction-bias routing semantics.
-        from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
-            TrtLlmMxfp4ExpertsModular,
-        )
+        # SM12x (GB10 DGX Spark / RTX Pro 6000): the sm120 cutlass MXFP4xMXFP8
+        # fused-MoE kernel does not consume the block scales correctly (garbled
+        # output), and there is no sm120 trtllm-gen MoE cubin. Route MiMo's
+        # routed-experts MoE through the SM-agnostic, gpt-oss-validated TRITON
+        # path instead: dequant-free mxfp4 weights matmul'd against *bf16*
+        # activations (W4A16 — drop the mxfp8-act spec; bf16 act is numerically
+        # correct, just unquantized). We use the UNFUSED OAI triton experts
+        # (Mxfp4MoeBackend.TRITON_UNFUSED) rather than the fused OAITritonExperts
+        # because the fused matmul_ogs swiglu hardcodes gpt-oss params
+        # (alpha=1.702, clamp=7.0) and computes silu(gate)*(up+1) (gemm1_beta=1),
+        # which garbles MiMo's STANDARD SwiGLU. The unfused class lists SILU in
+        # _supports_activation and runs silu(gate)*up via swiglu_limit_func
+        # (no +1), matching MiMo's config hidden_act=silu. Both triton backends
+        # share the same _swizzle_mxfp4 + PrecisionConfig weight conversion and
+        # the mxfp4_w4a16 quant config, so the inherited gpt-oss triton
+        # _setup_kernel path is reused verbatim (see process_weights_after_loading).
+        # Off sm12x, keep the original TRT-LLM modular expert path.
+        self._use_sm12x_triton_moe = current_platform.is_device_capability_family(120)
+        if self._use_sm12x_triton_moe:
+            from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
+                UnfusedOAITritonExperts,
+            )
 
-        self.experts_cls = TrtLlmMxfp4ExpertsModular
+            # MiMo-local subclass of UnfusedOAITritonExperts that widens the
+            # device gate to SM12x (the only change). backend_to_kernel_cls is
+            # not used directly because the stock device gate would reject the
+            # class on SM120 before selection.
+            class _MiMoUnfusedOAITritonExperts(
+                _MiMoSm12xUnfusedOAITritonExperts, UnfusedOAITritonExperts
+            ):
+                pass
+
+            self.mxfp4_backend = Mxfp4MoeBackend.TRITON_UNFUSED
+            self.experts_cls = _MiMoUnfusedOAITritonExperts
+            logger.info_once(
+                "MiMo MXFP4 MoE: routing to the unfused OAI TRITON W4A16 path "
+                "(Mxfp4MoeBackend.TRITON_UNFUSED, bf16 activations) on SM12x."
+            )
+        else:
+            # MiMo must use vLLM's externally computed grouped sigmoid routing.
+            # The monolithic TRT-LLM expert path re-routes internally and drops
+            # the MiMo correction-bias routing semantics.
+            from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+                TrtLlmMxfp4ExpertsModular,
+            )
+
+            self.experts_cls = TrtLlmMxfp4ExpertsModular
 
     @property
     def supports_eplb(self) -> bool:
         return True
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if getattr(self, "_use_sm12x_triton_moe", False):
+            # SM12x TRITON W4A16 path: reuse the inherited gpt-oss triton
+            # _setup_kernel verbatim. It runs the TRITON branch of
+            # convert_gpt_oss_weight_to_mxfp4_moe_kernel_format (_swizzle_mxfp4 +
+            # PrecisionConfig into self.w13/w2_precision_config), builds the
+            # W4A16 quant config (mxfp4_w4a16_moe_quant_config — bf16 act, no
+            # mxfp8) and the modular kernel. MiMo stores w13 as contiguous
+            # [gate; up], which is exactly what the unfused swiglu split
+            # (gate = first half, up = second half) expects — no extra reorder.
+            w13_bias = getattr(layer, "w13_bias", None)
+            w2_bias = getattr(layer, "w2_bias", None)
+            GptOssMxfp4MoEMethod._setup_kernel(
+                self,
+                layer,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                w13_bias,
+                w2_bias,
+            )
+            return
+
         from flashinfer.fp4_quantization import block_scale_interleave
         from flashinfer.fused_moe.core import (
             _maybe_get_cached_w3_w1_permute_indices,
