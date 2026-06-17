@@ -1118,22 +1118,22 @@ def instanttensor_weights_iterator(
 
     device = current_platform.current_device()
 
-    # copy=False yields zero-copy views; we sync + clone below. Rationale: with the
-    # default copy=True, instanttensor.tensors() clones each tensor BEFORE the current
-    # tensor's async distributed (NCCL) transfer completes — its stream.synchronize()
-    # sits at the TOP of the per-tensor loop and only covers the PREVIOUS tensor. For a
-    # remote-file tensor (read by another rank under a TP process_group, e.g. MiMo's
-    # custom-loaded fused-fp8 qkv for layers >= 3) the clone races the fetch and reads
-    # ZEROS -> dead attention -> garbage. Cloning ourselves AFTER an explicit sync makes
-    # the data complete. Harmless single-GPU (process_group=None -> no async transfer).
+    # Force process_group=None (non-distributed) so EVERY rank reads all files
+    # locally via instanttensor's fast C-extension format. Why: instanttensor's
+    # distributed mode partitions checkpoint files across ranks and pulls
+    # remote-owned tensors via NCCL (get_dl_tensor). That remote fetch returns
+    # ZEROS for MiMo's CUSTOM fused-fp8 qkv (mimo_v2.py _shard_fp8_qkv_proj needs
+    # the COMPLETE tensor on every rank; layers>=3 live in other ranks' files ->
+    # zeroed -> dead attention -> garbage). A sync-before-clone did NOT fix it, so
+    # it's the distributed fetch, not an async race. Non-distributed loading has no
+    # remote fetch -> correct; same I/O volume as load-format=auto but instanttensor's
+    # format is faster than the auto/safetensors Python path. (Standard sharded-loader
+    # models could keep distribution, but this shared iterator has no model context.)
+    del process_group  # distribution disabled (see above); each rank reads locally
     with instanttensor.safe_open(
-        hf_weights_files,
-        framework="pt",
-        device=device,
-        process_group=process_group,
-        copy=False,
+        hf_weights_files, framework="pt", device=device, process_group=None
     ) as f:
-        for name, tensor in tqdm(
+        yield from tqdm(
             f.tensors(),
             desc="Loading safetensors using InstantTensor loader",
             disable=not enable_tqdm(use_tqdm_on_load),
@@ -1141,9 +1141,7 @@ def instanttensor_weights_iterator(
             position=tqdm._get_free_pos(),
             total=len(f.keys()),
             mininterval=1.0,
-        ):
-            torch.cuda.current_stream().synchronize()
-            yield name, tensor.clone()
+        )
 
 
 def pt_weights_iterator(
