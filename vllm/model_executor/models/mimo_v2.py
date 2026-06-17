@@ -696,8 +696,10 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             # layers, BEFORE any sharding/clone, to localize which weight loads
             # dead under load-format=instanttensor (qkv vs the bf16 o_proj
             # ignored-layer vs MoE) and how (all-zero vs garbage). Off by default.
+            # NB: AutoWeightsLoader delegates here with the "model." prefix
+            # STRIPPED, so names arrive as "layers.N.<...>" (no leading dot).
             if _MIMO_IT_DEBUG and (
-                any(f".layers.{i}." in name for i in (0, 1, 3, 10, 20))
+                any(f"layers.{i}." in name for i in (0, 1, 3, 10, 20))
             ) and any(
                 k in name
                 for k in (

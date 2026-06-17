@@ -508,7 +508,14 @@ def triton_kernel_fused_experts(
             hidden_states.contiguous(), torch.float8_e4m3fn, axis=-1
         )
         x1 = x1q
-        w1_prec = dataclasses.replace(quant_config.w1_precision, act_scale=x1s)
+        # Pin out_dtype to bf16: the W4A16 PrecisionConfig leaves out_dtype=None,
+        # so matmul_ogs would otherwise infer it from x.dtype (now fp8) and emit a
+        # fp8 swiglu output into the bf16 intermediate buffer. Keep it bf16.
+        w1_prec = dataclasses.replace(
+            quant_config.w1_precision,
+            act_scale=x1s,
+            out_dtype=hidden_states.dtype,
+        )
 
     matmul_ogs(
         x1,
@@ -527,7 +534,11 @@ def triton_kernel_fused_experts(
     if _MIMO_MXFP8_ACT:
         x2q, x2s = downcast_to_mxfp(x2.contiguous(), torch.float8_e4m3fn, axis=-1)
         x2 = x2q
-        w2_prec = dataclasses.replace(quant_config.w2_precision, act_scale=x2s)
+        w2_prec = dataclasses.replace(
+            quant_config.w2_precision,
+            act_scale=x2s,
+            out_dtype=output_tensor.dtype,
+        )
 
     matmul_ogs(
         x2,
