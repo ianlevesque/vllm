@@ -704,19 +704,29 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             # sample-mean are a value fingerprint: comparing instanttensor vs auto
             # distinguishes byte-identical from a permutation / value corruption
             # (which my earlier nonzero/absmax stats could NOT catch).
+            # NOW ALSO logs SCALES (weight_scale_inv / weight_scale) + attention
+            # extras: the sampled weight VALUES proved byte-identical instanttensor
+            # vs auto, so a wrong SCALE (fp8/mxfp4 dequant) is the prime garble
+            # suspect. .endswith(".weight") restriction dropped so scales match.
             if _MIMO_IT_DEBUG and (
                 any(f"layers.{i}." in name for i in (0, 1, 3, 10, 20))
             ) and any(
                 k in name
                 for k in (
                     "qkv_proj.weight",
-                    "o_proj.weight",
+                    "qkv_proj.weight_scale_inv",
+                    "o_proj.",
                     "experts.0.gate_proj.weight",
+                    "experts.0.gate_proj.weight_scale",
                     "experts.0.down_proj.weight",
+                    "experts.0.down_proj.weight_scale",
                     "mlp.gate_proj.weight",
                     "mlp.down_proj.weight",
+                    "attention_sink",
+                    "input_layernorm.weight",
+                    "post_attention_layernorm.weight",
                 )
-            ) and name.endswith(".weight"):
+            ):
                 try:
                     _t = loaded_weight
                     _flat = _t.reshape(-1)
