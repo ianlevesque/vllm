@@ -43,6 +43,11 @@ logger = init_logger(__name__)
 # mxfp4 weights. Runs on the SM121-patched triton (no cutlass cubin). Gated; off
 # => the proven bf16-activation (W4A16) fused/unfused path.
 _MIMO_MXFP8_ACT = os.environ.get("MIMO_MXFP8_ACT", "0") == "1"
+# Isolation knob: MIMO_MXFP8_ACT=1 forces the non-swizzled StridedLayout weights
+# (so the kernel takes the tl.dot_scaled branch). With ACT_QUANT=0 we keep BF16
+# activations (no mxfp8 downcast) -> tests whether the StridedLayout *weight* path
+# is itself correct, isolating weight-format bugs from activation-scale bugs.
+_MIMO_MXFP8_ACT_QUANT = os.environ.get("MIMO_MXFP8_ACT_QUANT", "1") == "1"
 
 
 def _triton_kernel_moe_supports_current_device() -> bool:
@@ -503,7 +508,7 @@ def triton_kernel_fused_experts(
     # scheme (we quantize here, not via the quant_config). Off => bf16 act.
     x1 = hidden_states
     w1_prec = quant_config.w1_precision
-    if _MIMO_MXFP8_ACT:
+    if _MIMO_MXFP8_ACT and _MIMO_MXFP8_ACT_QUANT:
         x1q, x1s = downcast_to_mxfp(
             hidden_states.contiguous(), torch.float8_e4m3fn, axis=-1
         )
@@ -531,7 +536,7 @@ def triton_kernel_fused_experts(
 
     x2 = intermediate_cache.view(M * topk, N // 2)
     w2_prec = quant_config.w2_precision
-    if _MIMO_MXFP8_ACT:
+    if _MIMO_MXFP8_ACT and _MIMO_MXFP8_ACT_QUANT:
         x2q, x2s = downcast_to_mxfp(x2.contiguous(), torch.float8_e4m3fn, axis=-1)
         x2 = x2q
         w2_prec = dataclasses.replace(
