@@ -68,6 +68,9 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# #17: gate the instanttensor weight-load diagnostic (see load_weights).
+_MIMO_IT_DEBUG = os.environ.get("MIMO_IT_DEBUG", "0") == "1"
+
 # DFlash draft fidelity: the reference extracts HF output_hidden_states, where
 # the entry after the FINAL target layer is the POST-final-norm hidden state
 # (all earlier entries are raw residual-stream values). Capturing the last aux
@@ -687,6 +690,33 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 continue
             if "mtp" in name:
                 continue
+
+            # #17 instanttensor diagnostic (MIMO_IT_DEBUG=1): log the RAW
+            # delivered nonzero-fraction/absmax of selected weights at a few
+            # layers, BEFORE any sharding/clone, to localize which weight loads
+            # dead under load-format=instanttensor (qkv vs the bf16 o_proj
+            # ignored-layer vs MoE) and how (all-zero vs garbage). Off by default.
+            if _MIMO_IT_DEBUG and (
+                any(f".layers.{i}." in name for i in (0, 1, 3, 10, 20))
+            ) and any(
+                k in name
+                for k in (
+                    "qkv_proj", "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_up", "gate_proj", "up_proj", "down_proj", "experts",
+                )
+            ):
+                try:
+                    _t = loaded_weight
+                    _tf = _t.reshape(-1)[:4_000_000].to(torch.float32)
+                    _nz = (_t.to(torch.float32) != 0).float().mean().item()
+                    logger.info(
+                        "[IT-DEBUG] %s dtype=%s shape=%s contig=%s nonzero=%.5f "
+                        "absmax=%.6g mean=%.6g",
+                        name, _t.dtype, tuple(_t.shape), _t.is_contiguous(),
+                        _nz, _tf.abs().max().item(), _tf.mean().item(),
+                    )
+                except Exception as _e:  # diagnostic must never break load
+                    logger.info("[IT-DEBUG] %s STATS-FAILED: %s", name, _e)
 
             if self.quant_config is not None:
                 cache_scale_name = self.quant_config.get_cache_scale(name)

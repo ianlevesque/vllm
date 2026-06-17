@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -32,6 +35,14 @@ from vllm.utils.import_utils import has_triton_kernels
 from ..utils import swiglu_limit_func
 
 logger = init_logger(__name__)
+
+# "another mxfp8 activation" (the SGLang MiMo-V2.5-Pro-FP4 card recipe analog),
+# WITHOUT the broken sm120 cutlass MXFP4xMXFP8 kernel: dynamically downcast the
+# bf16 MoE activations to microscaled (e8m0 block-32) mxfp8 e4m3 and feed them to
+# matmul_ogs's native x_has_mx path (precision_config.act_scale) alongside the
+# mxfp4 weights. Runs on the SM121-patched triton (no cutlass cubin). Gated; off
+# => the proven bf16-activation (W4A16) fused/unfused path.
+_MIMO_MXFP8_ACT = os.environ.get("MIMO_MXFP8_ACT", "0") == "1"
 
 
 def _triton_kernel_moe_supports_current_device() -> bool:
@@ -243,6 +254,7 @@ if has_triton_kernels():
             ScatterIndx,
             matmul_ogs,
         )
+        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
         from triton_kernels.tensor import (
             BIT,
             Bitmatrix,
@@ -484,25 +496,46 @@ def triton_kernel_fused_experts(
     )
     gammas = routing_data.gate_scal if routing_data else None
 
+    # mxfp8 activation (MIMO_MXFP8_ACT): downcast the bf16 activations to
+    # microscaled mxfp8 e4m3 (e8m0 block-32) and attach the scale via
+    # precision_config.act_scale. matmul_ogs then runs its native mxfp8(act) x
+    # mxfp4(weight) microscale path (x_has_mx). Transparent to vLLM's W4A16 quant
+    # scheme (we quantize here, not via the quant_config). Off => bf16 act.
+    x1 = hidden_states
+    w1_prec = quant_config.w1_precision
+    if _MIMO_MXFP8_ACT:
+        x1q, x1s = downcast_to_mxfp(
+            hidden_states.contiguous(), torch.float8_e4m3fn, axis=-1
+        )
+        x1 = x1q
+        w1_prec = dataclasses.replace(quant_config.w1_precision, act_scale=x1s)
+
     matmul_ogs(
-        hidden_states,
+        x1,
         w1,
         quant_config.w1_bias,
         routing_data,
         gather_indx=gather_indx,
-        precision_config=quant_config.w1_precision,
+        precision_config=w1_prec,
         gammas=gammas if apply_router_weight_on_input else None,
         fused_activation=act,
         y=intermediate_cache,
     )
 
+    x2 = intermediate_cache.view(M * topk, N // 2)
+    w2_prec = quant_config.w2_precision
+    if _MIMO_MXFP8_ACT:
+        x2q, x2s = downcast_to_mxfp(x2.contiguous(), torch.float8_e4m3fn, axis=-1)
+        x2 = x2q
+        w2_prec = dataclasses.replace(quant_config.w2_precision, act_scale=x2s)
+
     matmul_ogs(
-        intermediate_cache.view(M * topk, N // 2),
+        x2,
         w2,
         quant_config.w2_bias,
         routing_data,
         scatter_indx=scatter_indx,
-        precision_config=quant_config.w2_precision,
+        precision_config=w2_prec,
         gammas=None if apply_router_weight_on_input else gammas,
         y=output_tensor,
     )

@@ -539,7 +539,15 @@ class MiMoV2Mxfp4MoEMethod(GptOssMxfp4MoEMethod):
             )
 
             self._mimo_fused_moe = os.environ.get("MIMO_FUSED_MOE", "0") == "1"
-            if self._mimo_fused_moe:
+            # "another mxfp8 activation" (#19, SGLang card recipe analog): the
+            # fused matmul_ogs path downcasts activations to microscaled mxfp8 and
+            # uses its native x_has_mx (mxfp8 act x mxfp4 weight) kernel, sidestepping
+            # the broken sm120 cutlass MXFP4xMXFP8 cubin. It needs the SAME fused
+            # experts class as MIMO_FUSED_MOE (the quant is done inside
+            # triton_kernel_fused_experts, gated by MIMO_MXFP8_ACT there), so this
+            # toggle implies the fused path.
+            self._mimo_mxfp8_act = os.environ.get("MIMO_MXFP8_ACT", "0") == "1"
+            if self._mimo_fused_moe or self._mimo_mxfp8_act:
                 # FUSED OAI TRITON path (#19 perf): folds silu_and_mul into matmul1
                 # via the beta=0 fused swiglu epilogue (no "+1"; alpha=1, no clamp).
                 # Faster than the unfused path (no separate activation kernel +
@@ -551,7 +559,10 @@ class MiMoV2Mxfp4MoEMethod(GptOssMxfp4MoEMethod):
                 self.experts_cls = _MiMoSm12xFusedOAITritonExperts
                 logger.info_once(
                     "MiMo MXFP4 MoE: FUSED OAI TRITON path (beta=0 swiglu, "
-                    "Mxfp4MoeBackend.TRITON) on SM12x [MIMO_FUSED_MOE=1]."
+                    "Mxfp4MoeBackend.TRITON) on SM12x [MIMO_FUSED_MOE=%s "
+                    "MIMO_MXFP8_ACT=%s].",
+                    self._mimo_fused_moe,
+                    self._mimo_mxfp8_act,
                 )
             else:
                 # MiMo-local subclass of UnfusedOAITritonExperts that widens the
