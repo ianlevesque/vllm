@@ -70,15 +70,6 @@ logger = init_logger(__name__)
 
 # #17: gate the instanttensor weight-load diagnostic (see load_weights).
 _MIMO_IT_DEBUG = os.environ.get("MIMO_IT_DEBUG", "0") == "1"
-# #17: once-per-process guard so the inference-time qkv/o_proj param fingerprint
-# in MiMoV2Attention.forward (the [IT-FWD] probe) fires exactly once per sampled
-# layer. The load-time [IT-DEBUG] probe proved the DELIVERED tensors are
-# byte-identical instanttensor-vs-auto; [IT-FWD] reads the FINAL post-load /
-# post-reshard params as actually consumed at inference, to decide whether the
-# instanttensor garble is (a) corrupt params at inference -> a reshard/order bug
-# in MiMo's stateful fused-fp8-qkv consumer (vLLM-side fixable) or (b) byte-correct
-# params -> a non-value GPU-state side-effect of the load (InstantTensor C-ext).
-_MIMO_FWD_PROBED: set = set()
 
 # DFlash draft fidelity: the reference extracts HF output_hidden_states, where
 # the entry after the FINAL target layer is the POST-final-norm hidden state
@@ -372,37 +363,6 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # #17 instanttensor diagnostic (MIMO_IT_DEBUG=1): fingerprint the FINAL
-        # qkv/o_proj params AS CONSUMED AT INFERENCE, once per sampled layer.
-        # Compare [IT-FWD] instanttensor-vs-auto: identical => params byte-correct
-        # at inference (garble is a non-param GPU-state side-effect of the IT load);
-        # different => params corrupted post-delivery (MiMo's order-dependent fused
-        # fp8-qkv reshard mis-consumes IT's DLPack tensors -> a vLLM-side fix).
-        if _MIMO_IT_DEBUG and self.layer_id in (0, 3) and self.layer_id not in _MIMO_FWD_PROBED:
-            _MIMO_FWD_PROBED.add(self.layer_id)
-            for _pn, _mod in (("qkv_proj", self.qkv_proj), ("o_proj", self.o_proj)):
-                for _attr in ("weight", "weight_scale_inv", "weight_scale"):
-                    _pt = getattr(_mod, _attr, None)
-                    if _pt is None:
-                        continue
-                    try:
-                        _t = _pt.data
-                        _flat = _t.reshape(-1)
-                        _n = _flat.numel()
-                        _head = [round(x, 3) for x in _flat[:8].to(torch.float32).tolist()]
-                        _tail = [round(x, 3) for x in _flat[-8:].to(torch.float32).tolist()]
-                        _mid = [round(x, 3) for x in _flat[_n // 2 : _n // 2 + 8].to(torch.float32).tolist()]
-                        _stride = max(1, _n // 4096)
-                        _sweep = _flat[::_stride].to(torch.float32)
-                        logger.info(
-                            "[IT-FWD] L%d %s.%s dtype=%s shape=%s contig=%s head8=%s "
-                            "mid8=%s tail8=%s sweepmean=%.6g sweepabsmax=%.6g sweepsum=%.6g",
-                            self.layer_id, _pn, _attr, _t.dtype, tuple(_t.shape),
-                            _t.is_contiguous(), _head, _mid, _tail,
-                            _sweep.mean().item(), _sweep.abs().max().item(), _sweep.sum().item(),
-                        )
-                    except Exception as _e:  # diagnostic must never break inference
-                        logger.info("[IT-FWD] L%d %s.%s STATS-FAILED: %s", self.layer_id, _pn, _attr, _e)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
@@ -725,8 +685,8 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         # #17 ROOT-CAUSE FIX: load_weights is invoked in MULTIPLE passes under the
         # distributed instanttensor loader (rank-local files first, then NCCL-gathered
         # remote files -> a 2nd call). The fused-fp8 qkv weight and its weight_scale_inv
-        # for layers >=3 land in DIFFERENT passes (proven by [IT-QKV]: L3 scale recv'd
-        # in pass 1, weight recv'd in pass 2 ~25s later). A per-CALL pending dict drops
+        # for layers >=3 land in DIFFERENT passes (observed during debugging: a layer's
+        # scale arrives in pass 1, its weight in pass 2 ~25s later). A per-CALL pending dict drops
         # the pass-1 half at function return, so the pair never completes and the qkv
         # param keeps its init value (zero weight / -FLT_MAX scale) -> dead attention ->
         # garbage. Persist the dict on self so a tensor held in one pass pairs with its
@@ -918,14 +878,6 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        # #17 diagnostic: any prefixes still pending here are ORPHANED fused-qkv
-        # tensors whose pair never arrived -> their params keep init values (zero
-        # weight / -FLT_MAX scale) -> dead attention. Must be empty after a clean load.
-        if _MIMO_IT_DEBUG:
-            logger.info(
-                "[IT-QKV] END n_loaded=%d pending_orphans=%s",
-                len(loaded_params), sorted(pending_fp8_qkv_proj.keys()),
-            )
         return loaded_params
 
     def _try_load_fp8_qkv_proj(
@@ -950,40 +902,22 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
         prefix, qkv_kind = name.rsplit(".", 1)
         entry = fp8_qkv_proj_dict.setdefault(prefix, {})
-        # #17 FIX: hold a synchronized HOST (CPU) copy of the first-arriving tensor,
-        # NOT a GPU .clone(). instanttensor streams weights through a REUSED GPU ring
-        # buffer; this dict holds the first of {weight, weight_scale_inv} across many
-        # iterator steps until its pair arrives. The earlier GPU .clone() was proven
-        # INSUFFICIENT: L3+ qkv still loaded as ZERO weight + (-FLT_MAX) uninit scale
-        # at inference ([IT-FWD]) despite byte-correct delivery ([IT-DEBUG]) -> the
-        # held GPU clone is corrupted while it waits (ring-buffer reuse reaching even
-        # the clone). A .to("cpu", copy=True) forces a D2H sync into host memory,
-        # immune to GPU buffer reuse; moved back to device at pair time. Harmless for
-        # the auto loader (fresh tensors), only adds a transient host copy.
-        _itdbg = _MIMO_IT_DEBUG and any(f"layers.{i}." in prefix for i in (0, 1, 2, 3, 4))
-        _qsum = lambda t: t.reshape(-1)[:: max(1, t.numel() // 4096)].to(torch.float32).sum().item()
-        if _itdbg:
-            logger.info(
-                "[IT-QKV] recv %s kind=%s dtype=%s recv_sum=%.6g held_after=%s",
-                prefix, qkv_kind, tensor.dtype, _qsum(tensor),
-                sorted(set(list(entry.keys()) + [qkv_kind])),
-            )
-        entry[qkv_kind] = tensor.detach().to("cpu", copy=True)
+        # instanttensor streams weights through a reused GPU ring buffer; this dict
+        # holds the first-arriving of {weight, weight_scale_inv} across iterator steps
+        # until its pair arrives, so the held ref must be a fresh allocation. .clone()
+        # (a torch-owned copy, not the ring buffer) suffices. The cross-PASS pairing
+        # (the distributed loader splits a layer's weight and scale across two
+        # load_weights calls) is handled by persisting this dict on self -- see
+        # load_weights. Harmless for the auto loader (single pass, fresh tensors).
+        entry[qkv_kind] = tensor.clone()
         if "weight" not in entry or "weight_scale_inv" not in entry:
             return True
         del fp8_qkv_proj_dict[prefix]
-        _held_w = entry["weight"].to(tensor.device)
-        _held_s = entry["weight_scale_inv"].to(tensor.device)
-        if _itdbg:
-            logger.info(
-                "[IT-QKV] PAIR-IN %s held_w_sum=%.6g held_s_sum=%.6g",
-                prefix, _qsum(_held_w), _qsum(_held_s),
-            )
 
         attn = self.get_submodule(prefix.rsplit(".", 1)[0])
         weight, scale = _shard_fp8_qkv_proj(
-            _held_w,
-            _held_s,
+            entry["weight"],
+            entry["weight_scale_inv"],
             num_heads=attn.total_num_heads,
             num_kv_heads=attn.total_num_kv_heads,
             head_dim=attn.head_dim,
@@ -991,11 +925,6 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
-        if _itdbg:
-            logger.info(
-                "[IT-QKV] PAIR-OUT %s w_out_sum=%.6g s_out_sum=%.6g w_shape=%s s_shape=%s",
-                prefix, _qsum(weight), _qsum(scale), tuple(weight.shape), tuple(scale.shape),
-            )
         for kind, loaded_weight in {
             "weight": weight,
             "weight_scale_inv": scale,

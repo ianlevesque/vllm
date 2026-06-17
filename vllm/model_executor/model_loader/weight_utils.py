@@ -1139,13 +1139,6 @@ def instanttensor_weights_iterator(
             total=len(f.keys()),
             mininterval=1.0,
         )
-    # #17: instanttensor's __exit__ syncs only the CURRENT stream + frees its ring
-    # buffer. Force a FULL-device sync once the generator is exhausted so any work
-    # still pending on the loader's internal cuda/nccl streams is flushed before
-    # vLLM's inference collectives reuse the device/comm. Free insurance against a
-    # load-stream race leaving inference reading half-written GPU state (one of the
-    # candidate causes of the byte-correct-params-yet-garbled-output signature).
-    torch.cuda.synchronize(device)
 
 
 def pt_weights_iterator(
