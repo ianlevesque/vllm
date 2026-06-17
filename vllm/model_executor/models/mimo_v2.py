@@ -293,7 +293,7 @@ class MiMoV2Attention(nn.Module):
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config if "mtp.layers" not in prefix else None,
+            quant_config=None,  # MiMo o_proj is in ckpt quantization_config.ignored_layers (bf16); vLLM fp8 doesn't skip it, so force unquantized or o_proj loads as 0 -> dead attention -> garbage.
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )
@@ -827,7 +827,13 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
         prefix, qkv_kind = name.rsplit(".", 1)
         entry = fp8_qkv_proj_dict.setdefault(prefix, {})
-        entry[qkv_kind] = tensor
+        # instanttensor streams weights through a REUSED GPU buffer. This dict
+        # holds the first-arriving tensor ("weight" or "weight_scale_inv") across
+        # iterator steps until its pair arrives, so the held ref MUST be a fresh
+        # allocation -- otherwise instanttensor recycles the buffer mid-wait and
+        # the fused-fp8 qkv for layers >=3 loads as ZERO (-> dead attention ->
+        # garbage). Harmless for the safetensors/auto loader (fresh tensors).
+        entry[qkv_kind] = tensor.clone()
         if "weight" not in entry or "weight_scale_inv" not in entry:
             return True
         del fp8_qkv_proj_dict[prefix]
