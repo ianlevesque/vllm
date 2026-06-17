@@ -698,24 +698,35 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             # ignored-layer vs MoE) and how (all-zero vs garbage). Off by default.
             # NB: AutoWeightsLoader delegates here with the "model." prefix
             # STRIPPED, so names arrive as "layers.N.<...>" (no leading dot).
+            # LIGHT fingerprint only (no full-tensor float32 -> that OOM'd rank-0):
+            # restrict to the dead-attention suspects + ONE expert, and log the
+            # first-8 raw values + a 1M-element sample mean/absmax. The head8 +
+            # sample-mean are a value fingerprint: comparing instanttensor vs auto
+            # distinguishes byte-identical from a permutation / value corruption
+            # (which my earlier nonzero/absmax stats could NOT catch).
             if _MIMO_IT_DEBUG and (
                 any(f"layers.{i}." in name for i in (0, 1, 3, 10, 20))
             ) and any(
                 k in name
                 for k in (
-                    "qkv_proj", "q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_up", "gate_proj", "up_proj", "down_proj", "experts",
+                    "qkv_proj.weight",
+                    "o_proj.weight",
+                    "experts.0.gate_proj.weight",
+                    "experts.0.down_proj.weight",
+                    "mlp.gate_proj.weight",
+                    "mlp.down_proj.weight",
                 )
-            ):
+            ) and name.endswith(".weight"):
                 try:
                     _t = loaded_weight
-                    _tf = _t.reshape(-1)[:4_000_000].to(torch.float32)
-                    _nz = (_t.to(torch.float32) != 0).float().mean().item()
+                    _flat = _t.reshape(-1)
+                    _s = _flat[:1_000_000].to(torch.float32)
+                    _head = [round(x, 4) for x in _flat[:8].to(torch.float32).tolist()]
                     logger.info(
-                        "[IT-DEBUG] %s dtype=%s shape=%s contig=%s nonzero=%.5f "
-                        "absmax=%.6g mean=%.6g",
+                        "[IT-DEBUG] %s dtype=%s shape=%s contig=%s head8=%s "
+                        "absmax1M=%.6g mean1M=%.6g",
                         name, _t.dtype, tuple(_t.shape), _t.is_contiguous(),
-                        _nz, _tf.abs().max().item(), _tf.mean().item(),
+                        _head, _s.abs().max().item(), _s.mean().item(),
                     )
                 except Exception as _e:  # diagnostic must never break load
                     logger.info("[IT-DEBUG] %s STATS-FAILED: %s", name, _e)
