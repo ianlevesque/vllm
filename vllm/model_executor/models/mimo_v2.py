@@ -906,6 +906,14 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        # #17 diagnostic: any prefixes still pending here are ORPHANED fused-qkv
+        # tensors whose pair never arrived -> their params keep init values (zero
+        # weight / -FLT_MAX scale) -> dead attention. Must be empty after a clean load.
+        if _MIMO_IT_DEBUG:
+            logger.info(
+                "[IT-QKV] END n_loaded=%d pending_orphans=%s",
+                len(loaded_params), sorted(pending_fp8_qkv_proj.keys()),
+            )
         return loaded_params
 
     def _try_load_fp8_qkv_proj(
@@ -930,21 +938,40 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
         prefix, qkv_kind = name.rsplit(".", 1)
         entry = fp8_qkv_proj_dict.setdefault(prefix, {})
-        # instanttensor streams weights through a REUSED GPU buffer. This dict
-        # holds the first-arriving tensor ("weight" or "weight_scale_inv") across
-        # iterator steps until its pair arrives, so the held ref MUST be a fresh
-        # allocation -- otherwise instanttensor recycles the buffer mid-wait and
-        # the fused-fp8 qkv for layers >=3 loads as ZERO (-> dead attention ->
-        # garbage). Harmless for the safetensors/auto loader (fresh tensors).
-        entry[qkv_kind] = tensor.clone()
+        # #17 FIX: hold a synchronized HOST (CPU) copy of the first-arriving tensor,
+        # NOT a GPU .clone(). instanttensor streams weights through a REUSED GPU ring
+        # buffer; this dict holds the first of {weight, weight_scale_inv} across many
+        # iterator steps until its pair arrives. The earlier GPU .clone() was proven
+        # INSUFFICIENT: L3+ qkv still loaded as ZERO weight + (-FLT_MAX) uninit scale
+        # at inference ([IT-FWD]) despite byte-correct delivery ([IT-DEBUG]) -> the
+        # held GPU clone is corrupted while it waits (ring-buffer reuse reaching even
+        # the clone). A .to("cpu", copy=True) forces a D2H sync into host memory,
+        # immune to GPU buffer reuse; moved back to device at pair time. Harmless for
+        # the auto loader (fresh tensors), only adds a transient host copy.
+        _itdbg = _MIMO_IT_DEBUG and any(f"layers.{i}." in prefix for i in (0, 1, 2, 3, 4))
+        _qsum = lambda t: t.reshape(-1)[:: max(1, t.numel() // 4096)].to(torch.float32).sum().item()
+        if _itdbg:
+            logger.info(
+                "[IT-QKV] recv %s kind=%s dtype=%s recv_sum=%.6g held_after=%s",
+                prefix, qkv_kind, tensor.dtype, _qsum(tensor),
+                sorted(set(list(entry.keys()) + [qkv_kind])),
+            )
+        entry[qkv_kind] = tensor.detach().to("cpu", copy=True)
         if "weight" not in entry or "weight_scale_inv" not in entry:
             return True
         del fp8_qkv_proj_dict[prefix]
+        _held_w = entry["weight"].to(tensor.device)
+        _held_s = entry["weight_scale_inv"].to(tensor.device)
+        if _itdbg:
+            logger.info(
+                "[IT-QKV] PAIR-IN %s held_w_sum=%.6g held_s_sum=%.6g",
+                prefix, _qsum(_held_w), _qsum(_held_s),
+            )
 
         attn = self.get_submodule(prefix.rsplit(".", 1)[0])
         weight, scale = _shard_fp8_qkv_proj(
-            entry["weight"],
-            entry["weight_scale_inv"],
+            _held_w,
+            _held_s,
             num_heads=attn.total_num_heads,
             num_kv_heads=attn.total_num_kv_heads,
             head_dim=attn.head_dim,
@@ -952,6 +979,11 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
+        if _itdbg:
+            logger.info(
+                "[IT-QKV] PAIR-OUT %s w_out_sum=%.6g s_out_sum=%.6g w_shape=%s s_shape=%s",
+                prefix, _qsum(weight), _qsum(scale), tuple(weight.shape), tuple(scale.shape),
+            )
         for kind, loaded_weight in {
             "weight": weight,
             "weight_scale_inv": scale,
