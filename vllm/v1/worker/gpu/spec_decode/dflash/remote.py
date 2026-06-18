@@ -437,14 +437,23 @@ class RemoteDFlashSpeculator(BaseSpeculator):
         start = input_batch.num_computed_tokens_np
         prefill = input_batch.is_prefilling_np
 
-        # EAGLE3 pairs position p with token_{p+1} (the EAGLE shift), so the
-        # service needs each request's scheduled token ids, not just the
-        # bonus. ~4 bytes/token of header next to 21-43 KB/token of aux rows.
-        ids_np = None
-        qsl = None
-        if self.method == "eagle3":
-            ids_np = input_batch.input_ids[:num_tokens].cpu().numpy()
-            qsl = input_batch.query_start_loc_np
+        qsl = input_batch.query_start_loc_np
+        # Ship the ACTUAL per-token positions of the scheduled tokens. The
+        # co-located DFlash kernel reads context positions from
+        # input_batch.positions (the ground truth); the service previously
+        # reconstructed them as arange(num_computed, +valid), which drifts under
+        # spec-decode accept patterns (the bonus re-feed + rejected-token
+        # padding) and gave the drafter a mis-positioned / holey context KV ->
+        # degenerate drafts (AL~1). ~8 bytes/token of header alongside the
+        # 21-43 KB/token of aux rows.
+        pos_np = input_batch.positions[:num_tokens].cpu().numpy()
+        # EAGLE3 also pairs position p with token_{p+1} (the EAGLE shift), so it
+        # needs each request's scheduled token ids, not just the bonus.
+        ids_np = (
+            input_batch.input_ids[:num_tokens].cpu().numpy()
+            if self.method == "eagle3"
+            else None
+        )
 
         reqs = [
             {
@@ -455,6 +464,7 @@ class RemoteDFlashSpeculator(BaseSpeculator):
                 "n_samp": int(ns[i]),
                 "bonus": int(bt[i]),
                 "prefill": bool(prefill[i]),
+                "ctx_pos": pos_np[qsl[i]: qsl[i + 1]].tolist(),
                 **(
                     {"ids": ids_np[qsl[i]: qsl[i + 1]].tolist()}
                     if ids_np is not None
