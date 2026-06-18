@@ -476,6 +476,15 @@ class HostedDrafterStepRunner:
         reqs = header["reqs"]
         num_reqs = len(reqs)
         self.r.free(header.get("finished", []))
+        # Robustness: also reclaim slots for requests the engine is no longer
+        # scheduling. "finished" notifications can lag the last scheduled step,
+        # and a fixed slot pool must not error under churn. In decode spec every
+        # active request is scheduled every step, so a held slot whose req_id is
+        # absent from the current step is done (re-allocs cleanly if it resumes).
+        _cur = {rq["id"] for rq in reqs}
+        _stale = [rid for rid in list(self.r._req_index.keys()) if rid not in _cur]
+        if _stale:
+            self.r.free(_stale)
 
         # Lay out the flattened scheduled-token arrays from per-request ctx_pos.
         positions_list: list[int] = []
