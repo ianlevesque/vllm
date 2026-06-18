@@ -1293,6 +1293,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
             output_intermediate_tensors = None
+            # AUXDBG (VLLM_DFLASH_AUXDBG=1): compare what the MAIN final hidden
+            # predicts (the actual next token) vs what each captured aux layer's
+            # last row predicts via the lm_head. If aux-last == main, the aux is
+            # fresh (predicts next); if aux predicts the CURRENT token, it is the
+            # producing-state captured one position behind. Resolves the
+            # remote-DFlash aux-staleness question. First 8 last-PP-rank steps.
+            import os as _auxdbg_os
+            if (
+                aux_hidden_states is not None
+                and hidden_states is not None
+                and hidden_states.shape[0] > 0
+                and _auxdbg_os.environ.get("VLLM_DFLASH_AUXDBG") == "1"
+            ):
+                _c = getattr(self, "_auxdbg_c", 0)
+                if _c < 8:
+                    self._auxdbg_c = _c + 1
+                    try:
+                        with torch.no_grad():
+                            _mh = self.model.compute_logits(
+                                hidden_states[-1:]
+                            ).argmax(-1)
+                            _axp = [
+                                int(
+                                    self.model.compute_logits(
+                                        a[-1:]
+                                    ).argmax(-1)[0]
+                                )
+                                for a in aux_hidden_states
+                            ]
+                        logger.info(
+                            "AUXDBG n_tok=%d main_predicts=%d aux_layers_predict=%s",
+                            hidden_states.shape[0], int(_mh[0]), _axp,
+                        )
+                    except Exception as _e:
+                        logger.info("AUXDBG err: %s", _e)
         else:
             assert isinstance(model_output, IntermediateTensors)
             hidden_states = None
