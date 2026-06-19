@@ -509,6 +509,39 @@ class Qwen3CoderToolParser(ToolParser):
             if json_fragments:
                 combined = "".join(json_fragments)
 
+                # Spec-decode burst: the final parameter value and the
+                # </function> close can arrive in the SAME delta. Returning
+                # here without checking would skip the close block below, and
+                # the next delta has no new text -- so the streamed args never
+                # get their closing "}" (-> invalid JSON for strict clients,
+                # e.g. pi.dev "content.invoke_error"). Close in this same delta.
+                if not self.json_closed and self.function_end_token in tool_text:
+                    self.json_closed = True
+                    combined += "}"
+                    func_start = tool_text.find(self.tool_call_prefix) + len(
+                        self.tool_call_prefix
+                    )
+                    func_content_end = tool_text.find(
+                        self.function_end_token, func_start
+                    )
+                    if func_content_end != -1:
+                        try:
+                            parsed_tool = self._parse_xml_function_call(
+                                tool_text[func_start:func_content_end]
+                            )
+                            if parsed_tool and self.current_tool_index < len(
+                                self.prev_tool_call_arr
+                            ):
+                                self.prev_tool_call_arr[self.current_tool_index][
+                                    "arguments"
+                                ] = parsed_tool.function.arguments
+                        except Exception:
+                            logger.debug(
+                                "Failed to parse tool call during streaming: %s",
+                                tool_text,
+                                exc_info=True,
+                            )
+
                 if self.current_tool_index < len(self.streamed_args_for_tool):
                     self.streamed_args_for_tool[self.current_tool_index] += combined
                 else:
