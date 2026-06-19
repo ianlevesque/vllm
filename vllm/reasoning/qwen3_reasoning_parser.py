@@ -50,6 +50,11 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         self._tool_call_end_tag = "</tool_call>"
         self._tool_call_end_token_id = self.vocab.get(self._tool_call_end_tag)
 
+        # ChatML start-of-message token. Used to scope is_reasoning_end's
+        # backward scan to the current (generation) assistant turn. None for
+        # non-ChatML tokenizers, which disables the scoping (original behaviour).
+        self._im_start_token_id = self.vocab.get("<|im_start|>")
+
     @property
     def start_token(self) -> str:
         """The token that starts reasoning content."""
@@ -73,6 +78,20 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                 return False
             if token_id == end_token_id:
                 return True
+            if (
+                self._im_start_token_id is not None
+                and token_id == self._im_start_token_id
+            ):
+                # Reached the start of the current assistant turn without a
+                # think marker. Everything further back is prior context
+                # (history, few-shot examples, or tool/usage instructions such
+                # as MiMo's "DO NOT use function calls inside <think></think>
+                # tags"); a </think> there must NOT be read as a
+                # template-injected "reasoning already ended" marker. Otherwise
+                # the streaming prompt pre-check short-circuits and the model's
+                # own <think>...</think> is routed to content instead of the
+                # reasoning field whenever tools are present.
+                return False
             if tool_call_token_id is not None and token_id == tool_call_token_id:
                 # Only treat as implicit reasoning end if this <tool_call>
                 # is NOT followed by </tool_call>.  Paired occurrences are
