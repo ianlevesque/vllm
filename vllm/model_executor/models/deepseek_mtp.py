@@ -159,7 +159,20 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         Called by the proposer to implement index_share_for_mtp_iteration:
         step 0 sets skip=False (compute own indices), steps 1+ set skip=True
         (reuse step 0's indices).
+
+        On NVIDIA sm_12x (e.g. GB10 / DGX Spark) the Triton sparse-MLA backend
+        (TRITON_MLA_SPARSE, the only sparse-MLA backend available on cc 12.x) does
+        not correctly reuse step-0 indexer indices across MTP iterations. Honoring
+        skip=True there makes steps 1+ attend over stale/invalid sparse indices and
+        the model emits garbage (degenerate token-0 "!") for num_speculative_tokens
+        > 1. Force recompute (skip=False) on sm_12x: the DSA lightning indexer is
+        lightweight, so recomputing it on every MTP step is exact and cheap. Index
+        sharing is left intact on architectures where the reuse path is correct.
         """
+        if skip and current_platform.is_cuda():
+            cap = current_platform.get_device_capability()
+            if cap is not None and cap[0] == 12:
+                skip = False
         for layer in self.layers.values():
             mtp_block = getattr(layer, "mtp_block", None)
             if mtp_block is not None:
