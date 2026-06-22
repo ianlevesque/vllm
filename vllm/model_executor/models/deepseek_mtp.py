@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -299,6 +300,13 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            # Force-dense (VLLM_MLA_FORCE_DENSE / PR #39594): the DSA sparse
+            # indexer modules are not built, so the checkpoint's MTP-block
+            # indexer weights (e.g. mtp_block.self_attn.indexer.*) have no
+            # destination param. Skip them (mirrors deepseek_v2.py's main-model
+            # skip) — otherwise params_dict[name] KeyErrors on the dense path.
+            if envs.VLLM_MLA_FORCE_DENSE and "indexer." in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
