@@ -50,8 +50,23 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         workspace.scalar_type() == torch::headeronly::ScalarType::Byte,
         "workspace must be uint8");
 
+    // The cooperative spin-wait barrier only runs when at least one row hits
+    // the radix path (seq_len > RADIX_THRESHOLD). Below that, non-CTA-0 CTAs
+    // early-exit, so oversubscription can't deadlock and headroom is wasted.
+    const bool needs_cooperative =
+        static_cast<uint32_t>(max_seq_len) > P::RADIX_THRESHOLD;
+
     int effective_max_smem;
-    if (num_rows <= 4) {
+    if (needs_cooperative) {
+      // GB10/sm121 (jasl/vllm#21): on the long-sequence cooperative radix path
+      // the chunk sizing must use full opt-in smem so ctas_per_group stays
+      // within the resident cap; the small num_rows caps below are a short
+      // (non-cooperative) decode occupancy tweak only. Without this, parts with
+      // sub-128KB optin smem (GB10: 101376B) shrink the chunk, inflate
+      // ctas_per_group past the resident cap, and fall into the FilteredTopK
+      // >=128KB fallback path that aborts.
+      effective_max_smem = max_smem_per_block;
+    } else if (num_rows <= 4) {
       effective_max_smem =
           std::min(max_smem_per_block, static_cast<int>(P::kSmemMedium));
     } else if (num_rows <= 8) {
@@ -108,12 +123,6 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
                     "persistent_topk occupancy query failed: ",
                     cudaGetErrorString(occ_err));
     if (occupancy < 1) occupancy = 1;
-
-    // The cooperative spin-wait barrier only runs when at least one row hits
-    // the radix path (seq_len > RADIX_THRESHOLD). Below that, non-CTA-0 CTAs
-    // early-exit, so oversubscription can't deadlock and headroom is wasted.
-    const bool needs_cooperative =
-        static_cast<uint32_t>(max_seq_len) > P::RADIX_THRESHOLD;
 
     const uint32_t hw_resident_cap =
         static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(occupancy);
