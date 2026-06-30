@@ -47,9 +47,25 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 cache_dtype=speculative_config.kv_cache_dtype,
             ),
         )
+    # The draft model is loaded on the LAST PP rank only (the runner gates drafter
+    # construction on get_pp_group().is_last_rank). instanttensor issues a world-group
+    # all_reduce in _determine_io_params during load; with only one PP rank
+    # participating, that collective has no partners on the other ranks and
+    # deadlocks (NCCL watchdog timeout -> group teardown). get_model() reads
+    # vllm_config.load_config (the TARGET's load-format), ignoring draft_load_config,
+    # so honor an explicit draft_load_config here and force the default loader for
+    # the draft whenever the effective load-format is instanttensor under PP>1.
+    import copy
+    import dataclasses
+
+    draft_load_config = speculative_config.draft_load_config or vllm_config.load_config
+    if get_pp_group().world_size > 1 and draft_load_config.load_format == "instanttensor":
+        draft_load_config = dataclasses.replace(draft_load_config, load_format="auto")
+    draft_vllm_config = copy.copy(vllm_config)
+    draft_vllm_config.load_config = draft_load_config
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
-            vllm_config=vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
     target_language_model = (
