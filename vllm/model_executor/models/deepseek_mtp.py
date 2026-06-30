@@ -34,9 +34,11 @@ from .deepseek_v2 import (
     DeepseekV2MoE,
     _try_load_fp8_indexer_wk,
 )
+from .interfaces import SupportsPP
 from .utils import (
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
+    make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
 
@@ -246,7 +248,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -256,6 +258,14 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
+        # PP support: the MTP draft runs only on the last PP stage (the runner gates
+        # drafter construction on get_pp_group().is_last_rank), so it never actually
+        # consumes PP intermediate tensors — but SupportsPP requires this factory.
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], self.config.hidden_size
+            )
+        )
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
