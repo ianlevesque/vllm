@@ -130,6 +130,8 @@ def _get_backend_priorities(
         elif device_capability.major == 12:
             return [
                 AttentionBackendEnum.TRITON_MLA,
+                # bf16 sparse-MLA on GB10/sm_121 (avoids DeepGEMM via Triton indexer).
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         else:
@@ -138,6 +140,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
