@@ -513,6 +513,10 @@ def sparse_attn_indexer(
             and num_rows <= 32
             and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
             and current_platform.has_device_capability(90)
+            # GB10/sm_121: cooperative_topk's launch_cooperative_cluster fails with
+            # "invalid argument" (integrated consumer-Blackwell can't do that cluster
+            # launch). Fall through to persistent_topk (fixed by topk_sm121_smem patch).
+            and not current_platform.is_device_capability(121)
         )
         use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
             512,
