@@ -679,7 +679,14 @@ _KIMI_SCHEMA_CONSTRAINT_KEYS = ("$ref", "anyOf", "enum", "type")
 
 
 def _is_kimi_tokenizer(tokenizer: HfTokenizer) -> bool:
-    return "tokenization_kimi" in type(tokenizer).__module__
+    # vllm.tokenizers.hf mutates the instance's class to a dynamically created
+    # subclass (TokenizerPool/CachedTokenizer, defined in that module), so
+    # type(tokenizer).__module__ reports vLLM's module. Walk the MRO to find
+    # the checkpoint's trust_remote_code base class.
+    return any(
+        "tokenization_kimi" in getattr(cls, "__module__", "")
+        for cls in type(tokenizer).__mro__
+    )
 
 
 def _normalize_kimi_schema_node(node: Any) -> Any:
