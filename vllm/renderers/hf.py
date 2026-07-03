@@ -661,6 +661,87 @@ def resolve_chat_template_kwargs(
     return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
 
 
+# JSON-Schema keys understood by the `tool_declaration_ts.py` converter that
+# Moonshot ships inside Kimi checkpoints (loaded via trust_remote_code). A
+# schema node carrying none of these — e.g. an annotation-only
+# `{"description": ...}` — makes that converter raise, which aborts
+# TypeScript-style rendering for the ENTIRE tool set and silently degrades
+# Kimi tool prompting to the fallback format on every request.
+_KIMI_SCHEMA_CONSTRAINT_KEYS = ("$ref", "anyOf", "enum", "type")
+
+
+def _is_kimi_tokenizer(tokenizer: HfTokenizer) -> bool:
+    return "tokenization_kimi" in type(tokenizer).__module__
+
+
+def _normalize_kimi_schema_node(node: Any) -> Any:
+    """Normalize a JSON-Schema node into the dialect the Kimi checkpoint
+    converter accepts. Per JSON Schema semantics, a schema without
+    constraints accepts any value, which the converter spells `{}` -> `any`.
+    """
+    if not isinstance(node, dict):
+        return node
+    node = dict(node)
+    if isinstance(node.get("properties"), dict):
+        node["properties"] = {
+            k: _normalize_kimi_schema_node(v) for k, v in node["properties"].items()
+        }
+    if "items" in node:
+        items = node["items"]
+        node["items"] = (
+            [_normalize_kimi_schema_node(v) for v in items]
+            if isinstance(items, list)
+            else _normalize_kimi_schema_node(items)
+        )
+    for key in ("anyOf", "oneOf", "allOf"):
+        if isinstance(node.get(key), list):
+            node[key] = [_normalize_kimi_schema_node(v) for v in node[key]]
+    for key in ("$defs", "definitions"):
+        if isinstance(node.get(key), dict):
+            node[key] = {
+                k: _normalize_kimi_schema_node(v) for k, v in node[key].items()
+            }
+    if isinstance(node.get("additionalProperties"), dict):
+        node["additionalProperties"] = _normalize_kimi_schema_node(
+            node["additionalProperties"]
+        )
+    if "oneOf" in node and "anyOf" not in node:
+        node["anyOf"] = node.pop("oneOf")
+    if "const" in node and "enum" not in node:
+        node["enum"] = [node.pop("const")]
+    if not any(k in node for k in _KIMI_SCHEMA_CONSTRAINT_KEYS):
+        if "properties" in node:
+            node["type"] = "object"
+        elif "items" in node:
+            node["type"] = "array"
+        else:
+            # Annotation-only or unrepresentable schema: constrains nothing.
+            return {}
+    return node
+
+
+def _normalize_kimi_tool_schemas(
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    changed = False
+    for tool in tools:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        params = fn.get("parameters") if isinstance(fn, dict) else None
+        if isinstance(params, dict):
+            new_params = _normalize_kimi_schema_node(params)
+            if new_params != params:
+                tool = {**tool, "function": {**fn, "parameters": new_params}}
+                changed = True
+        normalized.append(tool)
+    if changed:
+        logger.info_once(
+            "Normalized tool JSON schemas for the Kimi chat template "
+            "(schema nodes without type information mapped to `any`)."
+        )
+    return normalized
+
+
 @overload
 def safe_apply_chat_template(
     model_config: ModelConfig,
@@ -773,6 +854,9 @@ def safe_apply_chat_template(
     # consistently across v4 and v5.
     if tokenize and "return_dict" not in resolved_kwargs:
         resolved_kwargs["return_dict"] = False
+
+    if tools and _is_kimi_tokenizer(tokenizer):
+        tools = _normalize_kimi_tool_schemas(tools)
 
     try:
         plain = tokenizer.apply_chat_template(
