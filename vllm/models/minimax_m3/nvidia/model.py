@@ -12,6 +12,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import re
 from collections.abc import Iterable
 
 import torch
@@ -1062,9 +1063,58 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
+    # VL exports nest the text backbone under a `language_model.` prefix and ship
+    # a vision tower / projector. Rewrite that prefix to this module's `model.`
+    # and skip the vision weights when serving the text backbone standalone.
+    # Handles both `language_model.` (e.g. Mapika/MiniMax-M3-NVFP4) and
+    # `model.language_model.` layouts. No-op for native text-only checkpoints.
+    #
+    # transformers-style exports (e.g. lukealonso/MiniMax-M3-NVFP4) also name the
+    # MoE block and lightning indexer differently from the native checkpoint this
+    # backbone was written against. Normalize both to this module's layout:
+    #   * MoE block:    `…layers.N.mlp.{experts,gate,shared_experts}…`
+    #                -> `…layers.N.block_sparse_moe.{experts,gate,shared_experts}…`
+    #     (dense layers 0-2 keep their plain `mlp.` FFN — the `.experts.`/`.gate.`/
+    #     `.shared_experts.` tokens only exist on MoE layers, so this is layer-safe;
+    #     `.mlp.gate.` has a trailing dot and never matches `mlp.gate_up_proj`.)
+    #   * Routed-expert leaves: `experts.E.{gate,up,down}_proj`
+    #                        -> `experts.E.{w1,w3,w2}` (this backbone's ckpt names).
+    #     Regex-scoped to `.experts.<int>.` so dense/shared `down_proj`/`gate_up_proj`
+    #     are left untouched (a bare `down_proj` substr would also hit them).
+    #   * Indexer:      `…self_attn.indexer.{q,k}_proj` -> `…self_attn.index_{q,k}_proj`
+    #                   (then folded into the fused qkv_proj by the stacked mapping),
+    #                   `…self_attn.indexer.{q,k}_norm` -> `…self_attn.index_{q,k}_norm`.
+    # No-op for native checkpoints that already use the `block_sparse_moe`/`w1w2w3`/
+    # `index_*` names (none of these patterns match those).
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_regex={
+            re.compile(r"\.mlp\.experts\.(\d+)\.gate_proj\."): (
+                r".block_sparse_moe.experts.\1.w1."
+            ),
+            re.compile(r"\.mlp\.experts\.(\d+)\.up_proj\."): (
+                r".block_sparse_moe.experts.\1.w3."
+            ),
+            re.compile(r"\.mlp\.experts\.(\d+)\.down_proj\."): (
+                r".block_sparse_moe.experts.\1.w2."
+            ),
+        },
+        orig_to_new_substr={
+            ".self_attn.indexer.q_proj.": ".self_attn.index_q_proj.",
+            ".self_attn.indexer.k_proj.": ".self_attn.index_k_proj.",
+            ".self_attn.indexer.q_norm.": ".self_attn.index_q_norm.",
+            ".self_attn.indexer.k_norm.": ".self_attn.index_k_norm.",
+            ".mlp.gate.": ".block_sparse_moe.gate.",
+            ".mlp.shared_experts.": ".block_sparse_moe.shared_experts.",
+        },
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "language_model.": "",
+        },
+    )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
