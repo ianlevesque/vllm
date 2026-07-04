@@ -33,11 +33,45 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
     def end_token(self) -> str:
         return "</mm:think>"
 
+    # Turn-start marker (chat template `bos_token`, opens every role block —
+    # ``]~b]ai`` / ``]~b]user`` …). Used to scope is_reasoning_end to the current
+    # turn so the literal ``</mm:think>`` in the system thinking_instructions (and
+    # in replayed prior assistant turns) does not pre-seed reasoning_ended.
+    _turn_start_token = "]~b]"
+
     def __init__(self, tokenizer, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         self._initial_in_reasoning = chat_kwargs.get("thinking_mode") == "enabled"
         self._at_response_start = True
+        # None-safe: if the marker is absent from the vocab, is_reasoning_end
+        # falls back to the unscoped base behavior (never matches None).
+        self._turn_start_token_id = self.vocab.get(self._turn_start_token)
+
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        # Scope the backward scan to the CURRENT turn. The base implementation
+        # scans the whole sequence and returns True on the first ``</mm:think>``
+        # it sees — but the prompt embeds a literal ``</mm:think>`` (token
+        # 200060) in the thinking_instructions block and in every replayed
+        # assistant turn, so the unscoped scan wrongly reports reasoning-ended
+        # at the end of the prompt. The streaming orchestrator
+        # (vllm/parser/abstract_parser.py:parse_delta) then pre-seeds
+        # ``reasoning_ended=True`` before any token is generated, so the live
+        # ``<mm:think>…</mm:think>`` leaks into ``content`` and
+        # ``reasoning_content`` stays empty (non-streaming extract_reasoning is
+        # string-based over the generation only, so it was unaffected). Stop at
+        # the current turn's ``]~b]`` boundary: a real generated ``</mm:think>``
+        # appears AFTER it (reasoning genuinely ended), while the instruction /
+        # prior-turn closers sit BEFORE it and must be ignored. Mirrors
+        # PoolsideV1ReasoningParser.is_reasoning_end.
+        for token_id in reversed(input_ids):
+            if token_id == self.start_token_id:
+                return False
+            if token_id == self.end_token_id:
+                return True
+            if token_id == self._turn_start_token_id:
+                return False
+        return False
 
     def extract_reasoning(
         self,
