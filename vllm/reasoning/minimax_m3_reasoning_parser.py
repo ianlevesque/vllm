@@ -35,10 +35,17 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
     def end_token(self) -> str:
         return "</mm:think>"
 
+    # Turn-start marker (chat template `bos_token`, opens every role block —
+    # ``]~b]ai`` / ``]~b]user`` …). Used to scope is_reasoning_end to the current
+    # turn so the literal ``</mm:think>`` in the system thinking_instructions (and
+    # in replayed prior assistant turns) does not pre-seed reasoning_ended.
+    _turn_start_token = "]~b]"
+
     def __init__(self, tokenizer, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
         self._start_token_ids = self._encode_marker(self.start_token)
         self._end_token_ids = self._encode_marker(self.end_token)
+        self._turn_start_token_ids = self._encode_marker(self._turn_start_token)
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         self._initial_in_reasoning = chat_kwargs.get("thinking_mode") == "enabled"
         self._reasoning_ended_streaming = False
@@ -311,6 +318,16 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         return count
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        # Scope the scan to the CURRENT turn. The prompt embeds a literal
+        # ``</mm:think>`` in the thinking_instructions block and in every
+        # replayed assistant turn, so an unscoped whole-sequence scan wrongly
+        # reports reasoning-ended at the end of the prompt, pre-seeding
+        # ``reasoning_ended=True`` before any token is generated (the live
+        # reasoning then leaks into ``content``). Only markers after the last
+        # turn-start (``]~b]``) may count.
+        turn_index = self._rfind_token_sequence(input_ids, self._turn_start_token_ids)
+        if turn_index >= 0:
+            input_ids = input_ids[turn_index + len(self._turn_start_token_ids) :]
         start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)
         end_index = self._rfind_token_sequence(input_ids, self._end_token_ids)
         if end_index < 0:
