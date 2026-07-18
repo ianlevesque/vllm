@@ -56,6 +56,16 @@ def merge_attn_states(
             f"output_scale is required when output is {output.dtype}"
         )
 
+    # Both the CUDA kernel (128-bit vectorized accesses) and the Triton
+    # kernel index these tensors as dense [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    # / [NUM_HEADS, NUM_TOKENS]; strided views (e.g. padded-headdim slices
+    # from MLA prefill) silently corrupt the merge. Normalize; no-op when
+    # already dense.
+    prefix_output = prefix_output.contiguous()
+    suffix_output = suffix_output.contiguous()
+    prefix_lse = prefix_lse.contiguous()
+    suffix_lse = suffix_lse.contiguous()
+
     def supported_dtypes(prefix: torch.Tensor) -> bool:
         return prefix.dtype in [torch.float32, torch.half, torch.bfloat16]
 

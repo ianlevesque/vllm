@@ -2120,8 +2120,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 output_lse = attn_softmax_lse
             else:
                 if merge_output is None:
-                    merge_output = torch.empty_like(output)
-                    merge_output_lse = torch.empty_like(output_lse)
+                    # contiguous_format: empty_like preserves strides, and
+                    # `output` may be a padded-headdim slice from the prefill
+                    # backend; the merge kernels assume dense layout.
+                    merge_output = torch.empty_like(
+                        output, memory_format=torch.contiguous_format)
+                    merge_output_lse = torch.empty_like(
+                        output_lse, memory_format=torch.contiguous_format)
                 merge_attn_states(
                     output=merge_output,
                     output_lse=merge_output_lse,
@@ -2228,8 +2233,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 output_lse = attn_softmax_lse
             else:
                 if merge_output is None:
-                    merge_output = torch.empty_like(output)
-                    merge_output_lse = torch.empty_like(output_lse)
+                    # contiguous_format: empty_like preserves strides, and
+                    # `output` may be a padded-headdim slice from the prefill
+                    # backend; the merge kernels assume dense layout.
+                    merge_output = torch.empty_like(
+                        output, memory_format=torch.contiguous_format)
+                    merge_output_lse = torch.empty_like(
+                        output_lse, memory_format=torch.contiguous_format)
                 merge_attn_states(
                     output=merge_output,
                     output_lse=merge_output_lse,

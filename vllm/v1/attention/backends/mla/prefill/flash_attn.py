@@ -124,9 +124,14 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         if isinstance(attn_out, tuple):
             attn_out, lse = attn_out[0], attn_out[1]
 
-        # Unpad output back to v_head_dim if we padded V
+        # Unpad output back to v_head_dim if we padded V.
+        # .contiguous() is load-bearing: this sliced view keeps the padded
+        # head-dim stride, and downstream merge_attn_states kernels perform
+        # dense vectorized loads/stores — feeding them the strided view
+        # silently corrupts chunked-context merges (sm121 Kimi 65K bug,
+        # docs/DEBUG-vllm-kimi-65k.md in the wimshurst repo).
         if self.requires_v_padding:
-            attn_out = attn_out[..., : v.shape[-1]]
+            attn_out = attn_out[..., : v.shape[-1]].contiguous()
 
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
