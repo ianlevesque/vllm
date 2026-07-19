@@ -530,6 +530,16 @@ def _decode_grouped_att_m_fwd(
         # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
         # exceeds 101376 bytes limit
         num_stages = 1
+    elif (
+        not is_hip_
+        and BLOCK_DMODEL >= 512
+        and torch.cuda.get_device_properties(q.device).shared_memory_per_block_optin
+        < 102400
+    ):
+        # MLA BLOCK_DMODEL=512 needs 102400 bytes of shared memory with
+        # num_stages=2, exceeding the 101376-byte limit of consumer-class
+        # SMs (e.g. sm121/GB10).
+        num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
         q,
