@@ -655,6 +655,10 @@ class GPUModelRunner(
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
+        elif self.speculative_config:
+            # Non-last PP ranks never construct a drafter; leave the attribute
+            # present so isinstance-gated spec paths skip cleanly.
+            self.drafter = None  # type: ignore[assignment]
 
         self.num_spec_tokens = 0
         self.prev_num_spec_tokens = 0
@@ -6094,10 +6098,14 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
