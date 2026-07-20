@@ -27,7 +27,9 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.multimodal.inputs import NestedTensors
 
 from .interfaces import LocalArgmaxMixin
+from vllm.sequence import IntermediateTensors
 from .utils import (
+    make_empty_intermediate_tensors_factory,
     AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
@@ -299,6 +301,10 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
         # Store target layer count in draft config
         self.config.target_layer_count = target_layer_num
 
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], self.config.hidden_size
+        )
+
         self.model = DeepseekV2Eagle3Model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -333,7 +339,11 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # PP support: the eagle3 draft runs only on the last PP stage, so it
+        # never consumes PP intermediate tensors; the parameter exists to
+        # satisfy the SupportsPP forward-signature inspection.
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
 
     def compute_logits(
