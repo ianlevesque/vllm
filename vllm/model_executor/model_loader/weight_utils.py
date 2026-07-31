@@ -1132,6 +1132,14 @@ def instanttensor_weights_iterator(
     else:
         process_group = world_group.device_group if world_group.world_size > 1 else None
 
+    if process_group is not None and os.environ.get("INSTANTTENSOR_DISABLE_GROUP", "0") == "1":
+        # Independent per-rank loading. InstantTensor's cooperative-read
+        # allgather drives vLLM's world communicator from its own thread and
+        # stream, which desyncs on socket fabrics where the comm is not
+        # quiescent — and on disjoint-weight PP shapes the cooperative read
+        # is strictly more traffic than direct reads anyway.
+        process_group = None
+
     device = current_platform.current_device()
 
     # copy=True yields tensors that own their memory, staying valid after the
