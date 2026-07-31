@@ -315,9 +315,23 @@ def _repack_marlin_experts(
     perm: torch.Tensor,
     is_a_8bit: bool,
 ) -> torch.Tensor:
-    """Repack each expert to marlin format into a preallocated output."""
+    """Repack each expert to marlin format.
+
+    When the input is contiguous, repack IN PLACE: each expert's marlin
+    layout has the exact same byte count as its source, and the repack
+    kernel reads from a per-expert staging copy (the `.contiguous()`
+    below), so the result can be written back over the source slot and
+    the full tensor reinterpreted at the end. This caps the transient at
+    one expert (~MiB) instead of a full second copy of the weight
+    (~10 GiB per MoE layer for large models), which matters on
+    unified-memory devices where the extra copy can push a rank past the
+    host memory ceiling during post-load processing.
+    """
     num_experts = weight.shape[0]
+    in_place = weight.is_contiguous()
     out: torch.Tensor | None = None
+    out_shape: torch.Size | None = None
+    out_dtype: torch.dtype | None = None
     for i in range(num_experts):
         qweight = weight[i].view(torch.int32).T.contiguous()
         marlin_qweight = ops.gptq_marlin_repack(
@@ -328,13 +342,39 @@ def _repack_marlin_experts(
             num_bits=4,
             is_a_8bit=is_a_8bit,
         )
+        if in_place:
+            if out_shape is None:
+                out_shape = marlin_qweight.shape
+                out_dtype = marlin_qweight.dtype
+                expert_bytes = (
+                    weight[i].numel() * weight[i].element_size()
+                )
+                marlin_bytes = (
+                    marlin_qweight.numel() * marlin_qweight.element_size()
+                )
+                if expert_bytes != marlin_bytes:
+                    # Layout mismatch (padding); fall back to a fresh copy.
+                    in_place = False
+            if in_place:
+                weight[i].view(torch.int32).view(-1).copy_(
+                    marlin_qweight.view(-1)
+                )
+                continue
         if out is None:
+            assert out_dtype is None or out_dtype == marlin_qweight.dtype
             out = torch.empty(
                 (num_experts, *marlin_qweight.shape),
                 dtype=marlin_qweight.dtype,
                 device=marlin_qweight.device,
             )
+            # If earlier experts were written in place before a fallback
+            # (only possible on a byte-count mismatch detected at expert
+            # 0, so in practice the loop is all-or-nothing), copy nothing:
+            # expert 0 triggers the fallback before any write-back.
         out[i] = marlin_qweight
+    if in_place:
+        assert out_shape is not None
+        return weight.view(torch.int32).view(num_experts, *out_shape)
     assert out is not None
     return out
 
