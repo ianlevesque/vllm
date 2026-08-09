@@ -83,6 +83,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.common.ops.sequence_parallel import (
@@ -1017,6 +1018,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
 
+    # Local aux taps are sent directly to the last PP rank for EAGLE3 drafting.
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1035,7 +1039,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1148,9 +1152,17 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = sp_shard(hidden_states)
             assert residual is None, "Currently, SP is not supported with PP"
 
+        # Earlier stages' taps arrive only on the last rank.
+        remote_aux: list[torch.Tensor] = []
+        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
+            remote_aux = self.recv_remote_aux_from_producers(intermediate_tensors)
+
         # sharded aux hidden states when sp is enabled
         aux_hidden_states: list[torch.Tensor] = []
-        if self.start_layer in self.aux_hidden_state_layers:
+        if (
+            get_pp_group().is_first_rank
+            and self.start_layer in self.aux_hidden_state_layers
+        ):
             if self.use_attn_res or residual is None:
                 aux_hidden_states.append(hidden_states)
             else:
@@ -1197,9 +1209,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
             if prefix_sum is not None:
                 hidden_states = hidden_states + prefix_sum
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            tensors.update(self.pack_local_aux_for_last(aux_hidden_states))
+            return IntermediateTensors(tensors)
 
         if self.use_attn_res:
             assert prefix_sum is not None
@@ -1235,6 +1247,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
+        aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
