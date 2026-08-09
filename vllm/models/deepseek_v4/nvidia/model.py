@@ -63,6 +63,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
@@ -958,6 +959,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -994,7 +997,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             dtype=torch.int32,
         )
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1095,6 +1098,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
+        remote_aux: list[torch.Tensor] = []
+        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
+            remote_aux = self.recv_remote_aux_from_producers(intermediate_tensors)
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
         for idx, layer in enumerate(
@@ -1126,7 +1132,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+            tensors = {"hidden_states": hidden_states}
+            tensors.update(self.pack_local_aux_for_last(aux_hidden_states))
+            return IntermediateTensors(tensors)
 
         if self._mtp_hidden_buffer is not None:
             num_tokens = hidden_states.shape[0]
@@ -1141,6 +1149,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
