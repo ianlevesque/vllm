@@ -477,7 +477,12 @@ class K3DSparkForCausalLM(nn.Module, SupportsPP):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        intermediate_tensors=None,
     ) -> torch.Tensor:
+        # Accepted (unused) so the registry's supports_pp() inspect passes:
+        # the v1 drafter only ever runs on the last PP rank, so the draft is
+        # never actually pipeline-sharded.
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
