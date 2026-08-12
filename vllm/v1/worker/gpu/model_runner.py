@@ -1119,6 +1119,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
         )
+        if _PP_DRAFT_DEBUG:
+            logger.warning(
+                "[PPDRAFT] inputids pp=%s ids=%s last_samp=%s",
+                get_pp_group().rank_in_group,
+                self.input_buffers.input_ids[:18].tolist(),
+                self.req_states.last_sampled_tokens[idx_mapping][:4].tolist(),
+            )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
