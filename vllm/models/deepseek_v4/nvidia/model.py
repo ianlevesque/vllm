@@ -27,7 +27,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
+    FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import (
@@ -66,7 +66,14 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -515,6 +522,7 @@ class DeepseekV4MoE(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        use_sequence_parallel: bool = False,
     ):
         super().__init__()
 
@@ -522,6 +530,7 @@ class DeepseekV4MoE(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
+        self.use_sequence_parallel = use_sequence_parallel
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
@@ -595,6 +604,7 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
+                is_sequence_parallel=use_sequence_parallel,
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -671,7 +681,7 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
 
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -689,6 +699,7 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
+            is_sequence_parallel=self.use_sequence_parallel,
         )
 
     def forward(
@@ -737,7 +748,7 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
+            # In this case, the gate/router runs inside the MoERunner class
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,
@@ -792,6 +803,17 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     return DeepseekV4FlashMLAAttention
 
 
+def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    return (
+        parallel_config.pipeline_parallel_size == 1
+        and parallel_config.enable_expert_parallel
+        and parallel_config.tensor_parallel_size > 1
+        and (use_mega_moe or parallel_config.data_parallel_size > 1)
+    )
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -799,11 +821,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = _select_dsv4_attn_cls(vllm_config)(
@@ -811,8 +835,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            eager_scratch_pool=eager_scratch_pool,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        if self.use_sequence_parallel:
+            self.attn.wo_b.reduce_results = False
+        self.ffn = DeepseekV4MoE(
+            vllm_config,
+            prefix=f"{prefix}.ffn",
+            use_sequence_parallel=self.use_sequence_parallel,
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -930,8 +961,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
 
-        # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
+        if self.use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
+
         x = self.attn(positions, x, None)
+        if self.use_sequence_parallel:
+            x = sp_reduce_scatter(x)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
@@ -972,6 +1007,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -989,6 +1025,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(
+            config.num_attention_heads // get_tensor_model_parallel_world_size()
+        )
+        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
+        if not vllm_config.parallel_config.use_ubatching:
+            # TODO: support dbo if needed
+            # this requires the buffer to have ubatch dim
+            self.eager_scratch_pool = DeepseekV4EagerScratchPool(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                padded_heads,
+                config.head_dim,
+                config.index_n_heads,
+                config.index_head_dim,
+                config.index_topk,
+                current_platform.device_type,
+            )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -1014,6 +1066,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                eager_scratch_pool=self.eager_scratch_pool,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1097,6 +1150,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        full_num_tokens = positions.shape[0]
+        if self.use_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding, hidden_states
+                )
+            hidden_states = sp_shard(hidden_states)
+            input_ids = sp_shard(input_ids)
+
         residual, post_mix, res_mix = None, None, None
         remote_aux: list[torch.Tensor] = []
         if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
@@ -1120,7 +1183,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_recon = mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
                 )
-                aux_hidden_states.append(aux_recon.mean(dim=1))
+                aux_hidden_state = aux_recon.mean(dim=1)
+                if self.use_sequence_parallel:
+                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
@@ -1139,6 +1205,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 **self.pack_local_aux_for_last(aux_hidden_states),
             }
             return IntermediateTensors(tensors)
+
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         if self._mtp_hidden_buffer is not None:
             num_tokens = hidden_states.shape[0]
@@ -1187,7 +1256,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # ranks land on the zero pad). SP / unquantized ones need no padding.
         pad_shared_expert = (
             getattr(self.quant_config, "weight_block_size", None) is not None
-            and not self.parallel_config.use_sequence_parallel_moe
+            and not self.use_sequence_parallel
         )
 
         for name, loaded_weight in weights:
