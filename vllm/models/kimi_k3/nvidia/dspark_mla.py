@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -87,7 +88,7 @@ class K3DSparkDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class K3DSparkModel(nn.Module):
+class K3DSparkModel(nn.Module, SupportsPP):
     def __init__(
         self,
         *,
