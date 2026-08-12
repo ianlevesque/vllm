@@ -88,7 +88,7 @@ class K3DSparkDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class K3DSparkModel(nn.Module, SupportsPP):
+class K3DSparkModel(nn.Module):
     def __init__(
         self,
         *,
@@ -415,7 +415,7 @@ class K3DSparkModel(nn.Module, SupportsPP):
         return hidden_states
 
 
-class K3DSparkForCausalLM(nn.Module):
+class K3DSparkForCausalLM(nn.Module, SupportsPP):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
