@@ -21,8 +21,25 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
     from vllm.model_executor.models.utils import get_draft_quant_config
 
+    # The draft model is loaded on the LAST PP rank only (the runner gates drafter
+    # construction on get_pp_group().is_last_rank). instanttensor issues a world-group
+    # all_reduce in _determine_io_params during load; with only one PP rank
+    # participating, that collective has no partners on the other ranks and
+    # deadlocks (NCCL watchdog timeout -> group teardown). get_model() reads
+    # vllm_config.load_config (the TARGET's load-format), ignoring draft_load_config,
+    # so honor an explicit draft_load_config here and force the default loader for
+    # the draft whenever the effective load-format is instanttensor under PP>1.
+    # (Port of 3058ae60f; the dflash/utils.py copy was already patched — this is
+    # the dspark loader, which K3DSpark actually uses. Confirmed via py-spy on a
+    # hung last-stage worker: stuck in instanttensor _determine_io_params.)
+    from vllm.distributed.parallel_state import get_pp_group
+
+    draft_load_config = speculative_config.draft_load_config or vllm_config.load_config
+    if get_pp_group().world_size > 1 and draft_load_config.load_format == "instanttensor":
+        draft_load_config = replace(draft_load_config, load_format="auto")
     draft_vllm_config = replace(
         vllm_config,
+        load_config=draft_load_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
