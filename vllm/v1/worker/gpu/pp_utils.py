@@ -177,12 +177,18 @@ class PPHandler:
             # Replace the slot event so one wait covers sampled + draft recv.
             event = self.broadcast_stream.record_event()
             draft_tokens.record_stream(self.main_stream)
+        # Carry the sampled-token acceptance counts alongside: the mamba/KDA
+        # recurrent-state bookkeeping on non-last ranks needs step N's
+        # acceptance at step N+1's metadata build, not pp_size steps later.
+        slot = self.queue[-1]
+        num_sampled = slot.num_sampled if slot is not None else None
         self._pending_drafts = (
             draft_tokens,
             event,
             input_batch.idx_mapping,
             input_batch.idx_mapping_np.copy(),
             self.req_idx_gen_np[input_batch.idx_mapping_np].copy(),
+            num_sampled,
         )
 
     def pop_pending_drafts(self):
@@ -194,7 +200,7 @@ class PPHandler:
         self._pending_drafts = None
         if pending is None:
             return None
-        draft_tokens, event, idx_mapping, idx_mapping_np, gen_at_recv_np = pending
+        draft_tokens, event, idx_mapping, idx_mapping_np, gen_at_recv_np, num_sampled = pending
         freed = self.req_idx_gen_np[idx_mapping_np] != gen_at_recv_np
         if freed.all():
             return None
@@ -203,8 +209,12 @@ class PPHandler:
             keep = ~freed
             keep_t = torch.as_tensor(keep, device=self.device)
             keep_idx = async_copy_to_gpu(idx_mapping_np[keep], device=self.device)
-            return draft_tokens[keep_t], keep_idx
-        return draft_tokens, idx_mapping
+            return (
+                draft_tokens[keep_t],
+                keep_idx,
+                num_sampled[keep_t] if num_sampled is not None else None,
+            )
+        return draft_tokens, idx_mapping, num_sampled
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*

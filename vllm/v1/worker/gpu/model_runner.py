@@ -883,8 +883,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # slots and the context is poisoned from token 1.
             pending = self.pp_handler.pop_pending_drafts()
             if pending is not None:
-                draft_tokens, draft_idx_mapping = pending
+                draft_tokens, draft_idx_mapping, num_sampled = pending
                 self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
+                if num_sampled is not None:
+                    # The KDA/mamba recurrent-state metadata for THIS step
+                    # needs the previous step's acceptance counts; the deferred
+                    # postprocess would deliver them one step too late, leaving
+                    # stage-0 linear-attention state permanently diverged.
+                    # num_computed_tokens=None => scatter-only (the block-align
+                    # postprocess stays on the deferred path, idempotent).
+                    self.model_state.postprocess_state(
+                        draft_idx_mapping, num_sampled, None
+                    )
                 if _PP_DRAFT_DEBUG:
                     logger.warning(
                         "[PPDRAFT] draft_update pp=%s dt=%s",
