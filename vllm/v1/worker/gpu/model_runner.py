@@ -1121,10 +1121,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if _PP_DRAFT_DEBUG:
             logger.warning(
-                "[PPDRAFT] inputids pp=%s ids=%s last_samp=%s",
+                "[PPDRAFT] inputids pp=%s ids=%s last_samp=%s pos=%s seqs=%s",
                 get_pp_group().rank_in_group,
                 self.input_buffers.input_ids[:18].tolist(),
                 self.req_states.last_sampled_tokens[idx_mapping][:4].tolist(),
+                self.input_buffers.positions[:18].tolist(),
+                self.input_buffers.seq_lens[:4].tolist(),
             )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
