@@ -134,6 +134,10 @@ from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
 
+import os as _os
+_PP_DRAFT_DEBUG = _os.environ.get("VLLM_PP_DRAFT_DEBUG") == "1"
+
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -879,6 +883,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if draft_update is not None:
                     draft_tokens, draft_idx_mapping = draft_update
                     self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
+                    if _PP_DRAFT_DEBUG:
+                        logger.warning(
+                            "[PPDRAFT] draft_update rank=%s dt=%s",
+                            self.rank,
+                            draft_tokens[:2].tolist() if draft_tokens.numel() else [],
+                        )
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -1087,6 +1097,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
+        if _PP_DRAFT_DEBUG:
+            _dt = self.req_states.draft_tokens[idx_mapping]
+            logger.warning(
+                "[PPDRAFT] splice rank=%s dt=%s",
+                self.rank, _dt[:2].tolist() if _dt.numel() else [],
+            )
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
@@ -1656,6 +1672,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if _PP_DRAFT_DEBUG:
+                logger.warning(
+                    "[PPDRAFT] propose rank=%s dt=%s",
+                    self.rank,
+                    draft_tokens[:2].tolist() if draft_tokens.numel() else [],
+                )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
