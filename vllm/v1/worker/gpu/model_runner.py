@@ -1202,6 +1202,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
+        if _PP_DRAFT_DEBUG:
+            logger.warning(
+                "[PPDRAFT] slots pp=%s sm=%s pos=%s",
+                get_pp_group().rank_in_group,
+                [sm[:4].tolist() for sm in slot_mappings],
+                input_batch.positions[:4].tolist(),
+            )
         return block_tables, slot_mappings
 
     def prepare_dummy_attn(
