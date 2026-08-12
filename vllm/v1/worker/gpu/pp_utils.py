@@ -76,6 +76,15 @@ class PPHandler:
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
 
+        # Freshest broadcast draft proposals, consumed at the NEXT step's
+        # input prep (one step after broadcast). Draft ids are needed by the
+        # next step's input splice; parking them on the pp_size-deep deferred
+        # queue (as the sampled-token slot does) delivers them one step too
+        # late, so non-last ranks embed the PREVIOUS block's proposals — or
+        # zeros on the first block — at the CURRENT draft slots and poison
+        # the context (observed: DSpark+PP2 100% acceptance + degeneration).
+        self._pending_drafts = None
+
         # On non-last ranks, a FIFO with one entry per in-flight step: the entry
         # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
         # with pp_size None placeholders so the first pp_size consumes are no-ops.
@@ -131,19 +140,6 @@ class PPHandler:
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
         )
-        if slot.draft_tokens is not None:
-            # Drop freed rows: their req index may already belong to a new
-            # request by the time this deferred write lands.
-            if exclude_mask.any():
-                keep = ~exclude_mask
-                keep_t = torch.as_tensor(keep, device=self.device)
-                draft_idx_np = slot.idx_mapping_np[keep]
-                outputs["draft_update"] = (
-                    slot.draft_tokens[keep_t],
-                    async_copy_to_gpu(draft_idx_np, device=self.device),
-                )
-            else:
-                outputs["draft_update"] = (slot.draft_tokens, slot.idx_mapping)
         return outputs
 
     def broadcast_drafts(
@@ -181,10 +177,34 @@ class PPHandler:
             # Replace the slot event so one wait covers sampled + draft recv.
             event = self.broadcast_stream.record_event()
             draft_tokens.record_stream(self.main_stream)
-        slot = self.queue[-1]
-        if slot is not None:
-            slot.draft_tokens = draft_tokens
-            slot.event = event
+        self._pending_drafts = (
+            draft_tokens,
+            event,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np.copy(),
+            self.req_idx_gen_np[input_batch.idx_mapping_np].copy(),
+        )
+
+    def pop_pending_drafts(self):
+        """Consume the freshest broadcast draft proposals (posted at the end of
+        the previous step). Waits on the recv event — long complete by input
+        prep — and filters rows whose request was freed since receive.
+        """
+        pending = self._pending_drafts
+        self._pending_drafts = None
+        if pending is None:
+            return None
+        draft_tokens, event, idx_mapping, idx_mapping_np, gen_at_recv_np = pending
+        freed = self.req_idx_gen_np[idx_mapping_np] != gen_at_recv_np
+        if freed.all():
+            return None
+        self.main_stream.wait_event(event)
+        if freed.any():
+            keep = ~freed
+            keep_t = torch.as_tensor(keep, device=self.device)
+            keep_idx = async_copy_to_gpu(idx_mapping_np[keep], device=self.device)
+            return draft_tokens[keep_t], keep_idx
+        return draft_tokens, idx_mapping
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*

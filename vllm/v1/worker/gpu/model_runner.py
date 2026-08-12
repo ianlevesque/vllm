@@ -875,20 +875,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # For non-last PP ranks, update decode requests with sampler output from
         # the prior step in which they were scheduled (pp_size steps ago).
         if self.pp_handler is not None:
+            # Draft proposals feed THIS step's input splice — consume them
+            # immediately (posted at the end of the previous step). Routing
+            # them through the pp_size-deep deferred queue applies them one
+            # step too late: non-last ranks then embed the PREVIOUS block's
+            # proposals (zeros on the first block) at the CURRENT draft
+            # slots and the context is poisoned from token 1.
+            pending = self.pp_handler.pop_pending_drafts()
+            if pending is not None:
+                draft_tokens, draft_idx_mapping = pending
+                self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
+                if _PP_DRAFT_DEBUG:
+                    logger.warning(
+                        "[PPDRAFT] draft_update pp=%s dt=%s",
+                        get_pp_group().rank_in_group,
+                        draft_tokens[:2].tolist() if draft_tokens.numel() else [],
+                    )
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
-                # Land with the matching sampled tokens so _prepare_inputs
-                # splices real draft ids instead of placeholders.
-                draft_update = outputs.pop("draft_update", None)
-                if draft_update is not None:
-                    draft_tokens, draft_idx_mapping = draft_update
-                    self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
-                    if _PP_DRAFT_DEBUG:
-                        logger.warning(
-                            "[PPDRAFT] draft_update pp=%s dt=%s",
-                            get_pp_group().rank_in_group,
-                            draft_tokens[:2].tolist() if draft_tokens.numel() else [],
-                        )
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
