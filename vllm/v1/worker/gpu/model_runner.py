@@ -885,8 +885,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
                     if _PP_DRAFT_DEBUG:
                         logger.warning(
-                            "[PPDRAFT] draft_update rank=%s dt=%s",
-                            self.rank,
+                            "[PPDRAFT] draft_update pp=%s dt=%s",
+                            get_pp_group().rank_in_group,
                             draft_tokens[:2].tolist() if draft_tokens.numel() else [],
                         )
                 self.postprocess_sampled(**outputs)
@@ -1100,8 +1100,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if _PP_DRAFT_DEBUG:
             _dt = self.req_states.draft_tokens[idx_mapping]
             logger.warning(
-                "[PPDRAFT] splice rank=%s dt=%s",
-                self.rank, _dt[:2].tolist() if _dt.numel() else [],
+                "[PPDRAFT] splice pp=%s dt=%s",
+                get_pp_group().rank_in_group, _dt[:2].tolist() if _dt.numel() else [],
             )
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
@@ -1674,8 +1674,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if _PP_DRAFT_DEBUG:
                 logger.warning(
-                    "[PPDRAFT] propose rank=%s dt=%s",
-                    self.rank,
+                    "[PPDRAFT] propose pp=%s dt=%s",
+                    get_pp_group().rank_in_group,
                     draft_tokens[:2].tolist() if draft_tokens.numel() else [],
                 )
 
