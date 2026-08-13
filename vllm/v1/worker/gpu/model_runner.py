@@ -883,17 +883,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # slots and the context is poisoned from token 1.
             pending = self.pp_handler.pop_pending_drafts()
             if pending is not None:
-                draft_tokens, draft_idx_mapping, num_sampled = pending
+                (
+                    draft_tokens,
+                    draft_idx_mapping,
+                    num_sampled,
+                    sampled_tokens,
+                    num_rejected,
+                ) = pending
                 self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
-                if num_sampled is not None:
-                    # The KDA/mamba recurrent-state metadata for THIS step
-                    # needs the previous step's acceptance counts; the deferred
-                    # postprocess would deliver them one step too late, leaving
-                    # stage-0 linear-attention state permanently diverged.
-                    # num_computed_tokens=None => scatter-only (the block-align
-                    # postprocess stays on the deferred path, idempotent).
-                    self.model_state.postprocess_state(
-                        draft_idx_mapping, num_sampled, None
+                if sampled_tokens is not None:
+                    # Recurrent-state models (KDA/mamba) read num_computed /
+                    # num_accepted / last_sampled in THIS step's forward, so
+                    # the previous step's sampled postprocess must land now —
+                    # not pp_size steps later via the deferred queue (which is
+                    # timed for output bookkeeping, not forward consumption).
+                    self.postprocess_sampled(
+                        draft_idx_mapping,
+                        sampled_tokens,
+                        num_sampled,
+                        num_rejected,
                     )
                 if _PP_DRAFT_DEBUG:
                     logger.warning(
@@ -901,9 +909,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         get_pp_group().rank_in_group,
                         draft_tokens[:2].tolist() if draft_tokens.numel() else [],
                     )
-            outputs = self.pp_handler.get_prev_sampled_outputs()
-            if outputs is not None:
-                self.postprocess_sampled(**outputs)
+            # Cycle the deferred queue; its payloads are already applied above.
+            self.pp_handler.get_prev_sampled_outputs()
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:

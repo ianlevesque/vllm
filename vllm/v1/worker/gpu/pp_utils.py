@@ -182,6 +182,8 @@ class PPHandler:
         # acceptance at step N+1's metadata build, not pp_size steps later.
         slot = self.queue[-1]
         num_sampled = slot.num_sampled if slot is not None else None
+        sampled_tokens = slot.sampled_tokens if slot is not None else None
+        num_rejected = slot.num_rejected if slot is not None else None
         self._pending_drafts = (
             draft_tokens,
             event,
@@ -189,6 +191,8 @@ class PPHandler:
             input_batch.idx_mapping_np.copy(),
             self.req_idx_gen_np[input_batch.idx_mapping_np].copy(),
             num_sampled,
+            sampled_tokens,
+            num_rejected,
         )
 
     def pop_pending_drafts(self):
@@ -200,7 +204,16 @@ class PPHandler:
         self._pending_drafts = None
         if pending is None:
             return None
-        draft_tokens, event, idx_mapping, idx_mapping_np, gen_at_recv_np, num_sampled = pending
+        (
+            draft_tokens,
+            event,
+            idx_mapping,
+            idx_mapping_np,
+            gen_at_recv_np,
+            num_sampled,
+            sampled_tokens,
+            num_rejected,
+        ) = pending
         freed = self.req_idx_gen_np[idx_mapping_np] != gen_at_recv_np
         if freed.all():
             return None
@@ -209,12 +222,18 @@ class PPHandler:
             keep = ~freed
             keep_t = torch.as_tensor(keep, device=self.device)
             keep_idx = async_copy_to_gpu(idx_mapping_np[keep], device=self.device)
+
+            def _f(t):
+                return t[keep_t] if t is not None else None
+
             return (
                 draft_tokens[keep_t],
                 keep_idx,
-                num_sampled[keep_t] if num_sampled is not None else None,
+                _f(num_sampled),
+                _f(sampled_tokens),
+                _f(num_rejected),
             )
-        return draft_tokens, idx_mapping, num_sampled
+        return draft_tokens, idx_mapping, num_sampled, sampled_tokens, num_rejected
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
