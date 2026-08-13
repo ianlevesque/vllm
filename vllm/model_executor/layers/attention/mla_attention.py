@@ -1905,6 +1905,38 @@ def build_mla_chunked_context_metadata(
     )
 
 
+def _group_supports_non_causal_multi_token_decode(
+    kv_cache_spec: AttentionSpec,
+    layer_names: list[str],
+    static_forward_context: dict[str, object],
+) -> bool:
+    """Return whether every active layer uses non-causal block decode.
+
+    ``MLAAttentionSpec.merge`` promotes the marker with ``any`` so a packed KV
+    cache group can retain the capability when it contains both target and
+    draft layers. Metadata builders operate on a narrower attention group,
+    however, and enabling multi-token decode for a causal target layer makes
+    its query rows outnumber its request-indexed block-table rows. Prefer the
+    per-layer marker here and only enable the path when all active layers opt
+    in. The merged spec remains a fallback for attention modules that do not
+    expose the marker themselves.
+    """
+    assert layer_names
+    spec_default = bool(
+        getattr(kv_cache_spec, "non_causal_multi_token_decode", False)
+    )
+    return all(
+        bool(
+            getattr(
+                static_forward_context[layer_name],
+                "non_causal_multi_token_decode",
+                spec_default,
+            )
+        )
+        for layer_name in layer_names
+    )
+
+
 class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -2018,8 +2050,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.vllm_config = vllm_config
         self.device = device
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
-        self.non_causal_multi_token_decode = getattr(
-            kv_cache_spec, "non_causal_multi_token_decode", False
+        self.non_causal_multi_token_decode = (
+            _group_supports_non_causal_multi_token_decode(
+                kv_cache_spec,
+                layer_names,
+                self.compilation_config.static_forward_context,
+            )
         )
 
         # A draft cache group can have a different head count from the target.

@@ -10,6 +10,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     QueryLenSupport,
+    _group_supports_non_causal_multi_token_decode,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -124,3 +125,28 @@ def test_mla_cache_marker_is_promoted_to_group_capability():
     assert not MLAAttentionSpec.merge(
         [unmarked, unmarked]
     ).non_causal_multi_token_decode
+
+
+def test_mla_builder_marker_uses_active_layers_not_merged_cache_group():
+    kwargs = {
+        "block_size": 64,
+        "num_kv_heads": 1,
+        "head_size": 576,
+        "dtype": torch.bfloat16,
+    }
+    marked = MLAAttentionSpec(**kwargs, non_causal_multi_token_decode=True)
+    unmarked = MLAAttentionSpec(**kwargs)
+    merged = MLAAttentionSpec.merge([marked, unmarked])
+    context = {
+        "target": SimpleNamespace(non_causal_multi_token_decode=False),
+        "draft": SimpleNamespace(non_causal_multi_token_decode=True),
+    }
+
+    assert merged.non_causal_multi_token_decode
+    assert not _group_supports_non_causal_multi_token_decode(
+        merged, ["target"], context
+    )
+    assert _group_supports_non_causal_multi_token_decode(merged, ["draft"], context)
+    assert not _group_supports_non_causal_multi_token_decode(
+        merged, ["target", "draft"], context
+    )
