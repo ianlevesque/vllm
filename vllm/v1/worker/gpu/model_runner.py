@@ -1145,6 +1145,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers.positions[:18].tolist(),
                 self.input_buffers.seq_lens[:4].tolist(),
             )
+            logger.warning(
+                "[PPDRAFT] logitsix pp=%s li=%s nq=%s total_logits=%s ndraft=%s",
+                get_pp_group().rank_in_group,
+                logits_indices[:8].tolist(),
+                input_batch.num_reqs,
+                total_num_logits,
+                num_draft_tokens_per_req[:4].tolist()
+                if num_draft_tokens_per_req is not None else None,
+            )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
