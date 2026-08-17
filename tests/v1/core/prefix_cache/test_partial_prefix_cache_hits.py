@@ -1448,3 +1448,277 @@ def test_mamba_coarse_checkpoint_retained_below_eagle_proof_boundary(monkeypatch
     req1 = make_request("1", [7] * 9 + [9] * 4, block_size, sha256)
     _, num_computed, _ = manager.get_computed_blocks(req1)
     assert num_computed == 4
+
+
+def test_shared_prefix_shorter_than_the_prompt_resumes_below_a_block():
+    """A system prompt followed by a per-request suffix -- the deployed shape.
+
+    The owner's prompt tail sits over its own suffix, which no sibling shares, so
+    a check-point there is unreachable. The follower's full-attention hit stops at
+    the last shared BLOCK boundary and eagle drops one hash unit below it, so that
+    is where mamba state has to exist.
+    """
+    hash_block_size = 4
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+
+    shared = [7] * 24
+    owner = make_request("0", shared + [8] * 16, hash_block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    done = 0
+    for stop in (12, 16, 32, 36, 40):
+        assert (
+            manager.allocate_slots(owner, stop - done, num_computed, computed)
+            if done == 0
+            else manager.allocate_slots(owner, stop - done)
+        ) is not None
+        done = stop
+        owner.num_computed_tokens = done
+        manager.new_step_starts()
+
+    follower = make_request("1", shared + [9] * 8, hash_block_size, sha256)
+    _, hit, _ = manager.get_computed_blocks(follower)
+    # 16 is the last shared block boundary; eagle drops to 12. A check-point at
+    # the owner's prompt tail (40, or 36 one unit below it) is over the suffix
+    # and cannot serve this.
+    assert hit == 12, f"expected the resume point at 12, got {hit}"
+
+
+def test_mamba_align_split_stops_at_the_eagle_resume_point():
+    """With eagle, a chunk stops at the junction, floored to the hash grid.
+
+    That is where a later request resumes, so the state has to be cacheable
+    there; otherwise its hit floors to the previous block boundary.
+    """
+    block_size = 512
+    hash_block_size = 32
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+    )
+    split = Scheduler._mamba_block_aligned_split
+
+    req = make_request("0", [0] * 10000, hash_block_size, sha256)
+    req.num_computed_tokens = 0
+
+    # No sibling has resumed anywhere yet, so there is nothing to check-point
+    # and the chunk is not clipped at all.
+    assert split(self=mock, request=req, num_new_tokens=8192) == 8192
+
+    # A sibling resumed at 2000. Eagle prunes one hash unit off the prefix it
+    # verifies, so 2000 is not on the block grid: stop on the hash grid just
+    # below it (1984) instead of the block boundary (1536), which would round
+    # the resume point away and cost the sibling a whole block.
+    req.shared_prefix_boundary = 2000
+    assert split(self=mock, request=req, num_new_tokens=8192) == 1984
+
+    # Without eagle nothing is pruned, so a sibling resumes on the block grid
+    # and the junction is block-floored as before.
+    mock.use_eagle = False
+    assert split(self=mock, request=req, num_new_tokens=8192) == 1536
+
+
+def test_junction_past_the_prompt_adds_no_stop():
+    """A resumed request's junction can land in its output tokens.
+
+    MambaManager only registers the resume point during the prompt, so stopping
+    there would split the chunk for a check-point that is never written.
+    """
+    block_size = 512
+    hash_block_size = 32
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+    )
+    split = Scheduler._mamba_block_aligned_split
+
+    # 2000 prompt tokens, resumed with 2000 output tokens replayed. num_tokens is
+    # a property over the token list, so the output tokens are appended. The
+    # lengths are chosen so the junction stop would win the min() if it were
+    # kept -- otherwise last_cache_position hides the difference.
+    req = make_request("0", [0] * 2000, hash_block_size, sha256)
+    for _ in range(2000):
+        req.append_output_token_ids(1)
+    req.num_computed_tokens = 0
+    assert req.num_prompt_tokens == 2000 and req.num_tokens == 4000
+
+    # 2208 is past the prompt: dropped, so the chunk runs to the last cacheable
+    # block boundary (3072) instead of stopping at 2208.
+    req.shared_prefix_boundary = 2208
+    assert split(self=mock, request=req, num_new_tokens=8192) == 3072
+
+    # Inside the prompt it still stops, on the hash grid below the junction.
+    req.shared_prefix_boundary = 1000
+    assert split(self=mock, request=req, num_new_tokens=8192) == 992
+
+
+def test_eagle_reaches_the_resume_point_instead_of_flooring_a_block():
+    """The regression: eagle drops one hash unit and mamba loses a whole block.
+
+    Full attention hits at 8, eagle drops one hash unit to 7, and the mamba
+    group -- whose states sit at 4 and 8 -- floors to 4. Caching the state at 7
+    keeps the hit there.
+    """
+    hash_block_size = 1
+    block_size = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+
+    # The shared prefix ends exactly on a block boundary (8), which is the case
+    # that loses a block: the drop puts the candidate at 7, and mamba's states
+    # sit at 4 and 8. The stops below stand in for the scheduler's split once a
+    # junction has been observed at 7, so a state exists there.
+    owner = make_request("0", [7] * 8, hash_block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    done = 0
+    for stop in (3, 4, 7, 8):
+        assert (
+            manager.allocate_slots(owner, stop - done, num_computed, computed)
+            if done == 0
+            else manager.allocate_slots(owner, stop - done)
+        ) is not None
+        done = stop
+        owner.num_computed_tokens = done
+        manager.new_step_starts()
+
+    follower = make_request("1", [7] * 8 + [9] * 2, hash_block_size, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(follower)
+    assert hit == 7, f"expected the eagle resume point at 7, got {hit}"
+    assert all(len(g) * block_size >= hit for g in blocks.blocks)
+
+
+def test_junction_check_point_is_what_a_sibling_resumes_from():
+    """The junction clause on its own, when the prefix ends at the prompt tail.
+
+    The block-grid clause cannot fire here: the shared prefix ends at 24, so the
+    eagle-dropped candidate is 20 and ``(20 + 4) % 16 != 0``. Only
+    ``num_tokens == shared_prefix_boundary`` reaches 20.
+
+    Note this is the case where the shared prefix runs to the END of the owner's
+    prompt. When it ends earlier -- a system prompt followed by a per-request
+    suffix -- the resume point is one hash unit below a block boundary instead;
+    see ``test_shared_prefix_shorter_than_the_prompt_resumes_below_a_block``.
+    """
+    hash_block_size = 4
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+
+    # The owner's prompt IS the shared prefix, so full attention registers its
+    # partial tail at 24 and a sibling can match there.
+    shared = [7] * 24
+    owner = make_request("0", shared, hash_block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    done = 0
+    for stop in (16, 20, 24):
+        # What the scheduler does once it has observed the junction: the split
+        # stops at 20, and the manager must accept that position.
+        owner.shared_prefix_boundary = 20
+        assert (
+            manager.allocate_slots(owner, stop - done, num_computed, computed)
+            if done == 0
+            else manager.allocate_slots(owner, stop - done)
+        ) is not None
+        done = stop
+        owner.num_computed_tokens = done
+        manager.new_step_starts()
+
+    follower = make_request("1", shared + [9] * 8, hash_block_size, sha256)
+    _, hit, _ = manager.get_computed_blocks(follower)
+    assert hit == 20, f"expected the junction check-point at 20, got {hit}"

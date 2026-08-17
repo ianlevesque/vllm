@@ -1775,7 +1775,19 @@ class MambaManager(SingleTypeKVCacheManager):
             latest_prompt_hash_boundary = max(
                 latest_prompt_hash_boundary - hash_block_size, 0
             )
-        if num_tokens != latest_prompt_hash_boundary:
+        # When the shared prefix ends BEFORE this prompt's tail -- a system
+        # prompt followed by a per-request suffix -- a sibling's match stops at
+        # the last shared block boundary and eagle drops one unit below that.
+        # The tail position above is over this request's own suffix and cannot
+        # serve it, so accept the block-grid resume point too. Prompt only:
+        # during decode the target is the running state block, mutated in place
+        # and only equal to what its key promises after that step's forward.
+        block_grid_resume_point = (
+            self.use_eagle
+            and num_tokens <= request.num_prompt_tokens
+            and (num_tokens + hash_block_size) % self.block_size == 0
+        )
+        if num_tokens != latest_prompt_hash_boundary and not block_grid_resume_point:
             return None
 
         block_idx = num_tokens // self.block_size
