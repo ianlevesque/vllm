@@ -1517,93 +1517,103 @@ class SpecDecodeBaseProposer:
         have a duplicate copy of the target model's embedding layers. In these cases,
         we share the target model's embedding layers with the draft model to save
         memory.
+
+        Under pipeline parallelism (PP > 1), the target model's embed_tokens may be
+        a PPMissingLayer on non-first ranks. In that case, we skip sharing on those
+        ranks and let the draft model use its own embedding (or skip loading).
         """
-        if get_pp_group().world_size == 1:
-            inner_model = getattr(target_language_model, "model", None)
-            if inner_model is None:
-                raise AttributeError("Target model does not have 'model' attribute")
-            if hasattr(inner_model, "embed_tokens"):
-                target_embed_tokens = inner_model.embed_tokens
-            elif hasattr(inner_model, "embedding"):
-                target_embed_tokens = inner_model.embedding
-            else:
-                raise AttributeError(
-                    "Target model does not have 'embed_tokens' or 'embedding' attribute"
-                )
+        from vllm.model_executor.models.utils import PPMissingLayer
 
-            share_embeddings = False
-            if hasattr(self.model, "has_own_embed_tokens"):
-                # EAGLE model
-                if not self.model.has_own_embed_tokens:
-                    share_embeddings = True
-                    logger.info(
-                        "Detected EAGLE model without its own embed_tokens in the"
-                        " checkpoint. Sharing target model embedding weights with the"
-                        " draft model."
-                    )
-                elif (
-                    isinstance(target_embed_tokens.weight, torch.Tensor)
-                    and isinstance(self.model.model.embed_tokens.weight, torch.Tensor)
-                    # TODO: Offload to CPU for comparison to avoid extra GPU memory
-                    # usage in CI testing environments with limited GPU memory
-                    and torch.equal(
-                        target_embed_tokens.weight.cpu(),
-                        self.model.model.embed_tokens.weight.cpu(),
-                    )
-                ):
-                    share_embeddings = True
-                    logger.info(
-                        "Detected EAGLE model with embed_tokens identical to the target"
-                        " model. Sharing target model embedding weights with the draft"
-                        " model."
-                    )
-                else:
-                    logger.info(
-                        "Detected EAGLE model with distinct embed_tokens weights. "
-                        "Keeping separate embedding weights from the target model."
-                    )
-            else:
-                # MTP model
-                share_embeddings = True
-                logger.info(
-                    "Detected MTP model. "
-                    "Sharing target model embedding weights with the draft model."
-                )
-
-            if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):
-                # EAGLE drafts consume input embeddings at their own hidden
-                # size, so only share when the widths match. MTP drafts
-                # project target-width embeddings (e.g. Gemma4 MTP's
-                # pre_projection takes 2 * backbone_hidden_size), so the
-                # width check does not apply to them.
-                draft_embed = self.model.model.embed_tokens
-                # Guard with isinstance so non-Tensor weights (e.g. in tests)
-                # are not affected — mirrors the weight-equality check above.
-                if isinstance(target_embed_tokens.weight, torch.Tensor) and isinstance(
-                    draft_embed.weight, torch.Tensor
-                ):
-                    target_dim = target_embed_tokens.weight.shape[-1]
-                    draft_dim = draft_embed.weight.shape[-1]
-                    if target_dim != draft_dim:
-                        share_embeddings = False
-                        logger.info(
-                            "Target embedding dim (%d) differs from draft "
-                            "embedding dim (%d). Keeping separate embedding "
-                            "weights.",
-                            target_dim,
-                            draft_dim,
-                        )
-
-            if share_embeddings:
-                if hasattr(self.model.model, "embed_tokens"):
-                    del self.model.model.embed_tokens
-                self.model.model.embed_tokens = target_embed_tokens
+        inner_model = getattr(target_language_model, "model", None)
+        if inner_model is None:
+            raise AttributeError("Target model does not have 'model' attribute")
+        if hasattr(inner_model, "embed_tokens"):
+            target_embed_tokens = inner_model.embed_tokens
+        elif hasattr(inner_model, "embedding"):
+            target_embed_tokens = inner_model.embedding
         else:
-            logger.info(
-                "The draft model's vocab embedding will be loaded separately"
-                " from the target model."
+            raise AttributeError(
+                "Target model does not have 'embed_tokens' or 'embedding' attribute"
             )
 
+        # Under PP > 1, non-first ranks have PPMissingLayer for embed_tokens.
+        # Skip sharing on those ranks — the draft model receives hidden states
+        # from the target model's previous PP rank, so embed_tokens is not needed.
+        if isinstance(target_embed_tokens, PPMissingLayer):
+            logger.info(
+                "Target embed_tokens is PPMissingLayer on this PP rank. "
+                "Skipping embedding sharing — draft model will not use "
+                "embed_tokens on non-first PP ranks."
+            )
+            if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+                del self.model.model.embed_tokens
+                self.model.model.embed_tokens = None
+            return
+
+        share_embeddings = False
+        if hasattr(self.model, "has_own_embed_tokens"):
+            # EAGLE model
+            if not self.model.has_own_embed_tokens:
+                share_embeddings = True
+                logger.info(
+                    "Detected EAGLE model without its own embed_tokens in the"
+                    " checkpoint. Sharing target model embedding weights with the"
+                    " draft model."
+                )
+            elif (
+                isinstance(target_embed_tokens.weight, torch.Tensor)
+                and hasattr(self.model.model, "embed_tokens")
+                and isinstance(self.model.model.embed_tokens.weight, torch.Tensor)
+                # TODO: Offload to CPU for comparison to avoid extra GPU memory
+                # usage in CI testing environments with limited GPU memory
+                and torch.equal(
+                    target_embed_tokens.weight.cpu(),
+                    self.model.model.embed_tokens.weight.cpu(),
+                )
+            ):
+                share_embeddings = True
+                logger.info(
+                    "Detected EAGLE model with embed_tokens identical to the target"
+                    " model. Sharing target model embedding weights with the draft"
+                    " model."
+                )
+            else:
+                logger.info(
+                    "Detected EAGLE model with distinct embed_tokens weights. "
+                    "Keeping separate embedding weights from the target model."
+                )
+        else:
+            # MTP model
+            share_embeddings = True
+            logger.info(
+                "Detected MTP model. "
+                "Sharing target model embedding weights with the draft model."
+            )
+
+        if share_embeddings:
+            draft_embed = self.model.model.embed_tokens
+            # Only share when both models use the same embedding width.
+            # Guard with isinstance so non-Tensor weights (e.g. in tests)
+            # are not affected — mirrors the weight-equality check above.
+            if isinstance(target_embed_tokens.weight, torch.Tensor) and isinstance(
+                draft_embed.weight, torch.Tensor
+            ):
+                target_dim = target_embed_tokens.weight.shape[-1]
+                draft_dim = draft_embed.weight.shape[-1]
+                if target_dim != draft_dim:
+                    share_embeddings = False
+                    logger.info(
+                        "Target embedding dim (%d) differs from draft "
+                        "embedding dim (%d). Keeping separate embedding "
+                        "weights.",
+                        target_dim,
+                        draft_dim,
+                    )
+
+        if share_embeddings:
+            if hasattr(self.model.model, "embed_tokens"):
+                del self.model.model.embed_tokens
+            self.model.model.embed_tokens = target_embed_tokens
     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
         """
         Some draft models may not have their own LM head, and some may have a

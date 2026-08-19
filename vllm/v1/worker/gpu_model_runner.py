@@ -716,6 +716,10 @@ class GPUModelRunner(
                 self.sampler, self.speculative_config, self.device
             )
 
+        else:
+            # On non-last PP ranks, drafter is not created.
+            self.drafter = None
+
         self.num_spec_tokens = 0
         self.prev_num_spec_tokens = 0
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
@@ -4805,9 +4809,10 @@ class GPUModelRunner(
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(
-                    self.drafter,
-                    EagleProposer
+                if self.drafter is not None:
+                    assert isinstance(
+                        self.drafter,
+                                            EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
@@ -4832,12 +4837,14 @@ class GPUModelRunner(
                         )
                     if self.parallel_config.data_parallel_size > 1:
                         # Prevent hang when DP ranks disagree on input_fits_in_drafter
-                        self.drafter.dummy_run(num_tokens=1)
+                        if self.drafter is not None:
+                            self.drafter.dummy_run(num_tokens=1)
             elif (
                 spec_config.use_ngram_gpu()
                 and not spec_config.disable_padded_drafter_batch
             ):
-                assert isinstance(self.drafter, NgramProposerGPU)
+                if self.drafter is not None:
+                    assert isinstance(self.drafter, NgramProposerGPU)
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -4901,15 +4908,17 @@ class GPUModelRunner(
                 and self.parallel_config.data_parallel_size > 1
             ):
                 # Prevent hang when DP ranks disagree on input_fits_in_drafter
-                assert isinstance(
-                    self.drafter,
-                    EagleProposer
+                if self.drafter is not None:
+                    assert isinstance(
+                        self.drafter,
+                                            EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
                 )
-                self.drafter.dummy_run(num_tokens=1)
+                if self.drafter is not None:
+                    self.drafter.dummy_run(num_tokens=1)
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -5187,7 +5196,8 @@ class GPUModelRunner(
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, NgramProposer)
+            if self.drafter is not None:
+                assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
                 num_spec_tokens_to_schedule,
                 sampled_token_ids,
@@ -5204,7 +5214,8 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
         elif spec_config.use_ngram_gpu():
-            assert isinstance(self.drafter, NgramProposerGPU)
+            if self.drafter is not None:
+                assert isinstance(self.drafter, NgramProposerGPU)
             (
                 next_token_ids,
                 valid_sampled_tokens_count,
@@ -5243,7 +5254,8 @@ class GPUModelRunner(
             )
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, SuffixDecodingProposer)
+            if self.drafter is not None:
+                assert isinstance(self.drafter, SuffixDecodingProposer)
             draft_token_ids = self.drafter.propose(
                 num_spec_tokens_to_schedule,
                 self.input_batch,
@@ -5252,7 +5264,8 @@ class GPUModelRunner(
             )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, MedusaProposer)
+            if self.drafter is not None:
+                assert isinstance(self.drafter, MedusaProposer)
 
             if sample_hidden_states.shape[0] == len(sampled_token_ids):
                 # The input to the target model does not include draft tokens.
@@ -5278,7 +5291,8 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
         elif spec_config.uses_extract_hidden_states():
-            assert isinstance(self.drafter, ExtractHiddenStatesProposer)
+            if self.drafter is not None:
+                assert isinstance(self.drafter, ExtractHiddenStatesProposer)
             assert isinstance(sampled_token_ids, torch.Tensor), (
                 "sampled_token_ids should be a torch.Tensor for "
                 "extract_hidden_states method."
@@ -5313,9 +5327,10 @@ class GPUModelRunner(
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
         ):
-            assert isinstance(
-                self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+            if self.drafter is not None:
+                assert isinstance(
+                    self.drafter,
+                                    EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -6356,9 +6371,10 @@ class GPUModelRunner(
                 hidden_states = outputs
 
             if run_drafter and self._drafter_runs_model_forward():
-                assert isinstance(
-                    self.drafter,
-                    EagleProposer
+                if self.drafter is not None:
+                    assert isinstance(
+                        self.drafter,
+                                            EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
@@ -6389,8 +6405,9 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
-                    num_tokens,
+                if self.drafter is not None:
+                    self.drafter.dummy_run(
+                        num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
@@ -7462,13 +7479,14 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and self.drafter is not None and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(
-                self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+            if self.drafter is not None:
+                assert isinstance(
+                    self.drafter,
+                                    EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -7521,15 +7539,17 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
             or self.speculative_config.uses_extract_hidden_states()
         ):
-            assert isinstance(
-                self.drafter,
-                EagleProposer
+            if self.drafter is not None:
+                assert isinstance(
+                    self.drafter,
+                                    EagleProposer
                 | DFlashProposer
                 | DraftModelProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )
-            self.drafter.initialize_cudagraph_keys(cudagraph_mode)
+            if self.drafter is not None:
+                self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
         """
@@ -8136,11 +8156,12 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
-        if (
+        if (self.drafter is not None and
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()
         ):
-            assert isinstance(self.drafter, ExtractHiddenStatesProposer)
+            if self.drafter is not None:
+                assert isinstance(self.drafter, ExtractHiddenStatesProposer)
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)

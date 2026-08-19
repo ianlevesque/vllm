@@ -1139,8 +1139,10 @@ def fastsafetensors_weights_iterator(
     """
     from fastsafetensors.parallel_loader import ParallelLoader
 
+    # fix-dspark-pp2-weight-loading: use TP group instead of WORLD
     if torch.distributed.is_initialized():
-        pg = torch.distributed.group.WORLD
+        from vllm.distributed.parallel_state import get_tp_group as _get_tp_group
+        pg = _get_tp_group().device_group
     else:
         pg = SingleGroup()
 
@@ -1227,13 +1229,15 @@ def instanttensor_weights_iterator(
     if not current_platform.is_cuda():
         raise ValueError("InstantTensor requires NVIDIA GPUs")
 
+    # fix-dspark-pp2-weight-loading: use TP group instead of WORLD so
+    # draft model loading under PP doesn't deadlock on broadcast (Issue #50959).
     try:
-        world_group = get_world_group()
-    except AssertionError:
-        # Entering here only in unit tests where the world group is not initialized.
+        from vllm.distributed.parallel_state import get_tp_group as _get_tp_group
+        _tp_group = _get_tp_group()
+    except (AssertionError, ImportError):
         process_group = None
     else:
-        process_group = world_group.device_group if world_group.world_size > 1 else None
+        process_group = _tp_group.device_group if _tp_group.world_size > 1 else None
 
     device = current_platform.current_device()
     copy_setting = os.getenv("INSTANTTENSOR_COPY", "1")

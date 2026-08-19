@@ -149,6 +149,7 @@ from vllm.v1.worker.gpu.spec_decode.capacity import (
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
+    supports_aux_hidden_states_over_pp,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -314,11 +315,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
 
         # Draft token propagation for structured outputs and block speculators
         # whose returned draft prefix can be shorter than the configured width.
@@ -448,12 +444,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.use_pp and not supports_aux_hidden_states_over_pp(self.model):
+                    raise ValueError(
+                        f"{self.speculative_config.method} with pipeline parallel "
+                        f"is not supported by {type(self.model).__name__}: it does "
+                        "not forward auxiliary hidden states across pipeline stages."
+                    )
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(1):
                     self.speculator.load_model(self.model)
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+            # PP barrier: PP0 waits for PP1 draft loading + B12X JIT to finish.
+            # Use Gloo group with 30-min timeout (NCCL watchdog can't be changed).
+            if self.use_pp:
+                import datetime as _dt
+                import torch.distributed as _dist
+                if not hasattr(self, '_pp_barrier_group'):
+                    self._pp_barrier_group = _dist.new_group(
+                        backend='gloo',
+                        timeout=_dt.timedelta(seconds=1800),
+                    )
+                _dist.barrier(group=self._pp_barrier_group)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -1246,6 +1259,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pp_handler is not None:
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
+                # Land the proposals on the same step as the matching sampled
+                # tokens, so the next _prepare_inputs splices real draft ids
+                # into input_ids instead of placeholders.
+                draft_update = outputs.pop("draft_update", None)
+                if draft_update is not None:
+                    draft_tokens, draft_idx_mapping = draft_update
+                    self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -2075,6 +2095,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
             all_decode_next = self.pp_handler.receive(input_batch)
+            # Pair the last rank's post-propose draft send.
+            if self.num_speculative_steps > 0:
+                self.pp_handler.receive_drafts(input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
@@ -2271,6 +2294,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.draft_tokens_handler.set_draft_tokens(
                         input_batch, next_draft_tokens
                     )
+
+        # The other PP ranks have no drafter, so hand them the proposals
+        # they must feed the target on the next step.
+        if self.pp_handler is not None:
+            self.pp_handler.broadcast_drafts(
+                self.req_states.draft_tokens[input_batch.idx_mapping],
+                input_batch,
+            )
 
         # Post-step KV connector related operations.
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/kv_post_forward"):
