@@ -962,12 +962,20 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         output, lse = self._dense_mla.run(binding=binding)
         if os.environ.get("VLLM_KIMI_DEBUG_FINITE") == "1":
             torch.cuda.synchronize()
-            output_ok = bool(torch.isfinite(output).all().item())
+            # An empty DCP shard is represented by LSE=-inf. B12X is allowed
+            # to leave that shard's local output undefined (often NaN): the
+            # DCP correction kernel assigns it zero softmax weight and writes
+            # zero before reduce-scatter. Reject non-finite output only for an
+            # active row with finite LSE; the post-reduction guard below still
+            # requires the merged output to be fully finite.
+            output_rows_finite = torch.isfinite(output).all(dim=-1)
+            empty_rows = torch.isneginf(lse)
+            output_ok = bool((output_rows_finite | empty_rows).all().item())
             lse_ok = bool((~torch.isnan(lse) & ~torch.isposinf(lse)).all().item())
             if not output_ok or not lse_ok:
                 raise RuntimeError(
-                    "B12X_MLA produced invalid local output/LSE: "
-                    f"output_finite={output_ok}, lse_valid={lse_ok}"
+                    "B12X_MLA produced invalid active local output/LSE: "
+                    f"active_output_finite={output_ok}, lse_valid={lse_ok}"
                 )
         if dcp_group is None:
             return output[:, : self.num_heads], lse[:, : self.num_heads]
