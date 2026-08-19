@@ -1597,6 +1597,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
             # over-allocated at last round.
             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
+                self._allocated_block_reqs.add(request_id)
                 return []
             else:
                 prev_block_len = len(req_blocks)
@@ -1896,9 +1897,12 @@ def get_manager_for_kv_cache_spec(
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
-    # SlidingWindow / ChunkedLocalAttention managers recycle blocks across
-    # chunks; the runtime admission cap must match the recycling-aware bound
-    # the startup pool sizer uses (single source of truth: the spec method).
+    # PR_50169: SlidingWindow / ChunkedLocalAttention managers
+    # recycle blocks; the runtime admission cap uses the full
+    # in-flight allowance so a single large prefill is still
+    # admitted, while startup pool sizing amortizes that
+    # allowance across the request slots (see the spec's
+    # max_memory_usage_bytes).
     # R-SWA also recycles gap blocks but peak physical KV still fits the
     # full-attention bound (prefix + window <= max_model_len), so it inherits
     # FullAttentionSpec sizing without a separate admission cap.

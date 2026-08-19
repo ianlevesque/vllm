@@ -66,7 +66,11 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import (  # PR_46932
+    DeviceMemoryProfiler,
+    format_gib,
+    get_device_memory_info,
+)
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -1057,7 +1061,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         gc.collect()
         torch.accelerator.empty_cache()
         torch.accelerator.synchronize()
-        start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+        # PR_46932: UMA-corrected free-memory reading (psutil on integrated GPUs).
+        start_free_gpu_memory = get_device_memory_info(self.device)[0]
         graph_channel_checkpoints: tuple[tuple[Callable[[Any], None], Any], ...] = ()
         try:
             # Snapshot graph-owned B12X channels before this profiling
@@ -1082,7 +1087,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     with use_workspace_lane(1):
                         self.speculator.capture(capture_phase="profile")
                 self._zero_cudagraph_capture_kv_blocks()
-            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            # PR_46932: UMA-corrected free-memory reading (psutil on integrated GPUs).
+            end_free_gpu_memory = get_device_memory_info(self.device)[0]
             gross_cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
             assert getattr(self, "_cudagraph_pool_anchor", None) is None
             self._cudagraph_pool_anchor = _create_cudagraph_pool_anchor(
@@ -1113,7 +1119,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     saved_num_cudagraph_captured
                 )
 
-        free_after_cleanup = torch.accelerator.get_memory_info()[0]
+        # PR_46932: UMA-corrected free-memory reading (psutil on integrated GPUs).
+        free_after_cleanup = get_device_memory_info(self.device)[0]
         retained_pool_size = max(start_free_gpu_memory - free_after_cleanup, 0)
         # Retained private-pool pages are PyTorch-reserved. The outer profiler
         # deliberately restores the pre-graph torch peak, so they are not
@@ -1147,7 +1154,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_time = time.perf_counter()
         gc.collect()
         torch.accelerator.empty_cache()
-        start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+        # PR_46932: UMA-corrected free-memory reading (psutil on integrated GPUs).
+        start_free_gpu_memory = get_device_memory_info(self.device)[0]
 
         try:
             with self.maybe_setup_dummy_loras(self.lora_config):
@@ -1172,9 +1180,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._release_cudagraph_pool_anchor()
 
         end_time = time.perf_counter()
-        end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+        # PR_46932: UMA-corrected free-memory reading (psutil on integrated GPUs).
+        end_free_gpu_memory = get_device_memory_info(self.device)[0]
         elapsed_time = end_time - start_time
-        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        # PR_46932: clamp to >= 0 -- on UMA free memory can rise across a
+        # capture; a negative size would be subtracted in
+        # determine_available_memory, inflating the KV cache budget (silent
+        # OOM at high gpu-memory-utilization, upstream #44740).
+        cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
         lock_workspace()
         # This usually takes 5~20 seconds.
         logger.info(

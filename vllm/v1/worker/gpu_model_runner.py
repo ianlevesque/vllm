@@ -124,7 +124,11 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import (  # PR_46932
+    DeviceMemoryProfiler,
+    format_gib,
+    get_device_memory_info,
+)
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import (
@@ -6932,7 +6936,8 @@ class GPUModelRunner(
                             )
 
                             for i, desc in enumerate(profile_descs):
-                                mem_before = torch.accelerator.get_memory_info()[0]
+                                # PR_46932: UMA-corrected free-memory reading.
+                                mem_before, _ = get_device_memory_info(self.device)
                                 self._warmup_and_capture(
                                     desc,
                                     cudagraph_runtime_mode=mode,
@@ -6949,7 +6954,10 @@ class GPUModelRunner(
                                     ),
                                 )
                                 torch.accelerator.synchronize()
-                                free_after = torch.accelerator.get_memory_info()[0]
+                                # PR_46932: UMA-corrected reading; the max()
+                                # clamp mirrors upstream -- a negative delta
+                                # would inflate KV cache and risk OOM (#44740).
+                                free_after, _ = get_device_memory_info(self.device)
                                 mem_samples.append(max(mem_before - free_after, 0))
 
                             first_capture = mem_samples[0]
@@ -6984,7 +6992,8 @@ class GPUModelRunner(
                         if current_platform.is_rocm()
                         else None
                     )
-                    mem_before = torch.accelerator.get_memory_info()[0]
+                    # PR_46932: UMA-corrected free-memory reading.
+                    mem_before, _ = get_device_memory_info(self.device)
                     with graph_capture(
                         device=self.device,
                         graph_capture_context=cap_ctx,
@@ -6994,7 +7003,8 @@ class GPUModelRunner(
                             graph_pool=encoder_profiling_pool
                         )
                     torch.accelerator.synchronize()
-                    free_after = torch.accelerator.get_memory_info()[0]
+                    # PR_46932: UMA-corrected free-memory reading.
+                    free_after, _ = get_device_memory_info(self.device)
                     encoder_memory_estimate = max(mem_before - free_after, 0)
 
                     logger.debug(
@@ -7102,7 +7112,8 @@ class GPUModelRunner(
             with self._freeze_gc():
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
-                start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+                # PR_46932: UMA-corrected free-memory reading.
+                start_free_gpu_memory = get_device_memory_info(self.device)[0]
 
                 for component, channel_id in (
                     ("target", "vllm:target:production"),
@@ -7145,7 +7156,8 @@ class GPUModelRunner(
                         )
 
                 torch.accelerator.synchronize()
-                end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+                # PR_46932: UMA-corrected free-memory reading.
+                end_free_gpu_memory = get_device_memory_info(self.device)[0]
         finally:
             # Leave capture mode disabled even when one graph owner fails.
             set_cudagraph_capturing_enabled(False)
@@ -7159,7 +7171,11 @@ class GPUModelRunner(
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
-        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        # PR_46932: clamp to >= 0 -- on UMA free memory can rise across a
+        # capture; a negative size would understate non-KV memory in the
+        # logged kv-cache-memory suggestion (mirrors profile_cudagraph_memory;
+        # upstream #44740).
+        cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
         # This usually takes 5~20 seconds.
         logger.info_once(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
