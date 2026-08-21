@@ -238,12 +238,11 @@ class KVCacheManager:
             A tuple containing:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
-                - ``shared_prefix_boundary``: the block-aligned replay position
-                  for a shared prefix that a sparse-retention group (Mamba /
-                  sliding window) has not cached yet (Marconi-style APC), or 0
-                  if none. Under EAGLE this is one proof unit below the raw
-                  junction. Pinned so ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL``
-                  does not drop the reusable state and defeat cross-request reuse.
+                - ``shared_prefix_boundary``: the block-aligned token position of
+                  a shared prefix that a sparse-retention group (Mamba / sliding
+                  window) has not cached yet (Marconi-style APC), or 0 if none.
+                  Pinned so ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL`` does not drop
+                  the junction and defeat cross-request reuse.
         """
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
@@ -285,16 +284,12 @@ class KVCacheManager:
                         group_idx,
                     )
 
-        # Start from the raw junction where the lagging sparse-retention group
-        # stops plus the uncached shared prefix -- i.e. the longest single-group
-        # hit. EAGLE then rewinds one proof unit to the boundary every group can
-        # actually replay. Sub-block gaps are left to the mask, which floors to
-        # the alignment boundary (a no-op there).
+        # The junction to pin is where the lagging sparse-retention group stops
+        # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
+        # the longest single-group hit. Sub-block gaps are left to the mask,
+        # which floors to the alignment boundary (a no-op there).
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
-        )
-        shared_prefix_boundary = self.coordinator.get_shared_prefix_replay_boundary(
-            shared_prefix_boundary
         )
 
         blocks = self.create_kv_cache_blocks(computed_blocks)

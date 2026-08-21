@@ -383,19 +383,6 @@ class KVCacheCoordinator(ABC):
         )
         return max(aligned - self.scheduler_block_size, 0)
 
-    def get_shared_prefix_replay_boundary(self, boundary: int) -> int:
-        """Return the reusable boundary for a Marconi prefix junction.
-
-        ``boundary`` is already the aligned end of the common prefix. Without
-        EAGLE it is directly reusable. With EAGLE, every group must retain the
-        position one scheduler unit lower because the draft group needs the
-        following common unit as proof and drops it before replay.
-        """
-        if not boundary or not self.eagle_group_ids:
-            return boundary
-        aligned = boundary // self.scheduler_block_size * self.scheduler_block_size
-        return max(aligned - self.scheduler_block_size, 0)
-
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.
