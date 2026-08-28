@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
@@ -17,6 +18,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
     _pad_query_heads_for_sm120,
+    _reshape_kv_cache_for_sm120_decode,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -58,6 +60,24 @@ def test_sm120_supported_query_head_count_is_unchanged() -> None:
     query = torch.randn(2, 8, 7)
 
     assert _pad_query_heads_for_sm120(query) is query
+
+
+def test_sm120_decode_virtually_splits_large_kv_blocks() -> None:
+    cache = torch.arange(3 * 128 * 656, dtype=torch.int64).to(torch.uint8).view(
+        3, 128, 656
+    )
+
+    decode_view = _reshape_kv_cache_for_sm120_decode(cache)
+
+    assert decode_view.shape == (6, 64, 656)
+    assert decode_view.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+
+
+def test_sm120_decode_rejects_non_divisible_kv_blocks() -> None:
+    cache = torch.empty(2, 96, 656, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="divisible by 64"):
+        _reshape_kv_cache_for_sm120_decode(cache)
 
 
 def test_v32_glm_sm120_backend_accepts_glm_block_size(
