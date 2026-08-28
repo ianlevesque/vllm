@@ -212,6 +212,36 @@ def warmup_kernels(
     if model_runner.is_encoder_only:
         return
 
+    # GLM-5.3's TP16 sparse-MLA startup can otherwise leave ranks entering the
+    # scheduler-realistic V2 warmup calls at different times. Keep every rank
+    # aligned around startup-only execute/sample calls without adding barriers
+    # to the serving hot path.
+    original_worker_execute_model = worker_execute_model
+    original_worker_sample_tokens = worker_sample_tokens
+
+    def synchronized_execute_model(scheduler_output: SchedulerOutput) -> Any:
+        from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+            set_glm53_v2_warmup_active,
+        )
+
+        torch.cuda.synchronize(model_runner.device)
+        set_glm53_v2_warmup_active(True)
+        try:
+            result = original_worker_execute_model(scheduler_output)
+        finally:
+            set_glm53_v2_warmup_active(False)
+        torch.cuda.synchronize(model_runner.device)
+        return result
+
+    def synchronized_sample_tokens(grammar_output: GrammarOutput | None) -> Any:
+        torch.cuda.synchronize(model_runner.device)
+        result = original_worker_sample_tokens(grammar_output)
+        torch.cuda.synchronize(model_runner.device)
+        return result
+
+    worker_execute_model = synchronized_execute_model
+    worker_sample_tokens = synchronized_sample_tokens
+
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
