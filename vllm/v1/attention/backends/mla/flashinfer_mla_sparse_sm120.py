@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
 _DS_ROPE_DIM = 64  # rope section width of the fixed 656-byte fp8_ds_mla tile
 _SM120_MIN_KERNEL_HEADS = 8
+_SM120_DECODE_MAX_TOKENS = 64
+_SM120_DECODE_PAGE_SIZE = 64
 
 
 def _pad_query_heads_for_sm120(q: torch.Tensor) -> torch.Tensor:
@@ -48,6 +50,23 @@ def _pad_query_heads_for_sm120(q: torch.Tensor) -> torch.Tensor:
         q,
         (0, 0, 0, _SM120_MIN_KERNEL_HEADS - num_heads),
     )
+
+
+def _reshape_kv_cache_for_sm120_decode(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Expose physical cache blocks as the decode kernel's 64-token pages."""
+    packed = kv_cache.view(torch.uint8)
+    if packed.ndim != 3 or packed.shape[-1] != 656:
+        raise ValueError(
+            "SM120 sparse MLA decode expects packed KV cache shape "
+            f"[num_blocks, block_size, 656], got {tuple(packed.shape)}"
+        )
+    block_size = packed.shape[1]
+    if block_size % _SM120_DECODE_PAGE_SIZE != 0:
+        raise ValueError(
+            "SM120 sparse MLA decode requires the KV-cache block size to be "
+            f"divisible by {_SM120_DECODE_PAGE_SIZE}; got {block_size}"
+        )
+    return packed.reshape(-1, _SM120_DECODE_PAGE_SIZE, packed.shape[-1])
 
 
 def _kv_scale_format_for_model(model_type: str | None) -> str:
@@ -130,6 +149,7 @@ class FlashInferMLASparseSM120Impl(
 
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
+        self._decode_lse_buffer: torch.Tensor | None = None
 
     def do_kv_cache_update(
         self,
@@ -213,6 +233,71 @@ class FlashInferMLASparseSM120Impl(
         # check requires sparse_mla_top_k == the indices' actual width — pass
         # the buffer width, not attn_metadata.topk_tokens.
         eff_topk = topk_indices_physical.shape[-1]
+
+        # FlashInfer's public sparse-MLA wrapper dispatches decode only for a
+        # fixed shape table and otherwise falls through to the prefill
+        # orchestrator. The latter deliberately rejects num_tokens <= 64,
+        # turning an unsupported/misread predicate into an opaque C++ error.
+        # Call the same DSv3.2/GLM decode kernel directly for decode-shaped
+        # batches. This also makes the kernel's 64-token virtual KV pages
+        # explicit instead of relying on the wrapper to infer them from the
+        # cache view. MTP warmup reaches this path with exactly 64 tokens.
+        if num_actual_toks <= _SM120_DECODE_MAX_TOKENS:
+            if kernel_num_heads != _SM120_MIN_KERNEL_HEADS or eff_topk != 2048:
+                raise ValueError(
+                    "SM120 GLM sparse MLA decode requires 8 kernel query heads "
+                    f"and effective topk 2048; got heads={kernel_num_heads}, "
+                    f"topk={eff_topk}"
+                )
+
+            from flashinfer.mla._core import _sparse_mla_decode_workspace
+            from flashinfer.mla._sparse_mla_sm120 import (
+                _MODEL_TYPE_GLM_NSA,
+                sparse_mla_sm120_decode_dsv3_2,
+            )
+
+            mid_out, mid_lse = _sparse_mla_decode_workspace(
+                self._workspace_buffer,
+                num_tokens=num_actual_toks,
+                num_heads=kernel_num_heads,
+                d_v=self.kv_lora_rank,
+                topk=eff_topk,
+                extra_topk=0,
+            )
+            if mid_out is None or mid_lse is None:
+                raise RuntimeError(
+                    "FlashInfer workspace is too small for SM120 sparse MLA decode"
+                )
+            if (
+                self._decode_lse_buffer is None
+                or self._decode_lse_buffer.shape[0] < num_actual_toks
+                or self._decode_lse_buffer.shape[1] < kernel_num_heads
+            ):
+                self._decode_lse_buffer = torch.empty(
+                    (_SM120_DECODE_MAX_TOKENS, kernel_num_heads),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+
+            out = sparse_mla_sm120_decode_dsv3_2(
+                q=q,
+                kv_cache=_reshape_kv_cache_for_sm120_decode(
+                    kv_c_and_k_pe_cache
+                ),
+                indices=topk_indices_physical,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+                output=output,
+                out_lse=self._decode_lse_buffer[
+                    :num_actual_toks, :kernel_num_heads
+                ],
+                sm_scale=self.scale,
+                model_type=_MODEL_TYPE_GLM_NSA,
+                # Bypass autotuning and let the compiled kernel use its
+                # occupancy-aware heuristic. The fleet disables FI autotune.
+                chunks_per_block=-1,
+            )
+            return out[:, : self.num_heads].contiguous(), None
 
         out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
