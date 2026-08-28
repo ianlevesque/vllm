@@ -12,6 +12,7 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 """
 
 import functools
+import pickle
 
 import pytest
 from transformers import PretrainedConfig
@@ -37,6 +38,35 @@ def test_dict_overrides_are_not_forwarded_to_draft():
         {"max_position_embeddings": 1234}
     )
     assert composed is SpeculativeConfig.hf_config_override
+
+
+@pytest.mark.cpu_test
+def test_nested_dict_overrides_can_be_forwarded_to_mtp_draft():
+    """In-model MTP reloads the target checkpoint, so target config patches
+    must also reach its nested text config."""
+    text_config = PretrainedConfig(index_topk=2048, index_kpool=4)
+    config = _make_hf_config(text_config=text_config)
+
+    composed = SpeculativeConfig.compose_draft_hf_overrides(
+        {"text_config": {"index_topk": 2044}},
+        forward_dict=True,
+    )
+    out = composed(config)
+
+    assert out.text_config.index_topk == 2044
+    assert out.text_config.index_kpool == 4
+
+
+@pytest.mark.cpu_test
+def test_composed_dict_override_is_picklable():
+    composed = SpeculativeConfig.compose_draft_hf_overrides(
+        {"text_config": {"index_topk": 2044}},
+        forward_dict=True,
+    )
+
+    assert isinstance(composed, functools.partial)
+    assert composed.func is SpeculativeConfig._apply_composed_dict_hf_override
+    pickle.loads(pickle.dumps(composed))
 
 
 @pytest.mark.cpu_test
