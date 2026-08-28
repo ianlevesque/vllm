@@ -1030,8 +1030,46 @@ class SpeculativeConfig:
         return target_hf_overrides(hf_config)
 
     @staticmethod
+    def _update_nested_hf_override(
+        target: PretrainedConfig | dict[str, Any],
+        updates: dict[str, Any],
+    ) -> None:
+        """Recursively apply dictionary overrides to a loaded HF config."""
+        for key, value in updates.items():
+            nested_target = (
+                target.get(key)
+                if isinstance(target, dict)
+                else getattr(target, key, None)
+            )
+            if (
+                isinstance(value, dict)
+                and nested_target is not None
+                and (
+                    isinstance(nested_target, dict)
+                    or hasattr(nested_target, "__dict__")
+                )
+            ):
+                SpeculativeConfig._update_nested_hf_override(nested_target, value)
+            elif isinstance(target, dict):
+                target[key] = value
+            else:
+                setattr(target, key, value)
+
+    @staticmethod
+    def _apply_composed_dict_hf_override(
+        target_hf_overrides: dict[str, Any],
+        hf_config: PretrainedConfig,
+    ) -> PretrainedConfig:
+        """Compose draft architecture mapping with nested target overrides."""
+        hf_config = SpeculativeConfig.hf_config_override(hf_config)
+        SpeculativeConfig._update_nested_hf_override(hf_config, target_hf_overrides)
+        return hf_config
+
+    @staticmethod
     def compose_draft_hf_overrides(
         target_hf_overrides: HfOverrides | None,
+        *,
+        forward_dict: bool = False,
     ) -> Callable[[PretrainedConfig], PretrainedConfig]:
         """Build the ``hf_overrides`` for the draft ``ModelConfig``.
 
@@ -1040,7 +1078,9 @@ class SpeculativeConfig:
         reach the draft config — otherwise a draft belonging to a large
         target is instantiated at full size even when the target is shrunk.
         Dict overrides are target-specific key patches and are not applied
-        to the draft.
+        to a separate draft by default. For in-model MTP, ``forward_dict``
+        applies the same nested patches to the draft config loaded from the
+        target checkpoint.
 
         The composed override must stay picklable: the draft ``ModelConfig``
         is sent to spawned engine-core processes, so a local closure would
@@ -1048,6 +1088,12 @@ class SpeculativeConfig:
         target via ``functools.partial`` over a module-referenceable static
         method instead.
         """
+        if isinstance(target_hf_overrides, dict) and forward_dict:
+            return functools.partial(
+                SpeculativeConfig._apply_composed_dict_hf_override,
+                target_hf_overrides,
+            )
+
         if not callable(target_hf_overrides):
             return SpeculativeConfig.hf_config_override
 
@@ -1231,9 +1277,11 @@ class SpeculativeConfig:
                 else:
                     # Compose any callable hf_overrides set on the target so the
                     # draft config receives the same transform (e.g. the test
-                    # shrink). Dict overrides stay target-only.
+                    # shrink). An in-model MTP draft reloads the target checkpoint,
+                    # so it must also receive the target's nested dict overrides.
                     draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
-                        self.target_model_config.hf_overrides
+                        self.target_model_config.hf_overrides,
+                        forward_dict=self.method == "mtp",
                     )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
