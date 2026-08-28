@@ -12,6 +12,9 @@ from vllm.utils import flashinfer as fi_utils
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+    _pad_query_heads_for_sm120,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
@@ -36,6 +39,22 @@ def test_sm120_backend_uses_sparse_mqa_for_prefill() -> None:
 
     assert impl_cls.is_sparse
     assert not impl_cls.supports_dense_mha_prefill
+
+
+def test_sm120_tp16_query_heads_are_zero_padded_to_kernel_minimum() -> None:
+    query = torch.arange(2 * 4 * 7, dtype=torch.float32).view(2, 4, 7)
+
+    padded = _pad_query_heads_for_sm120(query)
+
+    assert padded.shape == (2, 8, 7)
+    torch.testing.assert_close(padded[:, :4], query)
+    assert torch.count_nonzero(padded[:, 4:]) == 0
+
+
+def test_sm120_supported_query_head_count_is_unchanged() -> None:
+    query = torch.randn(2, 8, 7)
+
+    assert _pad_query_heads_for_sm120(query) is query
 
 
 def test_v32_glm_sm120_backend_accepts_glm_block_size(
