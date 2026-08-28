@@ -36,6 +36,18 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 _DS_ROPE_DIM = 64  # rope section width of the fixed 656-byte fp8_ds_mla tile
+_SM120_MIN_KERNEL_HEADS = 8
+
+
+def _pad_query_heads_for_sm120(q: torch.Tensor) -> torch.Tensor:
+    """Pad small TP shards to FlashInfer's minimum instantiated head count."""
+    num_heads = q.shape[1]
+    if num_heads >= _SM120_MIN_KERNEL_HEADS:
+        return q
+    return torch.nn.functional.pad(
+        q,
+        (0, 0, 0, _SM120_MIN_KERNEL_HEADS - num_heads),
+    )
 
 
 def _kv_scale_format_for_model(model_type: str | None) -> str:
@@ -160,6 +172,15 @@ class FlashInferMLASparseSM120Impl(
             q = torch.nn.functional.pad(q, (0, _DS_ROPE_DIM))
             rope_dim = _DS_ROPE_DIM
 
+        # FlashInfer's SM120 DSv3.2/GLM decode and prefill dispatch tables are
+        # instantiated for 8 local query heads and above. GLM-5.3-Flash has 64
+        # global heads, so TP16 produces four local heads and otherwise falls
+        # through to the prefill orchestrator even for decode-shaped batches.
+        # Sparse MLA is independent per query head: zero-pad the query tile to
+        # the minimum supported width and discard the added outputs below.
+        q = _pad_query_heads_for_sm120(q)
+        kernel_num_heads = q.shape[1]
+
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
@@ -175,7 +196,7 @@ class FlashInferMLASparseSM120Impl(
         )
 
         output = q.new_empty(
-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
+            (num_actual_toks, kernel_num_heads, self.kv_lora_rank),
             dtype=q.dtype,
         )
 
@@ -209,4 +230,4 @@ class FlashInferMLASparseSM120Impl(
             sparse_mla_top_k=eff_topk,
             kv_scale_format=self.kv_scale_format,
         )
-        return out.squeeze(1), None
+        return out.squeeze(1)[:, : self.num_heads].contiguous(), None
