@@ -349,7 +349,12 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=rope_dim,
-            block_tables=topk_indices_physical.unsqueeze(1),
+            # flashinfer's sparse_mla_sm120 kernel hard-asserts
+            # eidx.IsContiguous(); the index conversion can hand back a
+            # strided view, which crashed every TP16 rank on GB10
+            # (RecreateGroup loop, 2026-08-29). A [N,1,topk] int copy
+            # per step is negligible.
+            block_tables=topk_indices_physical.unsqueeze(1).contiguous(),
             # Compacted per-token valid counts under DCP (the SM120 route maps
             # seq_lens to the kernel's per-token topk_length); None keeps the
             # uniform-top-k behaviour otherwise.
