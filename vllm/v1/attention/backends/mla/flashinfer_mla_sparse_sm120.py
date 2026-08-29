@@ -148,7 +148,12 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=topk_indices_physical.unsqueeze(1),
+            # flashinfer's sparse_mla_sm120 kernel hard-asserts
+            # eidx.IsContiguous(); the triton req->global index conversion
+            # (#52084 metadata packing) can hand back a strided view, which
+            # crashed every TP16 rank on GB10 (RecreateGroup loop,
+            # 2026-08-29). A [N,1,topk] int copy per step is negligible.
+            block_tables=topk_indices_physical.unsqueeze(1).contiguous(),
             seq_lens=None,
             max_seq_len=attn_metadata.topk_tokens,
             out=output.unsqueeze(1),
