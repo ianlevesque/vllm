@@ -12,6 +12,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
 from vllm.v1.attention.backends.mla import flashinfer_mla_sparse_sm120 as sm120_module
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+    FlashInferMLASparseMetadata,
     FlashInferMLASparseSM120Backend,
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
@@ -136,14 +137,37 @@ def _make_dcp_impl(
     return impl
 
 
-def _metadata(num_tokens: int, topk_tokens: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        req_id_per_token=torch.zeros(num_tokens, dtype=torch.int32),
+def _metadata(num_tokens: int, topk_tokens: int) -> FlashInferMLASparseMetadata:
+    # Build the REAL flat metadata class the SM120 builder produces (not a
+    # namespace with arbitrary attrs) so that any MLACommonMetadata-shaped
+    # access — like `.decode`, which this class does not have — raises
+    # AttributeError in these tests exactly as it would on hardware.
+    return FlashInferMLASparseMetadata(
+        num_reqs=1,
+        max_query_len=num_tokens,
+        max_seq_len=64,
+        num_actual_tokens=num_tokens,
+        query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64),
         block_table=torch.arange(8, dtype=torch.int32).reshape(2, 4),
-        block_size=64,
-        cp_kv_cache_interleave_size=1,
+        req_id_per_token=torch.zeros(num_tokens, dtype=torch.int32),
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=num_tokens,
         topk_tokens=topk_tokens,
     )
+
+
+def test_sm120_sparse_metadata_is_flat_for_dcp_combine() -> None:
+    """The DCP LSE-combine caller in mla_attention.py must probe `decode`
+    with getattr and fall back to the flat fields: this metadata has no
+    MLACommonMetadata-style `decode` sub-struct (live TP16+DCP2 regression)."""
+    md = _metadata(3, 2048)
+    assert not hasattr(md, "decode")
+    assert md.seq_lens is not None
+    assert md.num_decodes == 1
+    assert md.query_start_loc.shape[0] == md.num_reqs + 1
 
 
 def test_sm120_sparse_mla_dcp_fallback_plumbs_lse_and_valid_counts(

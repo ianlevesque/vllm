@@ -800,6 +800,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         num_mqa_tokens = attn_metadata.num_decode_tokens
         num_mha_tokens = q.size(0) - num_mqa_tokens
+        use_mha = True
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             prefill = getattr(attn_metadata, "prefill", None)
@@ -956,20 +957,27 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert self.dcp_manager is not None
                 # Sparse metadata (FlashInferMLASparseMetadata) is flat and
                 # has no `decode` sub-struct at all — `attn_metadata.decode`
-                # raises AttributeError there, so probe with getattr. The
-                # else-branch below is the intended flat-metadata path
-                # (decode requests are reordered first).
+                # raises AttributeError there, so probe with getattr.
                 _decode_md = getattr(attn_metadata, "decode", None)
-                seq_lens = (
-                    _decode_md.seq_lens
-                    if _decode_md is not None
-                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
-                        : attn_metadata.num_decodes
+                if not use_mha:
+                    # The sparse MQA path covered the WHOLE batch (no dense-MHA
+                    # prefill under DCP): the combine must see every row's
+                    # request boundaries. Slicing to num_decodes would mask all
+                    # prefill rows' LSE to -inf on every rank and NaN their
+                    # combined output.
+                    seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
+                    query_start_loc = attn_metadata.query_start_loc
+                else:
+                    seq_lens = (
+                        _decode_md.seq_lens
+                        if _decode_md is not None
+                        else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
+                            : attn_metadata.num_decodes
+                        ]
+                    )
+                    query_start_loc = attn_metadata.query_start_loc[
+                        : attn_metadata.num_decodes + 1
                     ]
-                )
-                query_start_loc = attn_metadata.query_start_loc[
-                    : attn_metadata.num_decodes + 1
-                ]
                 attn_out = self.dcp_manager.combine(
                     attn_out,
                     lse,
