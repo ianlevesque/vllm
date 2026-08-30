@@ -65,14 +65,16 @@ def test_sm120_supported_query_head_count_is_unchanged() -> None:
 
 
 def test_sm120_decode_virtually_splits_large_kv_blocks() -> None:
-    cache = torch.arange(3 * 128 * 656, dtype=torch.int64).to(torch.uint8).view(
-        3, 128, 656
+    cache = (
+        torch.arange(3 * 128 * 656, dtype=torch.int64).to(torch.uint8).view(3, 128, 656)
     )
 
     decode_view = _reshape_kv_cache_for_sm120_decode(cache)
 
     assert decode_view.shape == (6, 64, 656)
-    assert decode_view.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    assert (
+        decode_view.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    )
 
 
 def test_sm120_decode_rejects_non_divisible_kv_blocks() -> None:
@@ -133,6 +135,8 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+
+
 def _make_dcp_impl(
     monkeypatch,
     num_local_heads: int,

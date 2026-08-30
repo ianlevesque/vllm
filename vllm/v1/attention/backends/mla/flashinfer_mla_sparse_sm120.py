@@ -227,9 +227,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 topk_indices,
                 dcp_size=self.dcp_world_size,
                 dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(
-                    attn_metadata.cp_kv_cache_interleave_size
-                ),
+                cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
@@ -315,9 +313,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             out_lse = self._decode_lse_buffer[:num_actual_toks, :kernel_num_heads]
             out = sparse_mla_sm120_decode_dsv3_2(
                 q=q,
-                kv_cache=_reshape_kv_cache_for_sm120_decode(
-                    kv_c_and_k_pe_cache
-                ),
+                kv_cache=_reshape_kv_cache_for_sm120_decode(kv_c_and_k_pe_cache),
                 indices=topk_indices_physical,
                 mid_out=mid_out,
                 mid_lse=mid_lse,
