@@ -954,9 +954,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self.impl.dcp_world_size > 1:
                 assert lse is not None
                 assert self.dcp_manager is not None
+                # Sparse metadata (FlashInferMLASparseMetadata) is flat and
+                # has no `decode` sub-struct at all — `attn_metadata.decode`
+                # raises AttributeError there, so probe with getattr. The
+                # else-branch below is the intended flat-metadata path
+                # (decode requests are reordered first).
+                _decode_md = getattr(attn_metadata, "decode", None)
                 seq_lens = (
-                    attn_metadata.decode.seq_lens
-                    if attn_metadata.decode is not None
+                    _decode_md.seq_lens
+                    if _decode_md is not None
                     else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
                         : attn_metadata.num_decodes
                     ]
