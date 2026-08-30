@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
+    triton_filter_and_convert_dcp_index,
 )
 
 if TYPE_CHECKING:
@@ -77,6 +78,13 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
     is_sparse = True
     supports_dense_mha_prefill = False
+    # Both decode return paths produce a base-2 LSE: the direct
+    # sparse_mla_sm120_decode_dsv3_2 kernel scales scores by LOG2E and the
+    # shared split-K merge writes log2f(sum) + max (FlashInfer
+    # decode_dsv4_kernel.cuh), matching the trtllm-gen wrapper convention the
+    # generic FlashInfer sparse impl declares.
+    can_return_lse_for_decode: bool = True
+    lse_base_on_e: bool = False
 
     def __init__(
         self,
@@ -197,22 +205,48 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         # through to the prefill orchestrator even for decode-shaped batches.
         # Sparse MLA is independent per query head: zero-pad the query tile to
         # the minimum supported width and discard the added outputs below.
+        # Under DCP the incoming query is already head-gathered across the DCP
+        # group (dcp_world_size * local heads) and the shared reducer
+        # reduce-scatters that same head set back, so the returned width must
+        # be the incoming width, not self.num_heads.
+        in_num_heads = q.shape[1]
         q = _pad_query_heads_for_sm120(q)
         kernel_num_heads = q.shape[1]
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_physical = cast(
-            torch.Tensor,
-            triton_convert_req_index_to_global_index(
+        empty_rows: torch.Tensor | None = None
+        if self.dcp_world_size > 1:
+            # Each rank holds only its interleaved KV shard: drop indices owned
+            # by other ranks, compact this rank's slots to a contiguous prefix
+            # and get the per-token valid counts for the kernel.
+            topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=(
+                    attn_metadata.cp_kv_cache_interleave_size
+                ),
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
-            ),
-        )
+                return_valid_counts=True,
+            )
+            empty_rows = seq_lens == 0
+        else:
+            topk_indices_physical = cast(
+                torch.Tensor,
+                triton_convert_req_index_to_global_index(
+                    attn_metadata.req_id_per_token[:num_actual_toks],
+                    attn_metadata.block_table,
+                    topk_indices,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                ),
+            )
+            seq_lens = None
 
         output = q.new_empty(
             (num_actual_toks, kernel_num_heads, self.kv_lora_rank),
@@ -278,6 +312,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                     device=q.device,
                 )
 
+            out_lse = self._decode_lse_buffer[:num_actual_toks, :kernel_num_heads]
             out = sparse_mla_sm120_decode_dsv3_2(
                 q=q,
                 kv_cache=_reshape_kv_cache_for_sm120_decode(
@@ -287,18 +322,27 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 mid_out=mid_out,
                 mid_lse=mid_lse,
                 output=output,
-                out_lse=self._decode_lse_buffer[
-                    :num_actual_toks, :kernel_num_heads
-                ],
+                out_lse=out_lse,
                 sm_scale=self.scale,
                 model_type=_MODEL_TYPE_GLM_NSA,
                 # Bypass autotuning and let the compiled kernel use its
                 # occupancy-aware heuristic. The fleet disables FI autotune.
                 chunks_per_block=-1,
             )
-            return out[:, : self.num_heads].contiguous(), None
+            out = out[:, :in_num_heads].contiguous()
+            if not self.need_to_return_lse_for_decode:
+                return out, None
+            # The kernel fills out_lse (base-2) as a side effect; hand it to
+            # the DCP reducer. Rows whose top-k slots all live on other ranks
+            # write -1e30 split LSEs but the split merge accumulates their
+            # scratch unguarded, so mask them out explicitly.
+            lse = out_lse[:, :in_num_heads]
+            if empty_rows is not None:
+                out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+                lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            return out, lse
 
-        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+        kernel_out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
             kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
@@ -306,12 +350,56 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=rope_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=None,
+            # Compacted per-token valid counts under DCP (the SM120 route maps
+            # seq_lens to the kernel's per-token topk_length); None keeps the
+            # uniform-top-k behaviour otherwise.
+            seq_lens=seq_lens,
             max_seq_len=eff_topk,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
             sparse_mla_top_k=eff_topk,
+            return_lse=self.need_to_return_lse_for_decode,
             kv_scale_format=self.kv_scale_format,
         )
-        return out.squeeze(1)[:, : self.num_heads].contiguous(), None
+        if self.need_to_return_lse_for_decode:
+            assert isinstance(kernel_out, tuple)
+            out, lse = kernel_out
+        else:
+            assert isinstance(kernel_out, torch.Tensor)
+            out = kernel_out
+            lse = None
+
+        out = out.squeeze(1)[:, :in_num_heads].contiguous()
+        if lse is None:
+            return out, None
+        lse = self._normalize_lse(lse, num_actual_toks, kernel_num_heads)
+        lse = lse[:, :in_num_heads]
+        if empty_rows is not None:
+            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        return out, lse
+
+    @staticmethod
+    def _normalize_lse(
+        lse: torch.Tensor,
+        num_tokens: int,
+        num_heads: int,
+    ) -> torch.Tensor:
+        # FlashInfer returns the decode LSE either as 2D (num_tokens, num_heads)
+        # or 3D ((num_tokens, num_heads, 1) / (num_tokens, 1, num_heads)).
+        # Collapse all of these to the (num_tokens, num_heads) the shared DCP
+        # reducer expects.
+        if lse.dim() == 3:
+            if lse.shape[-1] == 1:
+                lse = lse.squeeze(-1)
+            elif lse.shape[1] == 1:
+                lse = lse.squeeze(1)
+            elif lse.shape[0] * lse.shape[1] == num_tokens:
+                lse = lse.reshape(num_tokens, lse.shape[-1])
+        if lse.shape != (num_tokens, num_heads):
+            raise RuntimeError(
+                "Unexpected FlashInfer SM120 sparse MLA LSE shape: "
+                f"{tuple(lse.shape)}, expected ({num_tokens}, {num_heads})."
+            )
+        return lse
