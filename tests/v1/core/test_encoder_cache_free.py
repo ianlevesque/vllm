@@ -9,6 +9,7 @@ the GPU-side encoder cache to survive preemption and hash reuse.
 
 See: https://github.com/vllm-project/vllm/issues/38551
 """
+
 import pytest
 import torch
 
@@ -183,6 +184,7 @@ class TestModelRunnerEncoderCacheRetention:
     def test_free_states_processes_encoder_decoder_hashes(self):
         """free_states() still frees entries for encoder-decoder models."""
         from unittest.mock import MagicMock
+
         from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
         cache = EncoderCache()
@@ -191,16 +193,21 @@ class TestModelRunnerEncoderCacheRetention:
         scheduler_output = MagicMock()
         scheduler_output.free_encoder_mm_hashes = ["enc_x"]
 
-        runner = type("_", (), {
-            "encoder_cache": cache,
-            "free_states": GPUModelRunner.free_states,
-        })()
+        runner = type(
+            "_",
+            (),
+            {
+                "encoder_cache": cache,
+                "free_states": GPUModelRunner.free_states,
+            },
+        )()
         runner.free_states(scheduler_output)
         assert "enc_x" not in cache.encoder_outputs
 
     def test_free_states_empty_list_for_multimodal(self):
         """free_states() with empty list (multimodal) keeps entries."""
         from unittest.mock import MagicMock
+
         from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
         cache = EncoderCache()
@@ -209,10 +216,14 @@ class TestModelRunnerEncoderCacheRetention:
         scheduler_output = MagicMock()
         scheduler_output.free_encoder_mm_hashes = []
 
-        runner = type("_", (), {
-            "encoder_cache": cache,
-            "free_states": GPUModelRunner.free_states,
-        })()
+        runner = type(
+            "_",
+            (),
+            {
+                "encoder_cache": cache,
+                "free_states": GPUModelRunner.free_states,
+            },
+        )()
         runner.free_states(scheduler_output)
         assert "img_x" in cache.encoder_outputs
 

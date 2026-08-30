@@ -1086,7 +1086,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     #     are left untouched (a bare `down_proj` substr would also hit them).
     #   * Indexer:      `…self_attn.indexer.{q,k}_proj` -> `…self_attn.index_{q,k}_proj`
     #                   (then folded into the fused qkv_proj by the stacked mapping),
-    #                   `…self_attn.indexer.{q,k}_norm` -> `…self_attn.index_{q,k}_norm`.
+    #                   `…self_attn.indexer.{q,k}_norm` ->
+    #                   `…self_attn.index_{q,k}_norm`.
     # No-op for native checkpoints that already use the `block_sparse_moe`/`w1w2w3`/
     # `index_*` names (none of these patterns match those).
     hf_to_vllm_mapper = WeightsMapper(
