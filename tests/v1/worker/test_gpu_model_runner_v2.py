@@ -8,6 +8,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import MultiModuleMTPSpeculator
+
 import vllm.v1.worker.gpu.model_runner as model_runner_module
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
@@ -366,3 +371,33 @@ def test_async_copy_to_np_does_not_alias_reused_buffer():
     buffer.fill_(1)
 
     assert snapshot.tolist() == [0, 0, 0, 0]
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "speculator_cls", [EagleSpeculator, MultiModuleMTPSpeculator, DFlashSpeculator]
+)
+@pytest.mark.parametrize(
+    ("enforce_eager", "target_mode", "expected_mode"),
+    [
+        pytest.param(
+            True, CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.NONE, id="eager"
+        ),
+        pytest.param(
+            False,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            id="full",
+        ),
+        pytest.param(None, CUDAGraphMode.NONE, CUDAGraphMode.NONE, id="none"),
+    ],
+)
+def test_draft_speculator_resolves_cudagraph_mode(
+    speculator_cls,
+    enforce_eager: bool | None,
+    target_mode: CUDAGraphMode,
+    expected_mode: CUDAGraphMode,
+):
+    speculator = speculator_cls.__new__(speculator_cls)
+    speculator.speculative_config = SimpleNamespace(enforce_eager=enforce_eager)
+    assert speculator.resolve_cudagraph_mode(target_mode) == expected_mode
