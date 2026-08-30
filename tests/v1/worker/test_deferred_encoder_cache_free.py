@@ -8,6 +8,7 @@ preemption, speculative rollback, and hash reuse across requests.
 
 See: https://github.com/vllm-project/vllm/issues/38551
 """
+
 import pytest
 import torch
 
@@ -41,10 +42,14 @@ class TestOldModelRunnerDeferredFree:
     def test_update_states_defers_free(self):
         """_update_states should save hashes instead of popping them."""
         encoder_cache = {"img_a": torch.zeros(1), "img_b": torch.zeros(1)}
-        runner = type("MockRunner", (), {
-            "encoder_cache": encoder_cache,
-            "_deferred_encoder_free_hashes": [],
-        })()
+        runner = type(
+            "MockRunner",
+            (),
+            {
+                "encoder_cache": encoder_cache,
+                "_deferred_encoder_free_hashes": [],
+            },
+        )()
 
         # Simulate what _update_states now does.
         free_hashes = ["img_a"]
@@ -57,10 +62,14 @@ class TestOldModelRunnerDeferredFree:
     def test_deferred_pop_after_mtp(self):
         """After MTP, deferred hashes are popped."""
         encoder_cache = {"img_a": torch.zeros(1), "img_b": torch.zeros(1)}
-        runner = type("MockRunner", (), {
-            "encoder_cache": encoder_cache,
-            "_deferred_encoder_free_hashes": ["img_a"],
-        })()
+        runner = type(
+            "MockRunner",
+            (),
+            {
+                "encoder_cache": encoder_cache,
+                "_deferred_encoder_free_hashes": ["img_a"],
+            },
+        )()
 
         # Simulate the deferred free after MTP.
         for mm_hash in runner._deferred_encoder_free_hashes:
@@ -82,7 +91,7 @@ class TestOldModelRunnerDeferredFree:
         assert "img_x" in encoder_cache
 
         # Phase 2: MTP's _gather_mm_embeddings reads from cache.
-        encoder_output = encoder_cache.get("img_x", None)
+        encoder_output = encoder_cache.get("img_x")
         assert encoder_output is not None, "MTP would hit cache miss here"
 
         # Phase 3: After MTP, deferred pop.
@@ -98,7 +107,7 @@ class TestOldModelRunnerDeferredFree:
         encoder_cache.pop("img_x", None)
 
         # MTP tries to read — cache miss!
-        encoder_output = encoder_cache.get("img_x", None)
+        encoder_output = encoder_cache.get("img_x")
         assert encoder_output is None, (
             "This proves the old code causes a cache miss for MTP"
         )
@@ -126,10 +135,14 @@ class TestNewModelRunnerDeferredFree:
         scheduler_output = MagicMock()
         scheduler_output.free_encoder_mm_hashes = []
 
-        runner = type("MockRunner", (), {
-            "encoder_cache": cache,
-            "free_states": GPUModelRunner.free_states,
-        })()
+        runner = type(
+            "MockRunner",
+            (),
+            {
+                "encoder_cache": cache,
+                "free_states": GPUModelRunner.free_states,
+            },
+        )()
 
         runner.free_states(scheduler_output)
 

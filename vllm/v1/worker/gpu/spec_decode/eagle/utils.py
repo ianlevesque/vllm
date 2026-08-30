@@ -59,7 +59,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     import dataclasses
 
     draft_load_config = speculative_config.draft_load_config or vllm_config.load_config
-    if get_pp_group().world_size > 1 and draft_load_config.load_format == "instanttensor":
+    if (
+        get_pp_group().world_size > 1
+        and draft_load_config.load_format == "instanttensor"
+    ):
         draft_load_config = dataclasses.replace(draft_load_config, load_format="auto")
     draft_vllm_config = copy.copy(vllm_config)
     draft_vllm_config.load_config = draft_load_config
