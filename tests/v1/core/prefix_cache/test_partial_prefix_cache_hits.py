@@ -4,6 +4,7 @@
 "align") models: scheduler chunk splitting, partial tail registration, CoW
 on partial hits, and same-step deferral."""
 
+from math import lcm
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -65,6 +66,96 @@ def test_capable_connector_uses_divergent_partial_hit_lookup():
 
     assert result == (per_group_blocks, 6, 0, True)
     manager.get_computed_blocks.assert_not_called()
+
+
+def drain_boundary_state_offloads(manager):
+    """Drain exact boundary-state block ids offered to a connector."""
+    return manager.take_boundary_state_offloads()
+
+
+def _free_block_ids(manager):
+    """Block ids the pool would hand out to the next allocation."""
+    return {
+        block.block_id
+        for block in manager.block_pool.free_block_queue.get_all_free_blocks()
+    }
+
+
+def make_full_mamba_manager(
+    *,
+    dcp_world_size: int,
+    hash_block_size: int = 2,
+    full_block_size: int = 4,
+    mamba_block_size: int = 4,
+    num_blocks: int = 32,
+    use_eagle: bool = False,
+    num_prefill_checkpoint_blocks: int = 0,
+):
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=full_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    # This tree has no num_prefill_checkpoint_blocks field
+                    # (upstream's prefill-checkpoint feature); the DCP
+                    # geometry under test does not depend on it.
+                ),
+            ),
+        ],
+    )
+    scheduler_block_size = lcm(
+        full_block_size * dcp_world_size,
+        mamba_block_size,
+    )
+    return make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+        use_eagle=use_eagle,
+    )
+
+
+def test_dcp_fine_hit_retention_uses_hash_alignment_without_eagle():
+    """DCP must not discard a reusable Mamba state at hash alignment."""
+    hash_block_size = 2
+    manager = make_full_mamba_manager(
+        dcp_world_size=4,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=hash_block_size,
+        num_blocks=64,
+    )
+    manager.coordinator.retention_interval = 0
+
+    token_ids = list(range(7))
+    producer = make_request("producer", token_ids, hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+    assert manager.allocate_slots(producer, 6, 0, computed_blocks) is not None
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request("consumer", token_ids, hash_block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert num_computed == 6
 
 
 def test_mamba_align_split_partial_tail_schedule():
