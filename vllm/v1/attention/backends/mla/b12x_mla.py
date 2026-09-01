@@ -420,11 +420,13 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         metadata.dense_mla_scratch = self._dense_mla_scratch
         metadata.dense_mla_padded_q = self._dense_mla_padded_q
         metadata.dense_mla_padded_output = self._dense_mla_padded_output
-        flatten_decode = (
-            metadata.decode is not None
-            and metadata.num_decodes > 0
-            and metadata.num_decode_tokens > metadata.num_decodes
-        )
+        flatten_decode = False
+        if metadata.decode is not None and metadata.num_decodes > 0:
+            plan_table_width = int(self._dense_mla_plan.caps.max_page_table_width)
+            flatten_decode = (
+                metadata.num_decode_tokens > metadata.num_decodes
+                or int(metadata.decode.block_table.shape[1]) > plan_table_width
+            )
         if flatten_decode:
             if metadata.decode is None or metadata.num_decodes <= 0:
                 raise ValueError("B12X_MLA flattened metadata requires decode rows.")
@@ -449,9 +451,10 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             # A bounded DSpark cache keeps a position-indexed worker table for
             # the target's complete context, but compacts its resident tail to
             # the beginning before this builder runs. Copy only the page-table
-            # prefix the bounded dense-MLA plan can consume. cache_seqlens is
-            # shortened by the same compaction, so entries beyond this prefix
-            # are unreachable.
+            # prefix the bounded dense-MLA plan can consume. This canonicalizes
+            # even a one-token adaptive draft, whose query does not otherwise
+            # require row flattening. cache_seqlens is shortened by the same
+            # compaction, so entries beyond this prefix are unreachable.
             source_width = min(int(source_table.shape[1]), int(flat_table.shape[1]))
             flat_table[:, :source_width].copy_(
                 source_table[:, None, :source_width]
@@ -796,7 +799,6 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             kv_scale=kv_scale,
             sm_scale=self.scale,
             active_splits=active_splits,
-            validate=False,
         )
 
     def forward_mqa(
