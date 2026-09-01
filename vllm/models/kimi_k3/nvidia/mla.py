@@ -694,6 +694,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         num_actual_toks = attn_metadata.num_actual_tokens
+        if num_actual_toks < int(attn_out.shape[0]):
+            # Downstream gate and output projections consume the padded rows.
+            # Define inactive rows so collective kernels never consume
+            # uninitialized values.
+            attn_out[num_actual_toks:].zero_()
         slot_mapping_by_layer = forward_context.slot_mapping
         assert isinstance(slot_mapping_by_layer, dict)
         slot_mapping = slot_mapping_by_layer[self.layer_name]
