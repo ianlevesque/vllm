@@ -656,7 +656,18 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         # Pro-format fused qkv_proj arrives as two tensors (weight and
         # weight_scale_inv). Store them per-layer so that they can be
         # sharded together.
-        pending_fp8_qkv_proj: dict[str, dict[str, torch.Tensor]] = {}
+        # load_weights may be invoked in several passes by distributed or
+        # streaming loaders (instanttensor issues one call per file group; the
+        # weight and its weight_scale_inv for one layer can land in different
+        # passes). A per-call pending dict drops the first half at return, so
+        # the pair never completes and qkv_proj keeps its zero-initialized
+        # weight (dead attention -> garbage output). Persist it on the module.
+        pending_fp8_qkv_proj: dict[str, dict[str, torch.Tensor]] | None = getattr(
+            self, "_pending_fp8_qkv_proj", None
+        )
+        if pending_fp8_qkv_proj is None:
+            pending_fp8_qkv_proj = {}
+            self._pending_fp8_qkv_proj = pending_fp8_qkv_proj
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -800,7 +811,10 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
         prefix, qkv_kind = name.rsplit(".", 1)
         entry = fp8_qkv_proj_dict.setdefault(prefix, {})
-        entry[qkv_kind] = tensor
+        # Streaming loaders hand out views into a reused staging buffer; the
+        # first-arriving half is held across iterator steps (and across
+        # load_weights calls), so keep an owned copy.
+        entry[qkv_kind] = tensor.clone()
         if "weight" not in entry or "weight_scale_inv" not in entry:
             # Still waiting for the other param.
             return True
