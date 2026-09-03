@@ -221,6 +221,9 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1942,6 +1945,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # integration is being qualified.
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
+    ),
+    # Opt-in multi-node DGX Spark RDMA collectives; larger tensors use NCCL.
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

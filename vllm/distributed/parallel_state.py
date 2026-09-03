@@ -680,6 +680,7 @@ class GroupCoordinator:
         maybe_ca_context = nullcontext()
         maybe_fi_pcie_ipc_context: AbstractContextManager[Any] = nullcontext()
         maybe_aiter_ar_context = nullcontext()
+        maybe_b12x_roce_context = nullcontext()
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
@@ -692,6 +693,9 @@ class GroupCoordinator:
                 self.device_communicator,
                 (CudaCommunicator, XpuCommunicator),
             )
+            b12x_ar_comm = getattr(self.device_communicator, "b12x_ar_comm", None)
+            if b12x_ar_comm is not None:
+                maybe_b12x_roce_context = b12x_ar_comm.capture(stream=stream)
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
@@ -716,6 +720,7 @@ class GroupCoordinator:
             maybe_ca_context,
             maybe_fi_pcie_ipc_context,
             maybe_aiter_ar_context,
+            maybe_b12x_roce_context,
         ):
             yield graph_capture_context
 
