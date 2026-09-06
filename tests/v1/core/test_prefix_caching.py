@@ -4630,3 +4630,143 @@ def test_swa_shared_prefix_reuse_under_zero_retention(monkeypatch):
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def test_hybrid_partial_hits_align_to_mamba_block_under_dcp():
+    """Partial hits land on the Mamba block cadence when it is coarser than the
+    hash unit (Kimi-K3 TP9/DCP9 geometry scaled down: 16-token hash unit,
+    48-token aligned Mamba block, full-attention block 64 x 3 DCP shards =
+    192, replicated 16-token sliding-window draft group)."""
+    hash_block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attn"],
+                FullAttentionSpec(
+                    block_size=64, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=48,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=32,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=4 * 192,
+        scheduler_block_size=192,
+        hash_block_size=hash_block_size,
+        enable_caching=True,
+        dcp_world_size=3,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.enable_partial_hash_hits
+    assert coordinator._cache_hit_alignment_tokens == 48
+
+    # A 96-token prompt: two Mamba state blocks, half of a full-attention
+    # block, six draft blocks. Every group must cache its tail at the
+    # 48-token cadence for the replay to hit locally.
+    owner = make_request("owner", list(range(96)), hash_block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(owner)
+    assert num_computed_tokens == 0
+    assert manager.allocate_slots(owner, 96, 0, computed_blocks) is not None
+    manager.cache_blocks(owner, 96)
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request("replay", list(range(96)) + [7] * 24, hash_block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 96
+    assert len(computed_blocks.get_block_ids()) == 3
+
+
+@pytest.mark.parametrize("cached_tokens", [8192, 9216, 10240, 11264, 12288])
+@pytest.mark.parametrize("retention", [None, "0"])
+@pytest.mark.parametrize("eagle", [False, True])
+def test_k3_dcp4_replicated_dspark_cache_restore_stays_block_aligned(
+    cached_tokens, retention, eagle, monkeypatch
+):
+    """Keep DSpark enabled after any cached turn in production K3 geometry."""
+    if retention is not None:
+        monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", retention)
+    config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=1024,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=4096,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["dspark"],
+                FullAttentionSpec(
+                    block_size=1024,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    dcp_replicated=True,
+                ),
+                is_eagle_group=eagle,
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=16384,
+        scheduler_block_size=4096,
+        hash_block_size=1024,
+        enable_caching=True,
+        dcp_world_size=4,
+    )
+    owner = make_request("owner", list(range(cached_tokens)), 1024, sha256)
+    # Match the real 4096-token prefill chunks so aligned recurrent states
+    # exist before processing the last partial chunk.
+    for start in range(0, cached_tokens, 4096):
+        end = min(start + 4096, cached_tokens)
+        assert manager.allocate_slots(owner, end - start) is not None
+        owner.num_computed_tokens = end
+        manager.cache_blocks(owner, end)
+        manager.new_step_starts()
+    manager.free(owner)
+    manager.new_step_starts()
+    replay = make_request(
+        "replay", list(range(cached_tokens)) + [42] * 256, 1024, sha256
+    )
+    computed, hit_tokens, _ = manager.get_computed_blocks(replay)
+    assert hit_tokens > 0, "prefix caching must remain usable"
+    # These are the kernel block sizes checked by DSpark's restored-prefix guard.
+    assert all(hit_tokens % block_size == 0 for block_size in (1024, 4096)), hit_tokens
+    assert len(computed.get_block_ids()) == 3

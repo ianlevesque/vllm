@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -737,7 +738,26 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = has_partial_mamba_group
+        # Adopt the Mamba-cadence alignment from local-inference-lab/vllm
+        # cebc258d2249. A restored prefix must be on every recurrent-state
+        # boundary as well as the hash grid. Otherwise DFlash/DSpark cannot
+        # safely draft after the restore and suppresses the entire request.
+        self.partial_hit_alignment_tokens = math.lcm(
+            hash_block_size,
+            *(
+                manager.block_size
+                for group, manager in zip(
+                    kv_cache_config.kv_cache_groups, self.single_type_managers
+                )
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_cache_mode == "align"
+            ),
+        )
+        self.enable_partial_hash_hits = (
+            has_partial_mamba_group
+            and self.partial_hit_alignment_tokens < self.scheduler_block_size
+            and self.scheduler_block_size % self.partial_hit_alignment_tokens == 0
+        )
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -765,7 +785,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Fine-grained partial hits may return hash-block-aligned lengths;
         # otherwise it must stay scheduler-block-aligned.
         return (
-            self.hash_block_size
+            self.partial_hit_alignment_tokens
             if self.enable_partial_hash_hits
             else self.scheduler_block_size
         )
