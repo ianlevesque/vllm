@@ -51,12 +51,13 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
-from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata, MultipleOf
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     dsa_indexer_uses_fp4,
@@ -964,6 +965,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return source.kv_cache
 
 
+class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if current_platform.is_device_capability_family(120):
+            # SM12x FP8 paged MQA needs 64 stored states: CSA1 uses 64
+            # original tokens per page, CSA2 uses 128.
+            return [64, 128]
+        return DeepseekV4IndexerBackend.get_supported_kernel_block_sizes()
+
+
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
         self,
@@ -993,8 +1004,13 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # head_dim already carries the fp8 scale padding
         # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        block_size = self.cache_config.block_size
+        if current_platform.is_device_capability_family(120):
+            # Use a separate manager group for CSA1 index keys. Splitting the
+            # MLA group's packed pages would give incorrect physical strides.
+            block_size = 64 * self.compress_ratio
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
@@ -1006,7 +1022,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return DeepseekV4IndexerBackend
+        return DeepseekV41IndexerBackend
 
 
 class DeepseekV4Indexer(nn.Module):
