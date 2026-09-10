@@ -180,10 +180,10 @@ impl RoundtripCase {
         }
     }
 
-    /// DeepSeek V4.1 DSML format with files from a local checkpoint.
+    /// DeepSeek V4.1 DSML format.
     fn deepseek_v41() -> Self {
         Self {
-            model_id: "/mnt/lustre/sra-weights/ckpt20260903",
+            model_id: "deepseek-ai/DeepSeek-V4.1-Flash",
             assistant_stop_suffix: "<｜end▁of▁sentence｜>",
             tool_call_parser: ParserSelection::Explicit("deepseek_v41".to_string()),
             reasoning_parser: ParserSelection::Explicit("deepseek_v41".to_string()),
@@ -398,7 +398,7 @@ roundtrip_tests! {
     minimax_m25 => [reasoning_and_content, tool_call_mix],
     minimax_m3 => [reasoning_and_content, tool_call_mix],
     deepseek_v4 => [reasoning_and_content, tool_call_mix],
-    deepseek_v41 => #[ignore = "requires the local DeepSeek V4.1 checkpoint on GB200"] [reasoning_and_content, tool_call_mix],
+    deepseek_v41 => #[ignore = "requires DeepSeek V4.1 model files"] [reasoning_and_content, tool_call_mix],
     deepseek_v32 => [tool_call_mix],
     glm45 => [reasoning_and_content, tool_call_mix],
     glm47 => [reasoning_and_content, tool_call_mix],
