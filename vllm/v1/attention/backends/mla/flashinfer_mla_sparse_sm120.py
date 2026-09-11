@@ -85,6 +85,10 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
     # generic FlashInfer sparse impl declares.
     can_return_lse_for_decode: bool = True
     lse_base_on_e: bool = False
+    # DCP mechanics live in this file (triton_filter_and_convert_dcp_index,
+    # per-token topk compaction, shared DCP reducer); qualified at DCP2 on
+    # GLM-5.3. Declare it so backend validation admits the combination.
+    supports_dcp: bool = True
 
     def __init__(
         self,
