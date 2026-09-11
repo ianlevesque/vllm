@@ -17,10 +17,20 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 from transformers.models.pixtral.modeling_pixtral import (
-    PixtralRotaryEmbedding,
     apply_rotary_pos_emb,
     position_ids_in_meshgrid,
 )
+try:
+    # transformers<5.5
+    from transformers.models.pixtral.modeling_pixtral import (
+        PixtralRotaryEmbedding,
+    )
+except ImportError:
+    # transformers>=5.5 renamed PixtralRotaryEmbedding (drop-in: same
+    # (config, device) init and forward(x, position_ids))
+    from transformers.models.pixtral.modeling_pixtral import (
+        PixtralVisionRotaryEmbedding as PixtralRotaryEmbedding,
+    )
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
