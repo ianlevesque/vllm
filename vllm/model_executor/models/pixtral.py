@@ -18,19 +18,35 @@ from transformers.models.pixtral.image_processing_pixtral import (
 )
 from transformers.models.pixtral.modeling_pixtral import (
     apply_rotary_pos_emb,
-    position_ids_in_meshgrid,
 )
 try:
-    # transformers<5.5
+    # transformers<=5.16
     from transformers.models.pixtral.modeling_pixtral import (
         PixtralRotaryEmbedding,
+        position_ids_in_meshgrid,
     )
 except ImportError:
-    # transformers>=5.5 renamed PixtralRotaryEmbedding (drop-in: same
-    # (config, device) init and forward(x, position_ids))
+    # transformers>=5.17 renamed PixtralRotaryEmbedding (drop-in: same
+    # (config, device) init and forward(x, position_ids)) and removed the
+    # module-level position_ids_in_meshgrid helper (inlined at its one use
+    # site); fall back to the renamed class plus a verbatim vendored copy of
+    # the 5.16 helper.
     from transformers.models.pixtral.modeling_pixtral import (
         PixtralVisionRotaryEmbedding as PixtralRotaryEmbedding,
     )
+
+    def position_ids_in_meshgrid(patch_embeds_list, max_width):
+        positions = []
+        for patch in patch_embeds_list:
+            height, width = patch.shape[-2:]
+            mesh = torch.meshgrid(torch.arange(height),
+                                  torch.arange(width),
+                                  indexing="ij")
+            h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(
+                2, -1)
+            ids = h_grid * max_width + v_grid
+            positions.append(ids[:, 0])
+        return torch.cat(positions)
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
