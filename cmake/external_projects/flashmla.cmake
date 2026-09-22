@@ -22,8 +22,8 @@ else()
         # rope_dim branch; it's unreachable from a plain clone of
         # vllm-project/FlashMLA (only via refs/pull/*), so point at the fork.
         # https://github.com/vllm-project/FlashMLA/pull/17
-        GIT_REPOSITORY https://github.com/JaredforReal/FlashMLA.git
-        GIT_TAG 8447acbcb558db892bf7c1197d225be1c95b168c
+        GIT_REPOSITORY https://github.com/vllm-project/FlashMLA
+        GIT_TAG 739783463c8ef5cb35f501eadcaf2aad63b66c36
         GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""
