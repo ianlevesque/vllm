@@ -18,10 +18,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
 )
 from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
-from vllm.models.deepseek_v4_1.common.mm_preprocess import (
-    IMAGE_PAD_ID,
-    IMAGE_SENTINEL_BASE_ID,
-)
+from vllm.models.deepseek_v4_1.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from vllm.models.deepseek_v4_1.nvidia.model import DeepseekV4MoE as DeepseekV41MoE
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
@@ -78,7 +75,7 @@ def test_deepseek_v41_moe_routes_without_hash_table(
         moe = DeepseekV41MoE(v41_moe_config, prefix=f"model.layers.{layer_id}.ffn")
         hidden_states = torch.randn(4, config.hidden_size)
         input_ids = (
-            torch.tensor([42, IMAGE_SENTINEL_BASE_ID, IMAGE_PAD_ID, 129257])
+            torch.tensor([42, IMAGE_SENTINEL_BASE_ID, IMAGE_SENTINEL_BASE_ID, 129257])
             if vision
             else None
         )
@@ -100,7 +97,7 @@ def test_deepseek_v41_moe_routes_without_hash_table(
     ).sqrt()
     bias = moe.gate.e_score_correction_bias
     if vision:
-        image_mask = (input_ids == IMAGE_SENTINEL_BASE_ID) | (input_ids == IMAGE_PAD_ID)
+        image_mask = input_ids == IMAGE_SENTINEL_BASE_ID
         bias = torch.where(image_mask[:, None], moe.gate.bias_vl, bias)
     expected_ids = (scores + bias).topk(top_k, dim=-1).indices
     expected_weights = scores.gather(1, expected_ids)
@@ -365,11 +362,19 @@ def test_deepseek_v4_mega_moe_padding_preserves_weights(monkeypatch, intermediat
     assert experts._transformed_l1_weights is transformed_l1
 
 
-@pytest.mark.parametrize("mxfp8", [False, True])
-@pytest.mark.parametrize("intermediate_size", [512, 2304])
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,block_size,fused,mxfp8",
+    [
+        pytest.param(128, 512, 128, True, False, id="aligned-block128"),
+        pytest.param(128, 512, 128, True, True, id="aligned-block128-mxfp8"),
+        pytest.param(5120, 2304, 32, False, False, id="deepseek-v41-flash"),
+    ],
+)
 def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
-    monkeypatch, mxfp8, intermediate_size
+    monkeypatch, hidden_size, intermediate_size, block_size, fused, mxfp8
 ):
+    """V4.1-Flash's routed padding must preserve the serial shared-expert fallback."""
+
     class FakeDeepGemm:
         transformed_dims: list[tuple[int, int]] = []
         scale_inputs: list[tuple[int, ...]] = []
@@ -416,7 +421,7 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
         num_local_experts=1,
         experts_start_idx=0,
         top_k=1,
-        hidden_size=128,
+        hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_shared_experts=1,
     )
@@ -432,17 +437,21 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
 
     shared_experts = SimpleNamespace(
         gate_up_proj=SimpleNamespace(
-            weight=fp8_parameter(2 * intermediate_size, 128),
-            weight_block_size=(128, 128),
+            weight=fp8_parameter(2 * intermediate_size, hidden_size),
+            weight_block_size=(block_size, block_size),
             weight_scale_inv=scale_parameter(
-                2 * intermediate_size // 128, 1, dtype=torch.float8_e8m0fnu
+                2 * intermediate_size // block_size,
+                hidden_size // block_size,
+                dtype=torch.float8_e8m0fnu,
             ),
         ),
         down_proj=SimpleNamespace(
-            weight=fp8_parameter(128, intermediate_size),
-            weight_block_size=(128, 128),
+            weight=fp8_parameter(hidden_size, intermediate_size),
+            weight_block_size=(block_size, block_size),
             weight_scale_inv=scale_parameter(
-                1, intermediate_size // 128, dtype=torch.float8_e8m0fnu
+                hidden_size // block_size,
+                intermediate_size // block_size,
+                dtype=torch.float8_e8m0fnu,
             ),
         ),
     )
@@ -459,20 +468,28 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
     monkeypatch.setattr("vllm.utils.deep_gemm._import_deep_gemm", lambda: FakeDeepGemm)
 
     original_gate_up_ptr = shared_experts.gate_up_proj.weight.data_ptr()
+    original_down_ptr = shared_experts.down_proj.weight.data_ptr()
     experts.finalize_weights(shared_experts)
 
-    if intermediate_size % 512:
+    assert FakeDeepGemm.scale_inputs[-2:] == [
+        (1, 2 * intermediate_size, hidden_size // 32),
+        (1, hidden_size, intermediate_size // 32),
+    ]
+    assert experts.has_fused_shared_experts is fused
+    if not fused:
+        assert experts.intermediate_size == 2560
         assert FakeDeepGemm.transformed_dims == [(3, 3)]
-        assert not experts.has_fused_shared_experts
         assert experts.num_shared_experts == 0
+        assert shared_experts.gate_up_proj.weight.data_ptr() == original_gate_up_ptr
+        assert shared_experts.down_proj.weight.data_ptr() == original_down_ptr
+        assert shared_experts.gate_up_proj.weight.shape == (
+            2 * intermediate_size,
+            hidden_size,
+        )
+        assert shared_experts.down_proj.weight.shape == (hidden_size, intermediate_size)
         return
 
     assert FakeDeepGemm.transformed_dims == [(3, 3), (2, 2)]
-    assert FakeDeepGemm.scale_inputs[-2:] == [
-        (1, 2 * intermediate_size, 4),
-        (1, 128, intermediate_size // 32),
-    ]
-    assert experts.has_fused_shared_experts
     assert shared_experts.gate_up_proj.weight.data_ptr() != original_gate_up_ptr
     assert (
         experts._transformed_shared_l1_weights[0].data_ptr()

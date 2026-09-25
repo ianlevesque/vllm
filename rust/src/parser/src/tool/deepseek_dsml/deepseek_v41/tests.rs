@@ -57,7 +57,7 @@ fn spaced_dsml_streaming_preserves_shared_schema_coercion() {
         let mut parser = DeepSeekV41ToolParser::create(&tools()).unwrap();
         let output = collect_stream(parser.as_mut(), &[&wire[..split], &wire[split..]]);
         // Protocol framing follows the current shared DSML behavior.
-        assert_eq!(output.normal_text(), "summary\n\n", "split {split}");
+        assert_eq!(output.normal_text(), "summary", "split {split}");
         assert_eq!(output.calls().len(), 2, "split {split}");
         for (index, call) in output.calls().iter().enumerate() {
             assert_eq!(call.tool_index, index, "split {split}");

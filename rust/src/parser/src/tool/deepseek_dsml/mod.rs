@@ -8,7 +8,7 @@ use winnow::stream::Partial;
 use winnow::token::{literal, rest, take_until};
 
 use super::parameters::ToolSchemas;
-use super::utils::{MarkerScanState, parse_buffered_event, safe_text_len, take_until_marker};
+use super::utils::{MarkerScanState, parse_buffered_event, safe_text_len_mul, take_until_marker};
 use super::{Result, ToolCallDelta, ToolParserOutput};
 use crate::tool::Tool;
 
@@ -25,6 +25,7 @@ type DsmlInput<'i> = Partial<&'i str>;
 #[derive(Debug, Clone, Copy)]
 struct DsmlTokens {
     tool_calls_start: &'static str,
+    framed_tool_calls_start: &'static str,
     tool_calls_end: &'static str,
     invoke_start: &'static str,
     invoke_end: &'static str,
@@ -35,6 +36,7 @@ struct DsmlTokens {
 impl DsmlTokens {
     const V32: Self = Self {
         tool_calls_start: "<｜DSML｜function_calls>",
+        framed_tool_calls_start: "\n\n<｜DSML｜function_calls>",
         tool_calls_end: "</｜DSML｜function_calls>",
         invoke_start: "<｜DSML｜invoke",
         invoke_end: "</｜DSML｜invoke>",
@@ -43,11 +45,13 @@ impl DsmlTokens {
     };
     const V4: Self = Self {
         tool_calls_start: "<｜DSML｜tool_calls>",
+        framed_tool_calls_start: "\n\n<｜DSML｜tool_calls>",
         tool_calls_end: "</｜DSML｜tool_calls>",
         ..Self::V32
     };
     const V41: Self = Self {
         tool_calls_start: "<｜DSML｜ calls>",
+        framed_tool_calls_start: "\n\n<｜DSML｜ calls>",
         tool_calls_end: "</｜DSML｜ calls>",
         invoke_start: "<｜DSML｜ invoke",
         invoke_end: "</｜DSML｜ invoke>",
@@ -224,9 +228,12 @@ fn parse_tool_block_event(
 
 /// Parse a DSML function-calls start marker.
 fn tool_calls_start_event(input: &mut DsmlInput<'_>, tokens: DsmlTokens) -> ModalResult<DsmlEvent> {
-    literal(tokens.tool_calls_start)
-        .value(DsmlEvent::ToolCallsStart)
-        .parse_next(input)
+    alt((
+        literal(tokens.framed_tool_calls_start),
+        literal(tokens.tool_calls_start),
+    ))
+    .value(DsmlEvent::ToolCallsStart)
+    .parse_next(input)
 }
 
 /// Parse a DSML function-calls end marker.
@@ -241,7 +248,11 @@ fn ignored_rest_event(input: &mut DsmlInput<'_>) -> ModalResult<DsmlEvent> {
 
 /// Parse a safe text run before the next DSML marker.
 fn safe_text_event(input: &mut DsmlInput<'_>, tokens: DsmlTokens) -> ModalResult<DsmlEvent> {
-    safe_text_len(input, tokens.tool_calls_start).map(|len| DsmlEvent::Text { len })
+    safe_text_len_mul(
+        input,
+        &[tokens.framed_tool_calls_start, tokens.tool_calls_start],
+    )
+    .map(|len| DsmlEvent::Text { len })
 }
 
 /// Parse a DSML invoke block.

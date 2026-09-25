@@ -59,7 +59,7 @@ from vllm.utils.multi_stream_utils import (
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata, MultipleOf
 from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV4IndexerBackend,
+    DeepseekV41IndexerBackend as _UpstreamV41IndexerBackend,
     dsa_indexer_uses_fp4,
     get_max_prefill_buffer_size,
 )
@@ -169,6 +169,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
     # a single attention class dispatches across arch-specific layouts.
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # FlashInfer's DSV4 SM120 kernels require 64-token primary cache pages
+    # (overridden to 64 below); storage granularity only, SWA window stays 128.
     swa_cache_block_size: ClassVar[int] = 32
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
@@ -965,14 +967,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return source.kv_cache
 
 
-class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+class DeepseekV41IndexerBackend(_UpstreamV41IndexerBackend):
+    # SM12x carry (fork): FP8 paged MQA needs 64 stored states on SM120 —
+    # CSA1 uses 64 original tokens per page, CSA2 uses 128. get_name and the
+    # ROCm query-lens-mismatch override inherit from upstream unchanged.
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec=None,
+    ) -> list[int | MultipleOf]:
         if current_platform.is_device_capability_family(120):
-            # SM12x FP8 paged MQA needs 64 stored states: CSA1 uses 64
-            # original tokens per page, CSA2 uses 128.
             return [64, 128]
-        return DeepseekV4IndexerBackend.get_supported_kernel_block_sizes()
+        return _UpstreamV41IndexerBackend.get_supported_kernel_block_sizes(
+            kv_cache_spec
+        )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
@@ -1004,10 +1011,11 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # head_dim already carries the fp8 scale padding
         # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        # SM12x carry (fork): use a separate manager group for CSA1 index
+        # keys. Splitting the MLA group's packed pages would give incorrect
+        # physical strides.
         block_size = self.cache_config.block_size
         if current_platform.is_device_capability_family(120):
-            # Use a separate manager group for CSA1 index keys. Splitting the
-            # MLA group's packed pages would give incorrect physical strides.
             block_size = 64 * self.compress_ratio
         return MLAAttentionSpec(
             block_size=block_size,

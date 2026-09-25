@@ -99,6 +99,24 @@ def test_raw_text_parts_preserve_reference_separator():
     assert messages == original
 
 
+@pytest.mark.parametrize(
+    ("role", "responses_type"),
+    [("user", "input_text"), ("assistant", "output_text")],
+)
+def test_responses_text_parts_match_chat_text_parts(role, responses_type):
+    responses_message = {
+        "role": role,
+        "content": [{"type": responses_type, "text": "hello"}],
+    }
+    chat_message = {
+        "role": role,
+        "content": [{"type": "text", "text": "hello"}],
+    }
+    assert render([responses_message], thinking=False) == render(
+        [chat_message], thinking=False
+    )
+
+
 def test_mid_system_gets_its_own_marker_and_generation_header():
     assert render(
         [
@@ -114,7 +132,7 @@ def test_mid_system_gets_its_own_marker_and_generation_header():
 
 def test_top_level_effort_overrides_template_effort():
     request = ChatCompletionRequest(
-        model="deepseek-v41",
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
         messages=[{"role": "user", "content": "question"}],
         reasoning_effort="low",
         chat_template_kwargs={"reasoning_effort": 100},

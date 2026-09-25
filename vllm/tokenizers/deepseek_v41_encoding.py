@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa
 
-"""Text encoding adapted from the DeepSeek V4.1 checkpoint reference encoder.
+"""Text encoding adapted from the DeepSeek V4.1 reference encoder.
 
 Message normalization and serving controls live in deepseek_v41.py.
 """

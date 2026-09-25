@@ -180,13 +180,13 @@ impl RoundtripCase {
         }
     }
 
-    /// DeepSeek V4.1 DSML format.
+    /// DeepSeek V4.1 Flash DSML tool-call format.
     fn deepseek_v41() -> Self {
         Self {
             model_id: "deepseek-ai/DeepSeek-V4.1-Flash",
             assistant_stop_suffix: "<｜end▁of▁sentence｜>",
-            tool_call_parser: ParserSelection::Explicit("deepseek_v41".to_string()),
-            reasoning_parser: ParserSelection::Explicit("deepseek_v41".to_string()),
+            tool_call_parser: ParserSelection::Auto,
+            reasoning_parser: ParserSelection::Auto,
             thinking_behavior: ThinkingBehavior::Toggleable { default: true },
             json_fmt: compact_json_fmt(),
             sort_json_keys: false,
@@ -398,7 +398,7 @@ roundtrip_tests! {
     minimax_m25 => [reasoning_and_content, tool_call_mix],
     minimax_m3 => [reasoning_and_content, tool_call_mix],
     deepseek_v4 => [reasoning_and_content, tool_call_mix],
-    deepseek_v41 => #[ignore = "requires DeepSeek V4.1 model files"] [reasoning_and_content, tool_call_mix],
+    deepseek_v41 => [reasoning_and_content, tool_call_mix],
     deepseek_v32 => [tool_call_mix],
     glm45 => [reasoning_and_content, tool_call_mix],
     glm47 => [reasoning_and_content, tool_call_mix],
@@ -459,10 +459,12 @@ async fn run_roundtrip_reasoning_and_content_inner(
     let result = run_roundtrip(case, backends, &request, assistant).await?;
 
     assert_eq!(
-        result.parsed_message.reasoning().as_deref().map(str::trim),
-        effective_thinking.then_some(expected_reasoning)
+        result.parsed_message.reasoning().as_deref(),
+        effective_thinking.then_some(expected_reasoning),
+        "parsed message: {:#?}",
+        result.parsed_message
     );
-    assert_eq!(result.parsed_message.text().trim(), expected_text);
+    assert_eq!(result.parsed_message.text(), expected_text);
     assert_eq!(result.parsed_message.tool_calls().count(), 0);
 
     assert_eq!(
@@ -522,10 +524,12 @@ async fn run_roundtrip_tool_call_mix(
     .await?;
 
     assert_eq!(
-        result.parsed_message.reasoning().as_deref().map(str::trim),
-        Some(expected_reasoning)
+        result.parsed_message.reasoning().as_deref(),
+        Some(expected_reasoning),
+        "parsed message: {:#?}",
+        result.parsed_message
     );
-    assert_eq!(result.parsed_message.text().trim(), expected_text);
+    assert_eq!(result.parsed_message.text(), expected_text);
 
     let tool_calls = result.parsed_message.tool_calls().collect::<Vec<_>>();
     assert_eq!(
@@ -728,11 +732,7 @@ async fn parse_completion(
 
     while let Some(event) = events.next().await {
         if let ChatEvent::Done { message, .. } = event? {
-            // TODO: currently our parsers are not very strict about preserving or trimming
-            // whitespace, so we trim here to avoid roundtrip failures due to
-            // insignificant whitespace differences. However, this may hurt token-level
-            // fidelity so we should consider improving them.
-            return Ok(message.trim());
+            return Ok(message);
         }
     }
 

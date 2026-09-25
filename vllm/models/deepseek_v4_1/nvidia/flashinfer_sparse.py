@@ -545,8 +545,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
-    # FlashInfer's DSV4 SM120 kernels require 64-token primary cache pages.
-    # This changes storage granularity only; the model's SWA window stays 128.
+    # SM12x carry (fork): FlashInfer's DSV4 SM120 kernels require 64-token
+    # primary cache pages. Storage granularity only; SWA window stays 128.
     swa_cache_block_size: ClassVar[int] = 64
 
     @staticmethod
