@@ -131,7 +131,15 @@ class InputBatch:
         input_buffers: InputBuffers,
         max_query_len: int | None = None,
         is_padding: bool = True,
+        uniform_token_count: int | None = None,
     ) -> "InputBatch":
+        if uniform_token_count is not None:
+            # An idle DP rank can be padded to another rank's decode batch.
+            # Keep the agreed query width instead of widening its original
+            # dummy request; the drafter reuses this same DP agreement.
+            assert uniform_token_count > 0
+            assert num_tokens % uniform_token_count == 0
+            num_reqs = num_tokens // uniform_token_count
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
 

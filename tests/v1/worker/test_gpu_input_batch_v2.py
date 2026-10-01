@@ -18,6 +18,37 @@ DEVICE = current_platform.device_type
 
 
 @pytest.mark.parametrize(
+    "query_len,padded_tokens", [(1, 32), (2, 32), (4, 32), (4, 2048), (8, 64)]
+)
+def test_make_dummy_preserves_dp_uniform_decode(query_len: int, padded_tokens: int):
+    """Idle ranks must preserve the target's query width after DP padding.
+
+    PIECEWISE descriptors do not pad request counts. Keeping one original
+    dummy request would turn a padded 32-token MTP3 batch into one query of
+    length 32; the drafter would then reject the reused DP sync for length 4.
+    Check the actual input metadata passed to the target and drafter.
+    """
+    expected_reqs = padded_tokens // query_len
+    buffers = InputBuffers(
+        max_num_reqs=expected_reqs,
+        max_num_tokens=padded_tokens,
+        device=torch.device("cpu"),
+    )
+    batch = InputBatch.make_dummy(
+        1, padded_tokens, buffers, uniform_token_count=query_len
+    )
+    assert batch.num_reqs == expected_reqs
+    assert batch.num_reqs_after_padding == expected_reqs
+    assert batch.num_tokens == padded_tokens
+    assert (batch.num_scheduled_tokens == query_len).all()
+    assert batch.seq_lens.tolist() == [query_len] * expected_reqs
+    assert np.diff(batch.query_start_loc_np).tolist() == [query_len] * expected_reqs
+    assert batch.query_start_loc_np[-1] == padded_tokens
+    assert batch.decode_graph_eligible
+    assert batch.is_padding.all()
+
+
+@pytest.mark.parametrize(
     "num_reqs,num_tokens",
     [
         (256, 496),  # remainder 240: previously gave the last request 241 tokens
