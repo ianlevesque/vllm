@@ -133,13 +133,14 @@ class InputBatch:
         is_padding: bool = True,
         uniform_token_count: int | None = None,
     ) -> "InputBatch":
+        num_tokens_after_padding = num_tokens
         if uniform_token_count is not None:
-            # An idle DP rank can be padded to another rank's decode batch.
-            # Keep the agreed query width instead of widening its original
-            # dummy request; the drafter reuses this same DP agreement.
+            # DP/graph padding adds execution rows, not dummy requests. Keep
+            # both the local request count and the agreed query width: the
+            # drafter reuses the target's token and request-count agreement.
             assert uniform_token_count > 0
-            assert num_tokens % uniform_token_count == 0
-            num_reqs = num_tokens // uniform_token_count
+            num_tokens = num_reqs * uniform_token_count
+            assert num_tokens <= num_tokens_after_padding
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
 
@@ -179,11 +180,11 @@ class InputBatch:
         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
 
-        input_ids = input_buffers.input_ids[:num_tokens].zero_()
-        positions = input_buffers.positions[:num_tokens].zero_()
+        input_ids = input_buffers.input_ids[:num_tokens_after_padding].zero_()
+        positions = input_buffers.positions[:num_tokens_after_padding].zero_()
 
-        input_buffers.is_padding[:num_tokens].fill_(is_padding)
-        is_padding = input_buffers.is_padding[:num_tokens]
+        input_buffers.is_padding[:num_tokens_after_padding].fill_(is_padding)
+        is_padding = input_buffers.is_padding[:num_tokens_after_padding]
 
         logits_indices = query_start_loc[1:] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
@@ -201,7 +202,7 @@ class InputBatch:
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
             num_tokens=num_tokens,
-            num_tokens_after_padding=num_tokens,
+            num_tokens_after_padding=num_tokens_after_padding,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
             query_start_loc=query_start_loc,
@@ -257,7 +258,9 @@ def set_dummy_context(
     local_pos = np.arange(input_batch.num_tokens, dtype=np.int64) - np.repeat(
         input_batch.query_start_loc_np[:-1], input_batch.num_scheduled_tokens
     )
-    input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+    input_batch.positions[: input_batch.num_tokens].copy_(
+        torch.from_numpy(local_pos + context_len)
+    )
 
     seq_len = context_len + query_len
     for block_table, block_size, bpk in zip(

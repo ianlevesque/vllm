@@ -18,34 +18,75 @@ DEVICE = current_platform.device_type
 
 
 @pytest.mark.parametrize(
-    "query_len,padded_tokens", [(1, 32), (2, 32), (4, 32), (4, 2048), (8, 64)]
+    "num_reqs,query_len,padded_tokens",
+    [
+        (1, 1, 32),
+        (1, 2, 32),
+        (1, 3, 32),
+        (1, 4, 32),
+        (5, 4, 32),
+        (512, 4, 2048),
+        (1, 8, 64),
+    ],
 )
-def test_make_dummy_preserves_dp_uniform_decode(query_len: int, padded_tokens: int):
-    """Idle ranks must preserve the target's query width after DP padding.
+def test_make_dummy_preserves_dp_uniform_decode(
+    num_reqs: int, query_len: int, padded_tokens: int
+):
+    """Idle dummy rows preserve both reused DP token and request contracts.
 
-    PIECEWISE descriptors do not pad request counts. Keeping one original
-    dummy request would turn a padded 32-token MTP3 batch into one query of
-    length 32; the drafter would then reject the reused DP sync for length 4.
-    Check the actual input metadata passed to the target and drafter.
+    Execution padding must not widen the queries or fabricate extra requests.
+    In particular, five real MTP3 requests pad 20 tokens to a 32-token graph;
+    an idle rank must not invent eight requests and exceed the agreed five.
     """
-    expected_reqs = padded_tokens // query_len
     buffers = InputBuffers(
-        max_num_reqs=expected_reqs,
+        max_num_reqs=num_reqs,
         max_num_tokens=padded_tokens,
         device=torch.device("cpu"),
     )
     batch = InputBatch.make_dummy(
-        1, padded_tokens, buffers, uniform_token_count=query_len
+        num_reqs, padded_tokens, buffers, uniform_token_count=query_len
     )
-    assert batch.num_reqs == expected_reqs
-    assert batch.num_reqs_after_padding == expected_reqs
-    assert batch.num_tokens == padded_tokens
+    logical_tokens = num_reqs * query_len
+    assert batch.num_reqs == num_reqs
+    assert batch.num_reqs_after_padding == num_reqs
+    assert batch.num_tokens == logical_tokens
+    assert batch.num_tokens_after_padding == padded_tokens
     assert (batch.num_scheduled_tokens == query_len).all()
-    assert batch.seq_lens.tolist() == [query_len] * expected_reqs
-    assert np.diff(batch.query_start_loc_np).tolist() == [query_len] * expected_reqs
-    assert batch.query_start_loc_np[-1] == padded_tokens
+    assert batch.seq_lens.tolist() == [query_len] * num_reqs
+    assert np.diff(batch.query_start_loc_np).tolist() == [query_len] * num_reqs
+    assert batch.query_start_loc_np[-1] == logical_tokens
+    assert batch.input_ids.shape == (padded_tokens,)
+    assert batch.positions.shape == (padded_tokens,)
+    assert batch.is_padding.shape == (padded_tokens,)
     assert batch.decode_graph_eligible
     assert batch.is_padding.all()
+
+    from vllm.v1.worker.gpu.dp_utils import DPSyncState
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+    from vllm.v1.worker.utils import get_uniform_decode_token_count
+
+    assert (
+        get_uniform_decode_token_count(
+            batch.num_reqs,
+            batch.num_tokens,
+            int(batch.num_scheduled_tokens.max()),
+            batch.decode_graph_eligible,
+        )
+        == query_len
+    )
+    agreed_reqs = max(num_reqs, 5)
+    target_sync = DPSyncState(
+        num_tokens_across_dp=torch.full((4,), padded_tokens, dtype=torch.int32),
+        uniform_token_count=query_len,
+        eager=False,
+        num_reqs=agreed_reqs,
+    )
+    decode_sync, decode_tokens = DraftModelSpeculator._build_uniform_batch_dp_sync(
+        None, target_sync, batch.num_reqs, num_query_per_req=1
+    )
+    assert decode_tokens == agreed_reqs
+    assert decode_sync.num_tokens_across_dp.tolist() == [agreed_reqs] * 4
+    assert decode_sync.uniform_token_count == 1
 
 
 @pytest.mark.parametrize(
