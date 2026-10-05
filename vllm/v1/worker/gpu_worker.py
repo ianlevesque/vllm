@@ -185,7 +185,6 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
-
 class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
     """An asynchronous output whose completion is followed by the RoCEnante check."""
 
@@ -203,6 +202,7 @@ class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
 
         Raises:
             RuntimeError: When a RoCEnante wait timed out or its proxy died.
+
         """
         output = self._inner.get_output()
         self._check()
@@ -1281,15 +1281,14 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self._b12x_roce_guarded(
-            self.model_runner.sample_tokens(grammar_output)
-        )
+        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
         """The RoCEnante health check of the TP communicator, if one is active.
 
         Returns:
             The check callable, or None when RoCEnante is not in use.
+
         """
         communicator = get_tp_group().device_communicator
         comm = getattr(communicator, "b12x_ar_comm", None)
@@ -1316,6 +1315,7 @@ class Worker(WorkerBase):
 
         Raises:
             RuntimeError: When a RoCEnante wait timed out or its proxy died.
+
         """
         check = self._b12x_roce_health_check()
         if check is None:
