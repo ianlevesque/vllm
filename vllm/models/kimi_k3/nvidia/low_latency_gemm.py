@@ -8,10 +8,11 @@ holding the winning backend per token count. The static part of the decision is
 resolved once per module at install time into a small ``{M: call}`` plan, so the
 per-forward path is a single dict lookup.
 
-SM103 uses the full projection table. SM121 (GB10) additionally filters every
-plan through the measured winner subsets below: kernel-validate runs showed
-several SM103 winners lose against cuBLAS there (and unmeasured (shape, M)
-pairs are never routed), so anything not listed stays on the default GEMM.
+SM103 uses the full projection table. SM121 (GB10) routes only
+kernel-validate-measured >=1.05x winners: the DSV3 map below is authoritative
+(several SM103 winners lose against cuBLAS there, and K=7168 shapes were
+unmeasurable before the smem fix), while CuTe plans are filtered to the
+winner subset. Anything not listed stays on the default GEMM.
 """
 
 from __future__ import annotations
@@ -304,10 +305,15 @@ def _backend_for(
         not sm121 or ((spec.n, spec.k), num_tokens) in _SM121_CUTE_TOKENS
     ):
         return "cute"
-    if num_tokens in spec.dsv3_tokens and (
-        not sm121
-        or num_tokens in _SM121_DSV3_TOKENS.get((spec.n, spec.k), frozenset())
-    ):
+    if sm121:
+        # Authoritative: only measured SM121 winners route, whether or not
+        # the SM103 table lists them (K=7168 M9/M16 were unmeasurable there).
+        if num_tokens in _SM121_DSV3_TOKENS.get(
+            (spec.n, spec.k), frozenset()
+        ):
+            return "dsv3_fused_a"
+        return None
+    if num_tokens in spec.dsv3_tokens:
         return "dsv3_fused_a"
     return None
 
@@ -363,14 +369,20 @@ def _is_sm121() -> bool:
 # (tools/qualification/validate_dsv3_sm121.py and
 # validate_cute_skinny_sm121.py) against cuBLAS, with the same >=1.05x
 # threshold the SM103 table uses. Only measured (shape, M) pairs are
-# listed; everything else stays on the default GEMM. K=7168 DSV3 shapes
-# are excluded until the smem-budget fix is measured (they currently fail
-# to launch with cudaErrorInvalidValue).
+# listed; everything else stays on the default GEMM. The DSV3 map is
+# authoritative on SM121 (not a filter of the SM103 token sets): K=7168
+# shapes were unmeasurable before the smem-budget fix and now win big
+# at M9 (shared_gate_up 2.06x, mla_g 1.84x, qkv_a 1.22x).
 _SM121_DSV3_TOKENS: dict[tuple[int, int], frozenset[int]] = {
     (2304, 1536): frozenset({1, 9}),  # 1.40x / 1.11x
     (4608, 1536): frozenset({1}),  # 1.21x (M9 loses at 0.82x)
     (7168, 768): frozenset({1, 9}),  # 1.36x / 1.08x
     (1152, 1536): frozenset({1, 9, 16}),  # 1.43x / 1.48x / 1.32x
+    (1536, 7168): frozenset({1, 9, 16}),  # 1.43x / 2.06x / 1.77x
+    (2112, 7168): frozenset({1, 9}),  # 1.06x / 1.22x (M16 1.045x misses)
+    (768, 7168): frozenset({1, 9, 16}),  # 1.98x / 1.84x / 1.58x
+    (3216, 7168): frozenset({9}),  # 1.06x (M1/M16 neutral at 1.01x/1.02x)
+    (4224, 7168): frozenset({9, 16}),  # 1.07x / 1.06x (M1 neutral at 1.01x)
 }
 _SM121_CUTE_TOKENS: frozenset[tuple[tuple[int, int], int]] = frozenset({
     ((768, 7168), 1),  # 2.44x (M2-M4 lose at 0.63-0.66x)
