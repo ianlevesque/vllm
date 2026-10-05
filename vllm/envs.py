@@ -253,6 +253,8 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
+    VLLM_ROCE_HIERARCHICAL_MIN_SIZE: str = "64KB"
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
     VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp", "flashinfer-ipc"] = "cpp"
@@ -2156,6 +2158,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in multi-node DGX Spark RDMA collectives; larger tensors use NCCL.
     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_HIERARCHICAL_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ROCE_HIERARCHICAL_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_HIERARCHICAL_MIN_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_HIERARCHICAL_MIN_SIZE", "64KB"
     ),
     "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
         "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"

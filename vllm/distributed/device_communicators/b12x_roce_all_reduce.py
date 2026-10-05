@@ -27,7 +27,8 @@ Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -64,6 +65,11 @@ class B12xRoceAllReduce:
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
         self._runtime = None
+        self._hierarchical_runtimes = []
+        self._hierarchical_groups = []
+        self._hierarchical_min_size = 0
+        self._hierarchical_max_size = 0
+        self._announced_hierarchy = False
         self._announced = False
         self._announced_gather = False
 
@@ -84,7 +90,7 @@ class B12xRoceAllReduce:
         if verdict is not None:
             logger.warning("RoCEnante disabled on every rank: %s", verdict)
             return
-        max_size, max_gather = limits
+        max_size, max_gather, hierarchical_min = limits
 
         from b12x.comm import roce
 
@@ -102,6 +108,10 @@ class B12xRoceAllReduce:
             logger.warning("RoCEnante initialization failed: %s", exc)
             return
         self.disabled = False
+        if hierarchical_min:
+            # Initialization failure is fatal and coordinated across TP ranks;
+            # never leave some ranks using a hierarchy and others using flat.
+            self._initialize_hierarchy(max_size, hierarchical_min)
         if self.rank == 0:
             logger.info(
                 "Using RoCEnante (b12x one-shot RoCE collectives): world=%d, hcas=%s, "
@@ -112,7 +122,7 @@ class B12xRoceAllReduce:
                 max_gather,
             )
 
-    def _local_capability(self) -> tuple[str | None, tuple[int, int] | None]:
+    def _local_capability(self) -> tuple[str | None, tuple[int, int, int] | None]:
         """Evaluate this rank's ability to take part, without any collective.
 
         Returns:
@@ -133,13 +143,23 @@ class B12xRoceAllReduce:
             limits = (
                 _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE),
                 _parse_byte_size(envs.VLLM_ROCE_ALLGATHER_MAX_SIZE),
+                _parse_byte_size(envs.VLLM_ROCE_HIERARCHICAL_MIN_SIZE)
+                if envs.VLLM_ROCE_HIERARCHICAL_ALLREDUCE
+                else 0,
             )
+            if limits[2] and (
+                self.world_size != 16 or not 16 <= limits[2] <= limits[0] // 2
+            ):
+                return (
+                    "RoCE hierarchy requires TP16 and a valid FP32 payload range",
+                    None,
+                )
         except Exception as exc:  # noqa: BLE001 - reported through the vote
             return f"invalid RoCEnante size limit: {exc}", None
         return None, limits
 
     def _exchange_vote(
-        self, reason: str | None, limits: tuple[int, int] | None
+        self, reason: str | None, limits: tuple[int, int, int] | None
     ) -> str | None:
         """Gather every rank's capability result over the CPU group.
 
@@ -151,7 +171,7 @@ class B12xRoceAllReduce:
             None when every rank can proceed with identical limits, else the
             text naming the ranks that cannot or whose limits differ.
         """
-        votes: list[tuple[str | None, tuple[int, int] | None]] = [
+        votes: list[tuple[str | None, tuple[int, int, int] | None]] = [
             (None, None)
         ] * self.world_size
         dist.all_gather_object(votes, (reason, limits), group=self.group)
@@ -170,6 +190,74 @@ class B12xRoceAllReduce:
             )
         return None
 
+    def _initialize_hierarchy(self, max_size: int, minimum: int) -> None:
+        """Compose existing four-rank RoCE kernels with FP32 intermediates.
+
+        Each row first reduces its four TP ranks; each column then combines
+        the four row results. BF16 is converted only at the input/output,
+        avoiding an extra BF16 rounding between the two reductions. This is
+        opt-in, size-gated, and has no new GPU kernel or transport protocol.
+        """
+        from b12x.comm import roce
+
+        ranks = dist.get_process_group_ranks(self.group)
+        assert len(ranks) == 16
+        member_groups = []
+        for columns in (False, True):
+            for index in range(4):
+                offsets = (
+                    [row * 4 + index for row in range(4)]
+                    if columns
+                    else list(range(index * 4, (index + 1) * 4))
+                )
+                group = dist.new_group(
+                    ranks=[ranks[offset] for offset in offsets],
+                    backend="gloo",
+                    timeout=timedelta(seconds=120),
+                    use_local_synchronization=True,
+                )
+                if self.rank in offsets:
+                    member_groups.append(group)
+                    self._hierarchical_groups.append(group)
+        assert len(member_groups) == 2
+        for group in member_groups:
+            error = None
+            try:
+                runtime = roce.AllReduce(
+                    exchange_group=group,
+                    device=self.device,
+                    max_size=max_size,
+                    max_gather_bytes=max_size,
+                )
+                self._hierarchical_runtimes.append(runtime)
+                runtime.prepare((torch.float32,))
+            except Exception as exc:
+                error = str(exc)
+            errors = [None] * self.world_size
+            dist.all_gather_object(errors, error, group=self.group)
+            if any(errors):
+                self.close()
+                raise RuntimeError(f"RoCE hierarchy initialization failed: {errors}")
+        self._hierarchical_min_size = minimum
+        # BF16 -> FP32 doubles each subgroup payload. Keep the original
+        # large-message/fallback range and other dtypes on their flat path.
+        self._hierarchical_max_size = max_size // 2
+        if self.rank == 0:
+            logger.info(
+                "RoCEnante FP32 4x4 hierarchy ready: BF16 payload %d..%d bytes",
+                minimum,
+                self._hierarchical_max_size,
+            )
+
+    def _should_hierarchical(self, inp: torch.Tensor) -> bool:
+        return (
+            bool(self._hierarchical_runtimes)
+            and inp.dtype == torch.bfloat16
+            and self._hierarchical_min_size
+            <= inp.numel() * inp.element_size()
+            <= self._hierarchical_max_size
+        )
+
     def check_health(self) -> None:
         """Fail-stop check of the runtime.
 
@@ -178,6 +266,8 @@ class B12xRoceAllReduce:
         """
         if not self.disabled and self._runtime is not None:
             self._runtime.check_health()
+            for runtime in self._hierarchical_runtimes:
+                runtime.check_health()
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return not self.disabled and self._runtime.should_allreduce(inp)
@@ -196,6 +286,17 @@ class B12xRoceAllReduce:
                 str(inp.dtype).replace("torch.", ""),
                 envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE,
             )
+        if self._should_hierarchical(inp):
+            if not self._announced_hierarchy:
+                self._announced_hierarchy = True
+                log = logger.info if self.rank == 0 else logger.debug
+                log(
+                    "RoCEnante FP32 hierarchy is live: first BF16 reduction %d bytes",
+                    inp.numel() * inp.element_size(),
+                )
+            partial = self._hierarchical_runtimes[0].all_reduce(inp.float())
+            reduced = self._hierarchical_runtimes[1].all_reduce(partial)
+            return reduced.to(inp.dtype)
         return self._runtime.all_reduce(inp)
 
     def should_all_gather(self, inp: torch.Tensor, dim: int) -> bool:
@@ -228,10 +329,20 @@ class B12xRoceAllReduce:
         # inside a graph.  vLLM's gather shards have 16-byte rows (direct
         # layout), so the padded-gather scratch is not requested here.
         self._runtime.prepare((torch.bfloat16, torch.float16, torch.float32))
-        with self._runtime.capture(stream=stream):
+        with ExitStack() as contexts:
+            contexts.enter_context(self._runtime.capture(stream=stream))
+            for runtime in self._hierarchical_runtimes:
+                runtime.prepare((torch.float32,))
+                contexts.enter_context(runtime.capture(stream=stream))
             yield
 
     def close(self) -> None:
+        for runtime in self._hierarchical_runtimes:
+            runtime.close()
+        self._hierarchical_runtimes.clear()
+        for group in self._hierarchical_groups:
+            dist.destroy_process_group(group)
+        self._hierarchical_groups.clear()
         if self._runtime is not None:
             self._runtime.close()
             self._runtime = None
