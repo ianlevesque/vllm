@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 decode GEMM selection for unquantized BF16 on SM103.
+"""Kimi-K3 decode GEMM selection for unquantized BF16 on SM103 and SM121.
 
 Dispatch is purely by local ``(N, K)`` shape and token count ``M`` — the module
 name plays no role. Each measured shape maps to a :class:`ProjectionSpec`
 holding the winning backend per token count. The static part of the decision is
 resolved once per module at install time into a small ``{M: call}`` plan, so the
 per-forward path is a single dict lookup.
+
+SM103 uses the full projection table. SM121 (GB10) additionally filters every
+plan through the measured winner subsets below: kernel-validate runs showed
+several SM103 winners lose against cuBLAS there (and unmeasured (shape, M)
+pairs are never routed), so anything not listed stays on the default GEMM.
 """
 
 from __future__ import annotations
@@ -282,13 +287,27 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
 
 
 def _backend_for(
-    spec: ProjectionSpec, num_tokens: int, has_residual: bool
+    spec: ProjectionSpec,
+    num_tokens: int,
+    has_residual: bool,
+    sm121: bool = False,
 ) -> Backend | None:
     if has_residual:
-        return "cute" if spec.residual_config(num_tokens) is not None else None
-    if spec.cute_config(num_tokens) is not None:
+        if spec.residual_config(num_tokens) is None:
+            return None
+        if sm121 and ((spec.n, spec.k), num_tokens) not in (
+            _SM121_CUTE_RESIDUAL_TOKENS
+        ):
+            return None
         return "cute"
-    if num_tokens in spec.dsv3_tokens:
+    if spec.cute_config(num_tokens) is not None and (
+        not sm121 or ((spec.n, spec.k), num_tokens) in _SM121_CUTE_TOKENS
+    ):
+        return "cute"
+    if num_tokens in spec.dsv3_tokens and (
+        not sm121
+        or num_tokens in _SM121_DSV3_TOKENS.get((spec.n, spec.k), frozenset())
+    ):
         return "dsv3_fused_a"
     return None
 
@@ -305,10 +324,12 @@ def select_kimi_k3_backend(
     return _backend_for(spec, num_tokens, has_residual) if spec is not None else None
 
 
-def _build_plan(spec: ProjectionSpec) -> dict[int, ResolvedCall]:
+def _build_plan(
+    spec: ProjectionSpec, sm121: bool = False
+) -> dict[int, ResolvedCall]:
     plan: dict[int, ResolvedCall] = {}
     for num_tokens in range(1, 17):
-        backend = _backend_for(spec, num_tokens, has_residual=False)
+        backend = _backend_for(spec, num_tokens, has_residual=False, sm121=sm121)
         if backend == "cute":
             plan[num_tokens] = ("cute", spec.cute_config(num_tokens))
         elif backend == "dsv3_fused_a":
@@ -316,12 +337,70 @@ def _build_plan(spec: ProjectionSpec) -> dict[int, ResolvedCall]:
     return plan
 
 
-def _build_residual_plan(spec: ProjectionSpec) -> dict[int, SkinnyGemmConfig]:
-    return {num_tokens: config for num_tokens, config in spec.residual_configs}
+def _build_residual_plan(
+    spec: ProjectionSpec, sm121: bool = False
+) -> dict[int, SkinnyGemmConfig]:
+    if not sm121:
+        return {
+            num_tokens: config for num_tokens, config in spec.residual_configs
+        }
+    return {
+        num_tokens: config
+        for num_tokens, config in spec.residual_configs
+        if ((spec.n, spec.k), num_tokens) in _SM121_CUTE_RESIDUAL_TOKENS
+    }
 
 
 def _is_sm103() -> bool:
     return current_platform.is_device_capability((10, 3))
+
+
+def _is_sm121() -> bool:
+    return current_platform.is_device_capability((12, 1))
+
+
+# SM121 winners measured 2026-10-04 on GB10 via kernel-validate
+# (tools/qualification/validate_dsv3_sm121.py and
+# validate_cute_skinny_sm121.py) against cuBLAS, with the same >=1.05x
+# threshold the SM103 table uses. Only measured (shape, M) pairs are
+# listed; everything else stays on the default GEMM. K=7168 DSV3 shapes
+# are excluded until the smem-budget fix is measured (they currently fail
+# to launch with cudaErrorInvalidValue).
+_SM121_DSV3_TOKENS: dict[tuple[int, int], frozenset[int]] = {
+    (2304, 1536): frozenset({1, 9}),  # 1.40x / 1.11x
+    (4608, 1536): frozenset({1}),  # 1.21x (M9 loses at 0.82x)
+    (7168, 768): frozenset({1, 9}),  # 1.36x / 1.08x
+    (1152, 1536): frozenset({1, 9, 16}),  # 1.43x / 1.48x / 1.32x
+}
+_SM121_CUTE_TOKENS: frozenset[tuple[tuple[int, int], int]] = frozenset({
+    ((768, 7168), 1),  # 2.44x (M2-M4 lose at 0.63-0.66x)
+    ((1152, 1536), 1),  # 1.90x
+    ((3072, 7168), 1),  # 1.11x
+    ((3072, 7168), 2),  # 1.10x
+    ((3072, 7168), 3),  # 1.06x
+    ((3072, 7168), 4),  # 1.10x
+    ((3072, 7168), 5),  # 1.07x
+    ((3216, 7168), 1),  # 1.06x
+    ((3216, 7168), 2),  # 1.06x
+    ((3216, 7168), 3),  # 1.06x
+    ((3216, 7168), 4),  # 1.13x
+    ((3216, 7168), 5),  # 1.07x
+    ((3584, 7168), 1),  # 1.06x
+    ((4224, 7168), 1),  # 1.06x
+    ((6288, 7168), 1),  # 1.06x
+    ((7168, 1536), 1),  # 1.85x
+    ((7168, 3072), 1),  # 1.46x
+    ((7168, 3072), 2),  # 1.07x
+    ((7168, 3584), 1),  # 1.47x
+    ((7168, 4224), 1),  # 1.05x
+    ((8448, 7168), 1),  # 1.06x
+    ((12448, 7168), 3),  # 1.06x
+})
+_SM121_CUTE_RESIDUAL_TOKENS: frozenset[tuple[tuple[int, int], int]] = frozenset({
+    ((7168, 3584), 1),  # 1.44x
+    ((7168, 3584), 3),  # 1.06x
+    ((7168, 3584), 4),  # 1.07x
+})
 
 
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
@@ -393,16 +472,23 @@ def try_low_latency_gemm(
     precomputed plan (see :func:`enable_kimi_k3_low_latency_gemm`) and does not
     use this path.
     """
-    if envs.VLLM_BATCH_INVARIANT or not _is_sm103() or not _runtime_ok(x, weight):
+    sm121 = _is_sm121() and not _is_sm103()
+    if (
+        envs.VLLM_BATCH_INVARIANT
+        or not (_is_sm103() or sm121)
+        or not _runtime_ok(x, weight)
+    ):
         return None
     spec = KIMI_K3_PROJECTIONS.get((weight.shape[0], weight.shape[1]))
     if spec is None:
         return None
     if residual is None:
-        return _run_plan(_build_plan(spec), x, weight)
+        return _run_plan(_build_plan(spec, sm121), x, weight)
     if not _residual_ok(x, weight, residual):
         return None
-    return _run_residual_plan(_build_residual_plan(spec), x, weight, residual)
+    return _run_residual_plan(
+        _build_residual_plan(spec, sm121), x, weight, residual
+    )
 
 
 class _KimiK3LowLatencyApply:
@@ -469,7 +555,8 @@ def enable_kimi_k3_low_latency_gemm(
     Modules are matched purely by type, an exactly-unquantized method, and a
     local ``(N, K)`` present in :data:`KIMI_K3_PROJECTIONS`.
     """
-    if dtype != torch.bfloat16 or not _is_sm103():
+    sm121 = _is_sm121() and not _is_sm103()
+    if dtype != torch.bfloat16 or not (_is_sm103() or sm121):
         return
 
     warmup_configs: set[SkinnyGemmConfig] = set()
@@ -495,14 +582,32 @@ def enable_kimi_k3_low_latency_gemm(
             continue
         if is_linear:
             child.quant_method = KimiK3LowLatencyLinearMethod(
-                _build_plan(spec), _build_residual_plan(spec)
+                _build_plan(spec, sm121), _build_residual_plan(spec, sm121)
             )
         else:
-            child.quant_method = KimiK3LowLatencyEmbeddingMethod(_build_plan(spec))
+            child.quant_method = KimiK3LowLatencyEmbeddingMethod(
+                _build_plan(spec, sm121)
+            )
         # Warm up only the configs measured for this module's local (N, K) so a
-        # TP8 deployment does not compile TP4 configs and vice versa.
-        warmup_configs.update(config for _, config in spec.cute_configs)
-        residual_warmup_configs.update(config for _, config in spec.residual_configs)
+        # TP8 deployment does not compile TP4 configs and vice versa. On SM121
+        # warm up only the winner subset so losing configs never JIT.
+        if sm121:
+            key = (spec.n, spec.k)
+            warmup_configs.update(
+                config
+                for m, config in spec.cute_configs
+                if (key, m) in _SM121_CUTE_TOKENS
+            )
+            residual_warmup_configs.update(
+                config
+                for m, config in spec.residual_configs
+                if (key, m) in _SM121_CUTE_RESIDUAL_TOKENS
+            )
+        else:
+            warmup_configs.update(config for _, config in spec.cute_configs)
+            residual_warmup_configs.update(
+                config for _, config in spec.residual_configs
+            )
 
     if shape_dynamic_skinny_gemm.is_available():
         if warmup_configs:

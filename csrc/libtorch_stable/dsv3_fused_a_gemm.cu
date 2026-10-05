@@ -658,7 +658,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 }
 
 template <typename T, int kHdIn, int kHdOut, int kTileN, int kTileK = 256,
-          int kTileM = 16>
+          int kTileM = 16, int kSmemBudgetKB = 192>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
                       cudaStream_t const stream, bool enable_pdl) {
   constexpr int gemm_m = kHdOut;
@@ -670,7 +670,7 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   constexpr int tile_n = kTileN;
   constexpr int tile_k = kTileK;
   constexpr int max_stage_cnt =
-      1024 * 192 / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
+      1024 * kSmemBudgetKB / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
   constexpr int k_iter_cnt = gemm_k / tile_k;
   constexpr int stage_cnt =
       k_iter_cnt > max_stage_cnt ? max_stage_cnt : k_iter_cnt;
@@ -710,12 +710,29 @@ template <typename T, int kHdIn, int kHdOut, int kTileK = 256, int kTileM = 16>
 void invokeFusedAGemmForTokens(T* output, T const* mat_a, T const* mat_b,
                                int num_tokens, cudaStream_t const stream,
                                bool enable_pdl) {
+  // GB10 (sm120/121) allows ~101 KiB of dynamic smem per CTA vs 192+ KiB on
+  // Hopper/datacenter Blackwell, so the default 192 KiB stage budget asks for
+  // 193 KiB on K=7168 shapes and the launch fails with cudaErrorInvalidValue.
+  // Halve the budget there (97 KiB worst case, identical stage counts for
+  // K<=2048); every other arch keeps the tuned budget.
+  int const sm = getSMVersion();
+  bool const small_smem = sm >= 120 && sm < 130;
   if (num_tokens <= 8) {
-    invokeFusedAGemm<T, kHdIn, kHdOut, 8, kTileK, kTileM>(
-        output, mat_a, mat_b, num_tokens, stream, enable_pdl);
+    if (small_smem) {
+      invokeFusedAGemm<T, kHdIn, kHdOut, 8, kTileK, kTileM, 96>(
+          output, mat_a, mat_b, num_tokens, stream, enable_pdl);
+    } else {
+      invokeFusedAGemm<T, kHdIn, kHdOut, 8, kTileK, kTileM>(
+          output, mat_a, mat_b, num_tokens, stream, enable_pdl);
+    }
   } else {
-    invokeFusedAGemm<T, kHdIn, kHdOut, 16, kTileK, kTileM>(
-        output, mat_a, mat_b, num_tokens, stream, enable_pdl);
+    if (small_smem) {
+      invokeFusedAGemm<T, kHdIn, kHdOut, 16, kTileK, kTileM, 96>(
+          output, mat_a, mat_b, num_tokens, stream, enable_pdl);
+    } else {
+      invokeFusedAGemm<T, kHdIn, kHdOut, 16, kTileK, kTileM>(
+          output, mat_a, mat_b, num_tokens, stream, enable_pdl);
+    }
   }
 }
 
