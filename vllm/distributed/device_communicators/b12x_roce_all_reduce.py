@@ -35,9 +35,6 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
-from vllm.distributed.device_communicators.custom_all_reduce import (
-    _parse_byte_size,
-)
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 
@@ -45,6 +42,22 @@ logger = init_logger(__name__)
 
 
 REQUIRED_B12X_ROCE_API_VERSION = 1
+
+
+# Existing lab parser from f94802811c10 custom_all_reduce.py; keep this
+# communication-only adapter independent of the unrelated PCIe carry.
+def _parse_byte_size(value: str) -> int:
+    normalized = value.upper().strip()
+    suffixes = {
+        "KB": 1024,
+        "K": 1024,
+        "MB": 1024 * 1024,
+        "M": 1024 * 1024,
+    }
+    for suffix, multiplier in sorted(suffixes.items(), key=lambda item: -len(item[0])):
+        if normalized.endswith(suffix):
+            return int(normalized[: -len(suffix)]) * multiplier
+    return int(value)
 
 
 class B12xRoceAllReduce:
