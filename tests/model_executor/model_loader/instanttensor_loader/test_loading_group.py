@@ -23,12 +23,13 @@ spec.loader.exec_module(utils)
 @pytest.fixture
 def groups(monkeypatch):
     monkeypatch.delenv("VLLM_INSTANTTENSOR_NCCL_CTAS", raising=False)
+    inference_backend = SimpleNamespace(
+        options=SimpleNamespace(_timeout=timedelta(seconds=90))
+    )
     world = SimpleNamespace(
         world_size=16,
         ranks=list(range(16)),
-        device_group=SimpleNamespace(
-            options=SimpleNamespace(_timeout=timedelta(seconds=90))
-        ),
+        device_group=SimpleNamespace(_get_backend=lambda device: inference_backend),
     )
     private = object()
     created, destroyed = [], []
@@ -46,7 +47,11 @@ def groups(monkeypatch):
         new_group=new_group,
         destroy_process_group=destroyed.append,
     )
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(distributed=dist))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(distributed=dist, device=lambda name: name),
+    )
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
     return world, private, default, created, destroyed
 
@@ -61,7 +66,8 @@ def test_default_reuses_but_does_not_destroy_inference_group(groups):
 def test_loading_group_has_independent_options_and_same_membership(groups, monkeypatch):
     world, private, _, created, destroyed = groups
     monkeypatch.setenv("VLLM_INSTANTTENSOR_NCCL_CTAS", "8")
-    before = dict(world.device_group.options.__dict__)
+    inference_options = world.device_group._get_backend("cuda").options
+    before = dict(inference_options.__dict__)
     with utils.instanttensor_loading_group(world) as group:
         assert group is private
         assert destroyed == []
@@ -72,7 +78,7 @@ def test_loading_group_has_independent_options_and_same_membership(groups, monke
     assert options["pg_options"].config.min_ctas == 8
     assert options["pg_options"].config.max_ctas == 8
     assert options["timeout"] == timedelta(seconds=90)
-    assert world.device_group.options.__dict__ == before
+    assert inference_options.__dict__ == before
 
 
 def test_private_group_is_destroyed_when_loading_fails(groups, monkeypatch):

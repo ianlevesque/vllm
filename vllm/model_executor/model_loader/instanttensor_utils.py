@@ -37,6 +37,7 @@ def instanttensor_loading_group(world_group: Any) -> Generator[Any, None, None]:
         yield world_group.device_group
         return
 
+    import torch
     import torch.distributed as dist
 
     # A device-bound default group can make new_group split its communicator.
@@ -49,11 +50,12 @@ def instanttensor_loading_group(world_group: Any) -> Generator[Any, None, None]:
     options = dist.ProcessGroupNCCL.Options()
     options.config.min_ctas = ctas
     options.config.max_ctas = ctas
+    inference_backend = world_group.device_group._get_backend(torch.device("cuda"))
     group = dist.new_group(
         list(world_group.ranks),
         backend="nccl",
         pg_options=options,
-        timeout=world_group.device_group.options._timeout,
+        timeout=inference_backend.options._timeout,
         group_desc="instanttensor:loading",
     )
     try:
