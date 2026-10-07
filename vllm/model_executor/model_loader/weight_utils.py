@@ -1211,6 +1211,35 @@ def instanttensor_weights_iterator(
     *,
     indexed_tensor_files: dict[str, str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Load with InstantTensor and an optional dedicated bulk communicator."""
+    from vllm.model_executor.model_loader.instanttensor_utils import (
+        instanttensor_loading_group,
+    )
+
+    if not current_platform.is_cuda():
+        raise ValueError("InstantTensor requires NVIDIA GPUs")
+    try:
+        world_group = get_world_group()
+    except AssertionError:
+        world_group = None
+    with instanttensor_loading_group(world_group) as process_group:
+        yield from _instanttensor_weights_iterator(
+            hf_weights_files,
+            use_tqdm_on_load,
+            weight_name_prefixes,
+            indexed_tensor_files=indexed_tensor_files,
+            process_group=process_group,
+        )
+
+
+def _instanttensor_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    weight_name_prefixes: Sequence[str] | None = None,
+    *,
+    indexed_tensor_files: dict[str, str] | None = None,
+    process_group: Any = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over weights in model safetensor files with InstantTensor.
 
     When an index is available, restrict the physical I/O layout before
@@ -1226,14 +1255,6 @@ def instanttensor_weights_iterator(
 
     if not current_platform.is_cuda():
         raise ValueError("InstantTensor requires NVIDIA GPUs")
-
-    try:
-        world_group = get_world_group()
-    except AssertionError:
-        # Entering here only in unit tests where the world group is not initialized.
-        process_group = None
-    else:
-        process_group = world_group.device_group if world_group.world_size > 1 else None
 
     device = current_platform.current_device()
     copy_setting = os.getenv("INSTANTTENSOR_COPY", "1")
