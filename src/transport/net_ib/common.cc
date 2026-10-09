@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "common.h"
+#include <errno.h>
 #include "p2p_resiliency.h"
 
 char ncclIbIfName[MAX_IF_NAME_SIZE + 1];
@@ -163,10 +164,23 @@ static void ncclIbUpdateDeviceSpeed(struct ncclIbDev* dev) {
 }
 
 std::thread ncclIbAsyncThread;
+std::atomic<bool> ncclIbAsyncStop{false};
 void* ncclIbAsyncThreadMain(void* args) {
   struct ncclIbDev* dev = (struct ncclIbDev*)args;
   struct ibv_context* context = dev->context;
   while (1) {
+    // The opt-in sleep lifecycle must join the reader before closing verbs.
+    // Poll the real event FD so a quiescent context can stop without injecting
+    // a device event or cancelling a thread inside a provider callback.
+    if (ncclParamIbReleaseOnFinalize()) {
+      if (ncclIbAsyncStop.load(std::memory_order_acquire)) break;
+      struct pollfd pfd = {context->async_fd, POLLIN, 0};
+      int ready = poll(&pfd, 1, 100);
+      if (ready < 0 && errno == EINTR) continue;
+      if (ready == 0) continue;
+      if (ready < 0 || !(pfd.revents & POLLIN)) break;
+      if (ncclIbAsyncStop.load(std::memory_order_acquire)) break;
+    }
     struct ibv_async_event event;
     if (ncclSuccess != wrap_ibv_get_async_event(context, &event)) break;
     char* str;
