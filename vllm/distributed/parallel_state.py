@@ -1818,6 +1818,7 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
     timeout: timedelta | None = None,
+    network_wake_generation: int | None = None,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
@@ -1928,6 +1929,17 @@ def init_distributed_environment(
         if store is None and distributed_init_method.startswith("file://"):
             store = torch.distributed.FileStore(
                 distributed_init_method.removeprefix("file://"), world_size
+            )
+        if network_wake_generation is not None:
+            from vllm.distributed.network_sleep import transport_rendezvous_store
+
+            store = transport_rendezvous_store(
+                distributed_init_method,
+                rank,
+                world_size,
+                timeout or default_pg_timeout,
+                network_wake_generation,
+                store,
             )
         if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
             # split_group needs local_rank early to compute device_id for

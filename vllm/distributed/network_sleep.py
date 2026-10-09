@@ -11,7 +11,34 @@ from __future__ import annotations
 import gc
 import os
 import weakref
+from datetime import timedelta
 from typing import Any
+
+
+def transport_rendezvous_store(
+    init_method: str,
+    rank: int,
+    world_size: int,
+    timeout: timedelta,
+    generation: int,
+    store: Any = None,
+) -> Any:
+    """Isolate each wake from stale keys in a still-live multi-tenant store.
+
+    Follow upstream stateless_init_torch_distributed_process_group's
+    PrefixStore isolation. The executor can retain the original TCPStore;
+    destroying a process group does not delete its Gloo rendezvous keys.
+    """
+    import torch.distributed as dist
+
+    if generation < 1:
+        raise ValueError("Network wake requires a positive generation")
+    if store is None:
+        store, _, _ = next(
+            dist.rendezvous(init_method, rank, world_size, timeout=timeout)
+        )
+    store.set_timeout(timeout)
+    return dist.PrefixStore(f"vllm-network-wake-{generation}", store)
 
 
 def live_groups() -> dict[str, Any]:
