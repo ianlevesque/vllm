@@ -75,7 +75,7 @@ def check_network_sleep(worker: Any) -> dict[str, Any]:
                 "symm_mem_comm",
             )
         ):
-            raise RuntimeError("Network sleep requires ordinary NCCL collectives")
+            raise RuntimeError("Network sleep requires releasable NCCL/RoCEnante collectives")
     return {"groups": sorted(groups), "rank": worker.rank}
 
 
@@ -104,6 +104,17 @@ def clear_collective_graphs(worker: Any) -> None:
 
 def close_transport(groups: dict[str, Any]) -> None:
     from vllm.distributed import parallel_state as ps
+
+    # K3's native RoCE adapter owns flat and hierarchical verbs resources,
+    # plus raw Gloo exchange groups. Close those collectively while their
+    # exchange groups still exist, before destroying NCCL or coordinators.
+    # Clear only after successful close so a partial failure stays visible.
+    for group in groups.values():
+        dc = group.device_communicator
+        native = getattr(dc, "b12x_ar_comm", None)
+        if native is not None:
+            native.close()
+            dc.b12x_ar_comm = None
 
     # The generic shutdown path uses a timed daemon-thread ncclCommAbort.
     # NIC power-off needs actual synchronous completion, after graph release.

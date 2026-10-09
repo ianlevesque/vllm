@@ -119,6 +119,37 @@ def test_failed_nccl_destroy_does_not_advertise_closed_transport(context):
     assert ps._groups["tp:0"]() is group
 
 
+def test_native_roce_closes_before_nccl_and_is_not_closed_twice(context):
+    module, ps, _ = context
+    comm = SimpleNamespace(available=True, disabled=False, comm=42)
+    comm.nccl = SimpleNamespace(ncclCommDestroy=lambda ptr: ps.events.append(ptr))
+    native = SimpleNamespace(close=lambda: ps.events.append("roce-closed"))
+    transport = SimpleNamespace(pynccl_comm=comm, b12x_ar_comm=native)
+    group = put(ps, transport=transport)
+    assert module.check_network_sleep(SimpleNamespace(use_v2_model_runner=True, rank=0))
+    module.close_transport({"tp:0": group})
+    assert ps.events == ["roce-closed", 42, "model-groups-closed", "world-closed"]
+    assert transport.b12x_ar_comm is None
+
+
+def test_failed_native_close_keeps_nccl_and_group_ownership(context):
+    module, ps, _ = context
+
+    def fail():
+        raise RuntimeError("Native RoCE closure failed")
+
+    native = SimpleNamespace(close=fail)
+    comm = SimpleNamespace(available=True, disabled=False, comm=42)
+    comm.nccl = SimpleNamespace(ncclCommDestroy=lambda ptr: ps.events.append(ptr))
+    transport = SimpleNamespace(pynccl_comm=comm, b12x_ar_comm=native)
+    group = put(ps, transport=transport)
+    with pytest.raises(RuntimeError, match="Native RoCE closure failed"):
+        module.close_transport({"tp:0": group})
+    assert transport.b12x_ar_comm is native
+    assert comm.available and not comm.disabled and not ps.events
+    assert ps._groups["tp:0"]() is group
+
+
 @pytest.mark.parametrize(
     "unsupported",
     ["empty", "symm", "custom", "v1", "socket", "retained-contexts", "stateless"],
