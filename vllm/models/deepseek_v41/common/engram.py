@@ -613,7 +613,28 @@ def _engram_head_shard_weight_loader(
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )
-    param.data.copy_(shard)
+    if (
+        shard.device.type == "cpu"
+        and param.device.type == "cuda"
+        and current_platform.is_integrated_gpu(param.device.index)
+    ):
+        # GB10's pageable H2D path can fault/COW huge mmap sources extremely
+        # slowly (vllm-project/vllm#58726). Materialize only this TP rank's
+        # slice, in bounded anonymous buffers, following the clone workaround
+        # in #49991. Never clone the full ~92 GiB Engram checkpoint tensor.
+        row_bytes = shard.shape[1] * shard.element_size()
+        rows_per_chunk = max(1, 64 * 1024 * 1024 // row_bytes)
+        logger.info(
+            "Loading %.2f GiB Engram shard with 64 MiB anonymous CPU staging",
+            shard.numel() * shard.element_size() / 1024**3,
+        )
+        for start in range(0, part_rows, rows_per_chunk):
+            staged = shard[start : start + rows_per_chunk].clone()
+            param.data[start : start + rows_per_chunk].copy_(staged)
+            del staged
+        logger.info("Finished bounded Engram shard copy")
+    else:
+        param.data.copy_(shard)
 
 
 # Branching on SORTED at runtime intermittently crashes Triton 3.8's
