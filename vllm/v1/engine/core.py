@@ -957,16 +957,26 @@ class EngineCore:
                 documentation of pause_scheduler method.
 
         """
+        release_transport = envs.VLLM_SLEEP_RELEASE_TRANSPORT
+        if release_transport:
+            if level != 0:
+                raise ValueError("Transport release requires level-0 sleep")
+            self.model_executor.collective_rpc("check_network_sleep")
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
-        if level < 1:
+        if level < 1 and not release_transport:
             return pause_future
 
-        # Level 1+: Delegate to executor for GPU memory management
         model_executor = self.model_executor
+
+        def suspend_executor():
+            if release_transport:
+                return model_executor.collective_rpc("sleep_network")
+            return model_executor.sleep(level)
+
         if pause_future is None:
-            model_executor.sleep(level)
+            suspend_executor()
             return None
 
         future = Future[Any]()
@@ -974,7 +984,7 @@ class EngineCore:
         def pause_complete(f: Future):
             try:
                 f.result()  # propagate any exception
-                future.set_result(model_executor.sleep(level))
+                future.set_result(suspend_executor())
             except Exception as e:
                 future.set_exception(e)
 
@@ -992,6 +1002,13 @@ class EngineCore:
             Whether all executor memory is resident again (fully awake).
 
         """
+        if envs.VLLM_SLEEP_RELEASE_TRANSPORT:
+            if tags not in (None, ["scheduling"]):
+                raise ValueError("Transport wake requires a full scheduling wake")
+            self.model_executor.collective_rpc("wake_network")
+            self.resume_scheduler()
+            return True
+
         if tags is not None and "scheduling" in tags:
             # Remove "scheduling" from tags if there are other tags to process.
             tags = [t for t in tags if t != "scheduling"]

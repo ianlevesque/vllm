@@ -273,6 +273,71 @@ class Worker(WorkerBase):
             model.get_parameter(name).copy_(value)
         self._sleep_saved_parameters.clear()
 
+    def check_network_sleep(self) -> dict[str, Any]:
+        from vllm.distributed.network_sleep import check_network_sleep
+
+        if getattr(self, "_network_sleep_state", "active") == "sleeping":
+            return self.network_sleep_status()
+        return check_network_sleep(self)
+
+    def network_sleep_status(self) -> dict[str, Any]:
+        return {
+            "state": getattr(self, "_network_sleep_state", "active"),
+            "rank": self.rank,
+            "pid": os.getpid(),
+        }
+
+    def sleep_network(self) -> dict[str, Any]:
+        from vllm.distributed.network_sleep import (
+            check_network_sleep,
+            clear_collective_graphs,
+            close_transport,
+            live_groups,
+        )
+
+        if getattr(self, "_network_sleep_state", "active") == "sleeping":
+            return self.network_sleep_status()
+        check_network_sleep(self)
+        self._network_sleep_state = "closing"
+        self.synchronize_device()
+        self._network_sleep_groups = live_groups()
+        clear_collective_graphs(self)
+        close_transport(self._network_sleep_groups)
+        self._network_sleep_state = "sleeping"
+        logger.info(
+            "Network sleep rank %s: RDMA transports closed; weights and KV retained",
+            self.rank,
+        )
+        return self.network_sleep_status()
+
+    def wake_network(self) -> dict[str, Any]:
+        from vllm.distributed.network_sleep import restore_group_references
+
+        state = getattr(self, "_network_sleep_state", "active")
+        if state == "active":
+            return self.network_sleep_status()
+        if state != "sleeping":
+            raise RuntimeError("Network sleep did not finish cleanly")
+        self._network_sleep_state = "restoring"
+        with set_current_vllm_config(self.vllm_config):
+            init_worker_distributed_environment(
+                self.vllm_config,
+                self.rank,
+                self.distributed_init_method,
+                self.local_rank,
+                current_platform.dist_backend,
+            )
+            restore_group_references(self._network_sleep_groups)
+            self.model_runner.capture_model()
+        self.synchronize_device()
+        self._network_sleep_groups = {}
+        self._network_sleep_state = "active"
+        logger.info(
+            "Network wake rank %s: fresh RDMA transports and CUDA graphs ready",
+            self.rank,
+        )
+        return self.network_sleep_status()
+
     def sleep(self, level: int = 1) -> None:
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
