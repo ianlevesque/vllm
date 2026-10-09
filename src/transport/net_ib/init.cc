@@ -7,15 +7,19 @@
 
 #include "common.h"
 #include "p2p_resiliency_recovery.h"
+#include <vector>
 
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbDataDirect, "IB_DATA_DIRECT", 1);
+NCCL_PARAM(IbReleaseOnFinalize, "IB_RELEASE_ON_FINALIZE", 0);
 
 // default to 0 to disable ooo rq, if set to 1, ooo rq will be enabled or failed
 NCCL_PARAM(IbOooRq, "IB_OOO_RQ", 0)
 
 static std::mutex ncclIbMutex;
+static std::mutex ncclIbLifetimeMutex;
+static std::vector<std::thread> ncclIbOwnedReaders;
 
 // With ncclNet_v11_t the NCCL core initializes the network plugin per-communicator
 // rather than once for all communicators. However, the internal plugin implementation
@@ -279,12 +283,48 @@ const char* ibProviderName[] = {
 };
 
 ncclResult_t ncclIbFinalizeDevices(void) {
-  netRefCount--;
+  std::lock_guard<std::mutex> lifetime(ncclIbLifetimeMutex);
+  if (ncclParamIbReleaseOnFinalize() && netRefCount <= 0) return ncclInvalidUsage;
+  if (--netRefCount || !ncclParamIbReleaseOnFinalize()) return ncclSuccess;
+  // Every network/GIN owner must have finalized and all DMA registrations
+  // must be gone. Refuse to close a device context with outstanding resources.
+  for (int d = 0; d < ncclNIbDevs; ++d) {
+    if (ncclIbDevs[d].pdRefs || ncclIbDevs[d].mrCache.population) {
+      WARN("NET/IB: refusing device release with live PD/MR references on %s", ncclIbDevs[d].devName);
+      return ncclInvalidUsage;
+    }
+  }
+  ncclIbAsyncStop.store(true, std::memory_order_release);
+  for (auto& reader : ncclIbOwnedReaders) if (reader.joinable()) reader.join();
+  ncclIbOwnedReaders.clear();
+  std::vector<struct ibv_context*> contexts;
+  std::vector<char*> paths;
+  for (int d = 0; d < ncclNIbDevs; ++d) {
+    struct ncclIbDev* dev = ncclIbDevs + d;
+    bool first = true;
+    for (auto* context : contexts) if (context == dev->context) first = false;
+    if (first && dev->context) {
+      NCCLCHECK(wrap_ibv_close_device(dev->context));
+      contexts.push_back(dev->context);
+    }
+    first = true;
+    for (auto* path : paths) if (path == dev->pciPath) first = false;
+    if (first && dev->pciPath) { paths.push_back(dev->pciPath); free(dev->pciPath); }
+    dev->context = nullptr;
+    dev->pciPath = nullptr;
+    free(dev->mrCache.slots);
+    dev->mrCache = {};
+    dev->pd = nullptr;
+  }
+  ncclNIbDevs = -1;
+  ncclNMergedIbDevs = 0;
+  INFO(NCCL_NET, "NET/IB: released every device context after last communicator finalize");
   return ncclSuccess;
 }
 
 extern int64_t ncclIbArThreshold;
 ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
+  std::lock_guard<std::mutex> lifetime(ncclIbLifetimeMutex);
   ncclResult_t ret = ncclSuccess;
   if (netRefCount++) return ret;
   ncclProfilerFunction = profFunction;
@@ -511,13 +551,19 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
       NCCLCHECK(ncclIbMakeVDeviceInternal(&vDev, &vProps));
     }
     // Start one reader per context only after the device table is complete and sorted.
+    ncclIbAsyncStop.store(false, std::memory_order_release);
     for (int d = 0; d < ncclNIbDevs; d++) {
       int first = 0;
       while (first < d && ncclIbDevs[first].context != ncclIbDevs[d].context) first++;
       if (first != d) continue;
-      ncclIbAsyncThread = std::thread(ncclIbAsyncThreadMain, ncclIbDevs + d);
-      ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", d);
-      ncclIbAsyncThread.detach();
+      if (ncclParamIbReleaseOnFinalize()) {
+        ncclIbOwnedReaders.emplace_back(ncclIbAsyncThreadMain, ncclIbDevs + d);
+        ncclSetThreadName(ncclIbOwnedReaders.back(), "NCCL IbAsync %2d", d);
+      } else {
+        ncclIbAsyncThread = std::thread(ncclIbAsyncThreadMain, ncclIbDevs + d);
+        ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", d);
+        ncclIbAsyncThread.detach();
+      }
     }
     char addrline[SOCKET_NAME_MAXLEN + 1];
     INFO(NCCL_INIT | NCCL_NET, "NET/IB : Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",

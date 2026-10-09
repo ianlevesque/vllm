@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <mutex>
+#include <atomic>
 #define ENABLE_TIMER 0
 #include "timer.h"
 
@@ -678,6 +679,8 @@ ncclResult_t ncclIbStatsCheckFatalCount(struct ncclIbStats* stat, const char* fu
 extern ncclProfilerCallback_t ncclProfilerFunction;
 
 extern std::thread ncclIbAsyncThread;
+extern std::atomic<bool> ncclIbAsyncStop;
+int64_t ncclParamIbReleaseOnFinalize();
 void* ncclIbAsyncThreadMain(void* args);
 
 ncclResult_t ncclIbGdrSupport();
