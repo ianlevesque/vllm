@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import weakref
 from concurrent.futures import Future
+from datetime import timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -225,3 +226,52 @@ def test_failed_transport_restore_does_not_resume_scheduler():
     with pytest.raises(RuntimeError, match="restore failed"):
         core_method("wake_up")(engine)
     assert not events
+
+
+def test_wake_store_isolates_old_keys_and_separate_sleep_generations(
+    context, monkeypatch
+):
+    module, _, _ = context
+    shared = {}
+
+    class Store:
+        def set_timeout(self, timeout):
+            self.timeout = timeout
+
+    class PrefixStore:
+        def __init__(self, prefix, store):
+            self.prefix, self.store = prefix, store
+
+        def set(self, key, value):
+            shared[self.prefix + "/" + key] = value
+
+        def get(self, key):
+            return shared[self.prefix + "/" + key]
+
+    dist = ModuleType("torch.distributed")
+    dist.PrefixStore = PrefixStore
+    torch = ModuleType("torch")
+    torch.distributed = dist
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    store = Store()
+    shared["endpoint"] = "dead listener"
+    first = module.transport_rendezvous_store(
+        "tcp://example:25000", 0, 2, timedelta(seconds=3), 1, store
+    )
+    second = module.transport_rendezvous_store(
+        "tcp://example:25000", 0, 2, timedelta(seconds=3), 2, store
+    )
+    with pytest.raises(KeyError):
+        first.get("endpoint")
+    first.set("endpoint", "first wake listener")
+    with pytest.raises(KeyError):
+        second.get("endpoint")
+    second.set("endpoint", "second wake listener")
+    assert first.get("endpoint") == "first wake listener"
+    assert second.get("endpoint") == "second wake listener"
+    assert shared["endpoint"] == "dead listener"
+    with pytest.raises(ValueError, match="positive generation"):
+        module.transport_rendezvous_store(
+            "tcp://example:25000", 0, 2, timedelta(seconds=3), 0, store
+        )

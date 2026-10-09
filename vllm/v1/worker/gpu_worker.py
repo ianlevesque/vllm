@@ -254,6 +254,7 @@ class Worker(WorkerBase):
             "state": getattr(self, "_network_sleep_state", "active"),
             "rank": self.rank,
             "pid": os.getpid(),
+            "generation": getattr(self, "_network_sleep_generation", 0),
         }
 
     def sleep_network(self) -> dict[str, Any]:
@@ -272,6 +273,9 @@ class Worker(WorkerBase):
         self._network_sleep_groups = live_groups()
         clear_collective_graphs(self)
         close_transport(self._network_sleep_groups)
+        self._network_sleep_generation = (
+            getattr(self, "_network_sleep_generation", 0) + 1
+        )
         self._network_sleep_state = "sleeping"
         logger.info(
             "Network sleep rank %s: RDMA transports closed; weights and KV retained",
@@ -295,6 +299,7 @@ class Worker(WorkerBase):
                 self.distributed_init_method,
                 self.local_rank,
                 current_platform.dist_backend,
+                network_wake_generation=self._network_sleep_generation,
             )
             restore_group_references(self._network_sleep_groups)
             self.model_runner.capture_model()
@@ -302,8 +307,10 @@ class Worker(WorkerBase):
         self._network_sleep_groups = {}
         self._network_sleep_state = "active"
         logger.info(
-            "Network wake rank %s: fresh RDMA transports and CUDA graphs ready",
+            "Network wake rank %s generation %s: "
+            "fresh RDMA transports and CUDA graphs ready",
             self.rank,
+            self._network_sleep_generation,
         )
         return self.network_sleep_status()
 
@@ -1578,6 +1585,7 @@ def init_worker_distributed_environment(
     distributed_init_method: str | None = None,
     local_rank: int = -1,
     backend: str = "nccl",
+    network_wake_generation: int | None = None,
 ) -> None:
     """Initialize the distributed environment."""
     parallel_config = vllm_config.parallel_config
@@ -1603,6 +1611,7 @@ def init_worker_distributed_environment(
         local_rank,
         backend,
         timeout,
+        network_wake_generation=network_wake_generation,
     )
 
     ensure_model_parallel_initialized(
