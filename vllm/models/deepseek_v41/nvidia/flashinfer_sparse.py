@@ -593,6 +593,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # FlashInfer 0.7.0 SM120 decode uses 64-token primary cache pages.
+    # The model's sliding window and compressed MLA pages remain 128.
+    swa_cache_block_size: ClassVar[int] = 64
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:

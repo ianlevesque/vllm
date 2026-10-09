@@ -194,6 +194,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
     # a single attention class dispatches across arch-specific layouts.
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    swa_cache_block_size: ClassVar[int] = 32
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
@@ -561,7 +562,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            block_size=self.swa_cache_block_size,
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
             bounded_replay=swa_bounded_replay,
@@ -1216,8 +1217,14 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         page_alignment = (
             576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
         )
+        block_size = self.cache_config.block_size
+        if current_platform.is_device_capability_family(120):
+            # SM12x paged FP8 MQA requires 64 stored index states. Keep
+            # independent CSA1/CSA2 manager groups so packed block strides
+            # are real storage strides, without splitting the MLA pages.
+            block_size = 64 * self.compress_ratio
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
