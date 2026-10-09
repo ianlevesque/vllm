@@ -11,7 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CompilationConfig, set_current_vllm_config
+
+from vllm.config import (
+    CompilationConfig,
+    KernelConfig,
+    ParallelConfig,
+    set_current_vllm_config,
+)
 from vllm.model_executor.layers import sparse_attn_indexer
 from vllm.models.deepseek_v41 import attention
 from vllm.platforms import current_platform
@@ -109,21 +115,27 @@ def _construct_layers(monkeypatch, capability):
             cache_dtype="fp8",
             num_gpu_blocks_override=16,
             prefix_cache_retention_interval=None,
+            swa_bounded_replay=False,
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
         ),
         compilation_config=CompilationConfig(custom_ops=["all"]),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=8, disable_hybrid_kv_cache_manager=False
         ),
-        parallel_config=SimpleNamespace(
+        parallel_config=ParallelConfig(
+            nnodes=8,
+            distributed_executor_backend="mp",
+            tensor_parallel_size=8,
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
         attention_config=SimpleNamespace(
-            indexer_sparse_logits=False, resolve_indexer_kv_dtype=lambda default: "fp8"
+            indexer_sparse_logits=False,
+            hisparse_config=None,
+            resolve_indexer_kv_dtype=lambda default: "fp8",
         ),
-        kernel_config=SimpleNamespace(enable_jit_warmup=False),
+        kernel_config=KernelConfig(enable_jit_warmup=False),
         quant_config=None,
         speculative_config=None,
         use_v2_model_runner=True,
@@ -140,6 +152,7 @@ def _construct_layers(monkeypatch, capability):
             )
             for i in (2, 8, 14, 20, 24, 28, 32, 36)
         }
+    assert all(layer.swa_cache_layer.block_size == 64 for layer in layers.values())
     return config, layers
 
 
