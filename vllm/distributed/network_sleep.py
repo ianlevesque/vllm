@@ -30,6 +30,8 @@ def check_network_sleep(worker: Any) -> dict[str, Any]:
         raise RuntimeError("Network sleep requires the V2 model runner")
     if os.environ.get("NCCL_NET") != "IB":
         raise RuntimeError("Network sleep requires the configured IB/RoCE transport")
+    if os.environ.get("NCCL_IB_RELEASE_ON_FINALIZE") != "1":
+        raise RuntimeError("Network sleep requires opt-in NCCL IB context release")
     if is_symmetric_memory_enabled():
         raise RuntimeError("Network sleep cannot retain NCCL symmetric allocations")
     groups = live_groups()
