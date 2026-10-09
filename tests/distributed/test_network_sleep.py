@@ -46,6 +46,7 @@ def context(monkeypatch):
     ]:
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setenv("NCCL_NET", "IB")
+    monkeypatch.setenv("NCCL_IB_RELEASE_ON_FINALIZE", "1")
     path = ROOT / "vllm/distributed/network_sleep.py"
     spec = importlib.util.spec_from_file_location("network_sleep_under_test", path)
     module = importlib.util.module_from_spec(spec)
@@ -118,7 +119,8 @@ def test_failed_nccl_destroy_does_not_advertise_closed_transport(context):
 
 
 @pytest.mark.parametrize(
-    "unsupported", ["empty", "symm", "custom", "v1", "socket", "stateless"]
+    "unsupported",
+    ["empty", "symm", "custom", "v1", "socket", "retained-contexts", "stateless"],
 )
 def test_preflight_rejects_unsupported_transport_before_mutation(
     context, monkeypatch, unsupported
@@ -136,6 +138,8 @@ def test_preflight_rejects_unsupported_transport_before_mutation(
         worker.use_v2_model_runner = False
     elif unsupported == "socket":
         monkeypatch.setenv("NCCL_NET", "Socket")
+    elif unsupported == "retained-contexts":
+        monkeypatch.delenv("NCCL_IB_RELEASE_ON_FINALIZE")
     else:
 
         class Stateless(ps.GroupCoordinator):
