@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -46,6 +47,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             decode_context_parallel_size=(
                 parallel_config.decode_context_parallel_size
                 if speculative_config.draft_model_config.use_mla
+                and envs.VLLM_DCP_SHARD_DRAFT
                 else 1
             ),
         )

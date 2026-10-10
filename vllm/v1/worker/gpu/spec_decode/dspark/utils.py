@@ -3,6 +3,7 @@
 
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import get_draft_load_config
@@ -46,6 +47,11 @@ def _get_dspark_parallel_config(
         parallel_config,
         pipeline_parallel_size=1,
         tensor_parallel_size=tensor_parallel_size,
+        decode_context_parallel_size=(
+            parallel_config.decode_context_parallel_size
+            if envs.VLLM_DCP_SHARD_DRAFT
+            else 1
+        ),
         enable_eplb=False,
         eplb_config=replace(
             parallel_config.eplb_config,

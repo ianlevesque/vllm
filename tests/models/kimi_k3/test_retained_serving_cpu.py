@@ -269,3 +269,84 @@ def test_b12x_dense_mla_cutlass_kernel_construction(dtype):
     assert callable(kernel)
     assert callable(DenseMlaMergeKernel(num_splits=4, value_dim=512))
     assert layout.total_bytes <= 99 * 1024
+
+
+@pytest.mark.parametrize("window,block_size", [(32768, 1024), (17, 8)])
+def test_windowed_draft_reads_only_resident_whole_blocks(window, block_size):
+    f = load_source(
+        "vllm/model_executor/layers/attention/mla_attention.py",
+        ["_compact_non_causal_mla_window"],
+    )._compact_non_causal_mla_window
+    lengths = torch.tensor(
+        [
+            0,
+            1,
+            window - 1,
+            window,
+            window + 1,
+            window + block_size - 1,
+            window + block_size,
+            window * 2,
+            window * 8,
+        ],
+        dtype=torch.int32,
+    )
+    width = int(lengths.max()) // block_size + 1
+    source = torch.arange(1, 1 + lengths.numel() * width, dtype=torch.int32).reshape(
+        lengths.numel(), width
+    )
+    original_source = source.clone()
+    original_lengths = lengths.clone()
+    table = torch.empty_like(source)
+    compact = torch.empty_like(lengths)
+    kwargs = dict(
+        window=window,
+        block_size=block_size,
+        columns=torch.arange(width),
+        indices=torch.empty_like(source, dtype=torch.int64),
+        shifts=torch.empty_like(lengths),
+        compact_table=table,
+        compact_lens=compact,
+    )
+    pointer = table.data_ptr()
+    for _ in range(2):
+        f(source, lengths, **kwargs)
+        for row, length in enumerate(lengths.tolist()):
+            shift = max(length - window, 0) // block_size
+            expected_len = length - shift * block_size
+            assert compact[row] == expected_len
+            count = (expected_len + block_size - 1) // block_size
+            torch.testing.assert_close(
+                table[row, :count], source[row, shift : shift + count]
+            )
+            assert expected_len <= window + block_size - 1
+        assert table.data_ptr() == pointer
+    # Position-indexed write tables and absolute prefix lengths stay intact.
+    torch.testing.assert_close(source, original_source)
+    torch.testing.assert_close(lengths, original_lengths)
+
+
+@pytest.mark.parametrize("shard", [False, True])
+def test_dspark_replication_override_keeps_target_parallel_config(shard):
+    def replace(value, **updates):
+        return SimpleNamespace(**(vars(value) | updates))
+
+    config = SimpleNamespace(
+        enable_eplb=False,
+        tensor_parallel_size=16,
+        decode_context_parallel_size=4,
+        pipeline_parallel_size=1,
+        enable_elastic_ep=False,
+        eplb_config=SimpleNamespace(num_redundant_experts=0),
+    )
+    f = load_source(
+        "vllm/v1/worker/gpu/spec_decode/dspark/utils.py",
+        ["_get_dspark_parallel_config"],
+        replace=replace,
+        envs=SimpleNamespace(VLLM_DCP_SHARD_DRAFT=shard),
+    )._get_dspark_parallel_config
+    draft = f(config, 1)
+    assert draft.decode_context_parallel_size == (4 if shard else 1)
+    assert draft.tensor_parallel_size == 1
+    assert config.decode_context_parallel_size == 4
+    assert config.tensor_parallel_size == 16

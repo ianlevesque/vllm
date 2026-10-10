@@ -2241,6 +2241,35 @@ def build_mla_chunked_context_metadata(
     )
 
 
+def _compact_non_causal_mla_window(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    window: int,
+    block_size: int,
+    columns: torch.Tensor,
+    indices: torch.Tensor,
+    shifts: torch.Tensor,
+    compact_table: torch.Tensor,
+    compact_lens: torch.Tensor,
+) -> None:
+    """Read the retained whole-block tail without changing global write slots.
+
+    This is the qualified DSpark window rule: floor(max(L-W, 0) / B).
+    It intentionally retains the leading partial block; RoPE positions and
+    prefix checkpoint accounting remain absolute. All outputs are preallocated.
+    """
+    torch.sub(seq_lens, window, out=shifts)
+    shifts.clamp_(min=0).div_(block_size, rounding_mode="floor")
+    torch.add(columns, shifts[:, None], out=indices)
+    # Out-of-range tail entries are unreachable under compact_lens. Clamping
+    # keeps padded/empty requests safe without reading beyond the source row.
+    indices.clamp_(max=block_table.shape[1] - 1)
+    torch.gather(block_table, 1, indices, out=compact_table)
+    shifts.mul_(block_size)
+    torch.sub(seq_lens, shifts, out=compact_lens)
+
+
 class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     """NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -2279,6 +2308,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         ):
             return
 
+        if self.non_causal_multi_token_decode and not self.kv_cache_spec.dcp_sharded:
+            return
         if self.non_causal_multi_token_decode:
             supported = self.supports_non_causal_multi_token_dcp
             query_mode = "non-causal draft"
@@ -2423,6 +2454,43 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
 
         self.page_size = self.kv_cache_spec.block_size
+        # A replicated DSpark draft shares the target's distributed groups,
+        # but its cache and attention lengths remain local/full-history.
+        if (
+            not kv_cache_spec.dcp_sharded
+            or parallel_config.decode_context_parallel_size == 1
+        ):
+            self.dcp_world_size = 1
+            self.dcp_virtual_block_size = self.dcp_local_block_size
+        self._non_causal_mla_window = (
+            kv_cache_spec.sliding_window
+            if isinstance(kv_cache_spec, SlidingWindowMLASpec)
+            and self.non_causal_multi_token_decode
+            else 0
+        )
+        if self._non_causal_mla_window:
+            if self.dcp_world_size != 1:
+                raise NotImplementedError(
+                    "Windowed non-causal MLA requires replicated draft KV"
+                )
+            max_reqs = vllm_config.scheduler_config.max_num_seqs
+            max_blocks = math.ceil(self.model_config.max_model_len / self.page_size)
+            if self.page_size <= 128:
+                alignment = 128 // self.page_size
+                max_blocks = math.ceil(max_blocks / alignment) * alignment
+            self._window_columns = torch.arange(
+                max_blocks, dtype=torch.int64, device=device
+            )
+            self._window_indices = torch.empty(
+                (max_reqs, max_blocks), dtype=torch.int64, device=device
+            )
+            self._window_table = torch.empty(
+                (max_reqs, max_blocks), dtype=torch.int32, device=device
+            )
+            self._window_shifts = torch.empty(
+                max_reqs, dtype=torch.int32, device=device
+            )
+            self._window_lens = torch.empty(max_reqs, dtype=torch.int32, device=device)
 
         self.chunked_prefill_workspace_size = (
             self.determine_chunked_prefill_workspace_size(vllm_config)
@@ -2536,6 +2604,33 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
         non_causal_decode = common_attn_metadata.causal is False
+        if non_causal_decode and self._non_causal_mla_window:
+            width = block_table_tensor.shape[1]
+            if (
+                num_reqs > self._window_table.shape[0]
+                or width > self._window_table.shape[1]
+            ):
+                raise ValueError(
+                    "DSpark MLA window metadata exceeds its retained workspace"
+                )
+            compact_table = self._window_table[:num_reqs, :width]
+            compact_lens = self._window_lens[:num_reqs]
+            _compact_non_causal_mla_window(
+                block_table_tensor,
+                seq_lens,
+                window=self._non_causal_mla_window,
+                block_size=self.page_size,
+                columns=self._window_columns[:width],
+                indices=self._window_indices[:num_reqs, :width],
+                shifts=self._window_shifts[:num_reqs],
+                compact_table=compact_table,
+                compact_lens=compact_lens,
+            )
+            block_table_tensor = compact_table
+            seq_lens = compact_lens
+            max_seq_len = min(
+                max_seq_len, self._non_causal_mla_window + self.page_size - 1
+            )
         if non_causal_decode:
             if not (
                 self.supports_non_causal_multi_token_decode
