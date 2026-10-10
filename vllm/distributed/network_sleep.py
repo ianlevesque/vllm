@@ -83,6 +83,7 @@ def clear_collective_graphs(worker: Any) -> None:
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+    from vllm.platforms import current_platform
 
     # Reuse this K3 lineage's V2 profiling primitive. Upstream elastic EP
     # calls it release_graphs(), but this runner uses clear(), including
@@ -92,14 +93,30 @@ def clear_collective_graphs(worker: Any) -> None:
     BreakableCUDAGraphWrapper.clear_all_graphs()
     runner = worker.model_runner
     seen = set()
+    managers = []
     for owner in (runner, getattr(runner, "speculator", None), runner.model_state):
         for manager in vars(owner).values() if owner is not None else ():
             if isinstance(manager, CudaGraphManager) and id(manager) not in seen:
                 manager.clear()
+                managers.append(manager)
                 seen.add(id(manager))
     # Its V2 EncoderRunner has no graph manager or clear() method. Preserve
     # encoder embeddings/cache; compiled wrappers were released above.
     gc.collect()
+    # PyTorch private pools cannot be reused after their last graph is released
+    # while tensors still reference their allocations (pytorch/pytorch#198794).
+    # Follow vLLM's disposable-profiling pool isolation: retain model/KV tensors,
+    # but give all surviving graph owners and lazily-created runners one fresh
+    # shared pool for the next capture. Never revive a retired allocator pool.
+    pool = current_platform.graph_pool_handle()
+    type(current_platform)._global_graph_pool = pool
+    for manager in managers:
+        if manager.pool is not None:
+            manager.pool = pool
+    for wrapper_cls in (CUDAGraphWrapper, BreakableCUDAGraphWrapper):
+        for wrapper in list(wrapper_cls._all_instances):
+            if wrapper.graph_pool is not None:
+                wrapper.graph_pool = pool
 
 
 def close_transport(groups: dict[str, Any]) -> None:

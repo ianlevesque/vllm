@@ -67,7 +67,8 @@ def test_actual_distributed_wake_resolves_backend_timeout(monkeypatch, timeout, 
                                world_size=16, rank=3, timeout=timeout)]
 
 
-def test_graph_release_uses_installed_k3_manager_api_and_retains_cache(context, monkeypatch):
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_graph_release_uses_installed_k3_manager_api_and_retains_cache(context, monkeypatch, capture_enabled):
     module, _, _ = context
     tree = ast.parse((ROOT / "vllm/v1/worker/gpu/cudagraph_utils.py").read_text())
     classes = []
@@ -85,24 +86,36 @@ def test_graph_release_uses_installed_k3_manager_api_and_retains_cache(context, 
     manager.aux_hidden_states = [object()]
     manager.intermediate_tensors = object()
     descriptors, pool, weights, kv, embeddings, encoder_cache = (object() for _ in range(6))
-    manager._capture_descs, manager.pool = descriptors, pool
+    manager._capture_descs, manager.pool = descriptors, pool if capture_enabled else None
     # The selected V2 EncoderRunner has no clear() or separate graph manager.
     encoder = SimpleNamespace(inputs_embeds=embeddings, encoder_cache=encoder_cache)
     runner = SimpleNamespace(cudagraph_manager=manager, speculator=SimpleNamespace(manager=manager),
                              model=weights, kv_caches=kv, model_state=SimpleNamespace(encoder_runner=encoder))
     wrappers = ModuleType("vllm.compilation.cuda_graph")
-    wrappers.CUDAGraphWrapper = SimpleNamespace(clear_all_graphs=lambda: None)
+    compiled_wrapper = SimpleNamespace(graph_pool=pool if capture_enabled else None)
+    wrappers.CUDAGraphWrapper = SimpleNamespace(clear_all_graphs=lambda: None, _all_instances=[compiled_wrapper])
     breakable = ModuleType("vllm.compilation.breakable_cudagraph")
-    breakable.BreakableCUDAGraphWrapper = SimpleNamespace(clear_all_graphs=lambda: None)
+    piecewise_wrapper = SimpleNamespace(graph_pool=pool if capture_enabled else None)
+    breakable.BreakableCUDAGraphWrapper = SimpleNamespace(clear_all_graphs=lambda: None, _all_instances=[piecewise_wrapper])
+    platforms = ModuleType("vllm.platforms")
+    new_pool = object()
+    class Platform:
+        _global_graph_pool = pool
+        graph_pool_handle = staticmethod(lambda: new_pool)
+    platforms.current_platform = Platform()
     managers = ModuleType("vllm.v1.worker.gpu.cudagraph_utils")
     managers.CudaGraphManager = namespace["CudaGraphManager"]
-    for item in (wrappers, breakable, managers):
+    for item in (wrappers, breakable, managers, platforms):
         monkeypatch.setitem(sys.modules, item.__name__, item)
     module.clear_collective_graphs(SimpleNamespace(model_runner=runner))
     assert not manager.graphs and not manager._graphs_captured
     assert manager.hidden_states is None and not manager.aux_hidden_states
     assert manager.intermediate_tensors is None and manager.breakable_cg_runner is None
-    assert manager._capture_descs is descriptors and manager.pool is pool
+    assert manager._capture_descs is descriptors
+    assert manager.pool is (new_pool if capture_enabled else None)
+    assert compiled_wrapper.graph_pool is (new_pool if capture_enabled else None)
+    assert piecewise_wrapper.graph_pool is (new_pool if capture_enabled else None)
+    assert type(platforms.current_platform)._global_graph_pool is new_pool
     assert runner.model is weights and runner.kv_caches is kv
     assert runner.model_state.encoder_runner is encoder
     assert encoder.inputs_embeds is embeddings and encoder.encoder_cache is encoder_cache
