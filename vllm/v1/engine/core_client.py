@@ -1388,9 +1388,12 @@ class AsyncMPClient(MPClient):
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return await self.call_utility_async(
+        per_engine = await self.call_utility_all_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+        # A DP deployment owns one worker list per engine. Returning only DP0
+        # hides live transport owners and makes a retained-sleep census unsafe.
+        return [worker for workers in per_engine for worker in workers]
 
     async def compute_weight_checksums_async(self) -> list[dict[str, str]]:
         per_engine = await self.call_utility_all_async("compute_weight_checksums")

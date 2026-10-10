@@ -3,10 +3,13 @@
 """CPU lifecycle regressions; native transport and model gates remain required."""
 
 import ast
+import asyncio
 import importlib.util
+import os
 import sys
 import weakref
 from concurrent.futures import Future
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -17,12 +20,19 @@ ROOT = Path(__file__).parents[2]
 
 
 @pytest.mark.parametrize("timeout", [None, timedelta(seconds=123)])
-@pytest.mark.parametrize("backend,available", [("nccl", True), ("gloo", True), ("nccl", False)])
-def test_actual_distributed_wake_resolves_backend_timeout(monkeypatch, timeout, backend, available):
+@pytest.mark.parametrize(
+    "backend,available", [("nccl", True), ("gloo", True), ("nccl", False)]
+)
+def test_actual_distributed_wake_resolves_backend_timeout(
+    monkeypatch, timeout, backend, available
+):
     """Execute the installed initialization body with production's unset timeout."""
     path = ROOT / "vllm/distributed/parallel_state.py"
-    fn = next(n for n in ast.parse(path.read_text()).body
-              if isinstance(n, ast.FunctionDef) and n.name == "init_distributed_environment")
+    fn = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "init_distributed_environment"
+    )
     config = ModuleType("vllm.config")
     config.get_current_vllm_config_or_none = lambda: None
     network = ModuleType("vllm.distributed.network_sleep")
@@ -45,24 +55,50 @@ def test_actual_distributed_wake_resolves_backend_timeout(monkeypatch, timeout, 
     initialized = []
     scope = {
         "timedelta": timedelta,
-        "logger": SimpleNamespace(**{n: lambda *a: None for n in ("debug", "info", "warning")}),
-        "Backend": str, "_get_default_timeout": resolve_default,
-        "torch": SimpleNamespace(distributed=SimpleNamespace(
-            is_initialized=lambda: False, is_backend_available=lambda b: available,
-            is_gloo_available=lambda: True, get_world_size=lambda: 16,
-            init_process_group=lambda **kwargs: initialized.append(kwargs))),
+        "logger": SimpleNamespace(
+            **{n: lambda *a: None for n in ("debug", "info", "warning")}
+        ),
+        "Backend": str,
+        "_get_default_timeout": resolve_default,
+        "torch": SimpleNamespace(
+            distributed=SimpleNamespace(
+                is_initialized=lambda: False,
+                is_backend_available=lambda b: available,
+                is_gloo_available=lambda: True,
+                get_world_size=lambda: 16,
+                init_process_group=lambda **kwargs: initialized.append(kwargs),
+            )
+        ),
         "envs": SimpleNamespace(VLLM_DISTRIBUTED_USE_SPLIT_GROUP=False),
-        "_WORLD": None, "_NODE_COUNT": None, "_INNER_DP_WORLD": None,
+        "_WORLD": None,
+        "_NODE_COUNT": None,
+        "_INNER_DP_WORLD": None,
         "init_world_group": lambda *a: SimpleNamespace(cpu_group=object()),
         "_node_count": lambda group: 16,
     }
     exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), scope)
     scope[fn.name](16, 3, "tcp://example:25000", 0, backend, timeout, 2)
-    assert calls == [("tcp://example:25000", 3, 16,
-                      timeout if timeout is not None else default_timeout, 2, None)]
+    assert calls == [
+        (
+            "tcp://example:25000",
+            3,
+            16,
+            timeout if timeout is not None else default_timeout,
+            2,
+            None,
+        )
+    ]
     assert defaults == ([expected_backend] if timeout is None else [])
-    assert initialized == [dict(backend=expected_backend, init_method=None, store=store,
-                               world_size=16, rank=3, timeout=timeout)]
+    assert initialized == [
+        dict(
+            backend=expected_backend,
+            init_method=None,
+            store=store,
+            world_size=16,
+            rank=3,
+            timeout=timeout,
+        )
+    ]
 
 
 @pytest.fixture
@@ -78,7 +114,9 @@ def context(monkeypatch):
     ps.GroupCoordinator = Group
     ps._groups = {}
     ps._group_name_counter = {"tp": 1}
-    ps._INNER_DP_WORLD = object()
+    ps._INNER_DP_WORLD = None
+    ps._WORLD = None
+    ps.get_world_group = lambda: SimpleNamespace(rank=0)
     ps.events = []
     ps.destroy_model_parallel = lambda: ps.events.append("model-groups-closed")
     ps.destroy_distributed_environment = lambda: ps.events.append("world-closed")
@@ -101,6 +139,7 @@ def context(monkeypatch):
     spec = importlib.util.spec_from_file_location("network_sleep_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.network_sleep", module)
     return module, ps, allocator
 
 
@@ -177,7 +216,15 @@ def test_preflight_rejects_unsupported_transport_before_mutation(
 ):
     module, ps, allocator = context
     group = put(ps)
-    worker = SimpleNamespace(use_v2_model_runner=True, rank=0)
+    worker = SimpleNamespace(
+        use_v2_model_runner=True,
+        rank=0,
+        vllm_config=SimpleNamespace(
+            kv_transfer_config=None,
+            ec_transfer_config=None,
+            parallel_config=SimpleNamespace(use_ubatching=False),
+        ),
+    )
     if unsupported == "empty":
         ps._groups.clear()
     elif unsupported == "symm":
@@ -222,7 +269,7 @@ def core_method(name):
     return scope[name]
 
 
-def test_network_sleep_waits_for_scheduler_drain_and_keeps_cache():
+def test_network_sleep_waits_for_scheduler_drain_and_keeps_cache(context):
     events = []
     pause = Future()
     executor = SimpleNamespace(collective_rpc=lambda method: events.append(method))
@@ -238,7 +285,7 @@ def test_network_sleep_waits_for_scheduler_drain_and_keeps_cache():
     assert result.done() and events == ["check_network_sleep", "sleep_network"]
 
 
-def test_failed_drain_never_closes_transport():
+def test_failed_drain_never_closes_transport(context):
     events = []
     pause = Future()
     engine = SimpleNamespace(
@@ -252,17 +299,18 @@ def test_failed_drain_never_closes_transport():
     assert events == ["check_network_sleep"]
 
 
-def test_wake_rebuilds_transport_before_scheduler_accepts_work():
+def test_wake_rebuilds_transport_before_scheduler_accepts_work(context):
     events = []
     engine = SimpleNamespace(
         model_executor=SimpleNamespace(collective_rpc=lambda m: events.append(m)),
         resume_scheduler=lambda: events.append("admission"),
+        _network_sleep_state="sleeping",
     )
     assert core_method("wake_up")(engine, tags=["scheduling"])
     assert events == ["wake_network", "admission"]
 
 
-def test_failed_transport_restore_does_not_resume_scheduler():
+def test_failed_transport_restore_does_not_resume_scheduler(context):
     events = []
 
     def fail(_):
@@ -271,6 +319,7 @@ def test_failed_transport_restore_does_not_resume_scheduler():
     engine = SimpleNamespace(
         model_executor=SimpleNamespace(collective_rpc=fail),
         resume_scheduler=lambda: events.append("admission"),
+        _network_sleep_state="sleeping",
     )
     with pytest.raises(RuntimeError, match="restore failed"):
         core_method("wake_up")(engine)
@@ -324,3 +373,448 @@ def test_wake_store_isolates_old_keys_and_separate_sleep_generations(
         module.transport_rendezvous_store(
             "tcp://example:25000", 0, 2, timedelta(seconds=3), 0, store
         )
+
+
+def test_worker_global_rank_survives_teardown(context):
+    module, ps, _ = context
+    workers = [SimpleNamespace(rank=i % 4) for i in range(16)]
+    for rank, worker in enumerate(workers):
+        ps.get_world_group = lambda rank=rank: SimpleNamespace(rank=rank)
+        assert module.worker_global_rank(worker) == rank
+    ps.get_world_group = lambda: (_ for _ in ()).throw(
+        AssertionError("world is closed")
+    )
+    assert [module.worker_global_rank(w) for w in workers] == list(range(16))
+
+
+def test_dp_rpc_returns_all_original_workers():
+    path = ROOT / "vllm/v1/engine/core_client.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "AsyncMPClient"
+    )
+    fn = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "collective_rpc_async"
+    )
+    fn.decorator_list = []
+    scope = {}
+    code = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            fn,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), scope)
+    expected = [{"rank": i, "pid": 1000 + i, "state": "sleeping"} for i in range(16)]
+    calls = []
+
+    async def all_engines(*args):
+        calls.append(args)
+        return [expected[i : i + 4] for i in range(0, 16, 4)]
+
+    result = asyncio.run(
+        scope[fn.name](
+            SimpleNamespace(call_utility_all_async=all_engines),
+            "network_sleep_status",
+            120,
+        )
+    )
+    assert result == expected
+    assert calls == [("collective_rpc", "network_sleep_status", 120, (), None)]
+
+
+def test_dp_rpc_peer_failure_is_not_partial_success():
+    path = ROOT / "vllm/v1/engine/core_client.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "AsyncMPClient"
+    )
+    fn = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "collective_rpc_async"
+    )
+    scope = {}
+    code = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            fn,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), scope)
+
+    async def fail(*args):
+        raise RuntimeError("DP3 failed")
+
+    with pytest.raises(RuntimeError, match="DP3 failed"):
+        asyncio.run(
+            scope[fn.name](
+                SimpleNamespace(call_utility_all_async=fail), "network_sleep_status"
+            )
+        )
+
+
+def test_native_roce_closes_before_nccl_and_exchange_groups(context):
+    module, ps, _ = context
+    native = SimpleNamespace(close=lambda: ps.events.append("native"))
+    comm = SimpleNamespace(available=True, disabled=False, comm=42)
+    comm.nccl = SimpleNamespace(ncclCommDestroy=lambda ptr: ps.events.append("nccl"))
+    dc = SimpleNamespace(b12x_ar_comm=native, pynccl_comm=comm)
+    group = put(ps, transport=dc)
+    ps._INNER_DP_WORLD = SimpleNamespace(destroy=lambda: ps.events.append("inner-dp"))
+    module.close_transport({"tp:0": group})
+    assert ps.events == [
+        "native",
+        "nccl",
+        "model-groups-closed",
+        "inner-dp",
+        "world-closed",
+    ]
+    assert dc.b12x_ar_comm is None
+
+
+@pytest.mark.parametrize("timeout", [None, timedelta(seconds=73)])
+def test_dp_control_group_rebuilds_after_consensus_with_fresh_generation(
+    context, monkeypatch, timeout
+):
+    module, _, _ = context
+    events = []
+    utils = ModuleType("vllm.distributed.utils")
+    utils.stateless_destroy_torch_distributed_process_group = lambda group: (
+        events.append(("close", group))
+    )
+    utils.init_gloo_process_group = lambda **kw: (
+        events.append(("open", kw))
+        or SimpleNamespace(generation=kw["prefix_store"].prefix)
+    )
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    class Store:
+        def __init__(self, prefix, base):
+            self.prefix, self.base = prefix, base
+
+        def set_timeout(self, value):
+            self.timeout = value
+
+    dist = ModuleType("torch.distributed")
+    dist.PrefixStore = Store
+    torch = ModuleType("torch")
+    torch.distributed = dist
+    backend = ModuleType("torch.distributed.distributed_c10d")
+    backend.Backend = str
+    backend._get_default_timeout = lambda backend: timedelta(minutes=30)
+    for m in (torch, dist, backend):
+        monkeypatch.setitem(sys.modules, m.__name__, m)
+    original, store = object(), object()
+    engine = SimpleNamespace(
+        dp_group=original,
+        dp_store=store,
+        dp_rank=3,
+        dp_size=4,
+        pending_pause=False,
+        engines_running=False,
+        ignore_start_dp_wave=True,
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(cpu_distributed_timeout=timeout)
+        ),
+    )
+    for generation in (1, 2):
+        old = engine.dp_group
+        module.close_engine_control_group(engine)
+        assert engine.dp_group is None and events[-1] == ("close", old)
+        module.restore_engine_control_group(engine)
+        restored = events[-1][1]
+        assert restored["prefix_store"].base is store
+        assert restored["prefix_store"].prefix == f"vllm-network-dp-wake-{generation}"
+        assert restored["group_rank"] == 3 and restored["group_size"] == 4
+        assert restored["timeout"] == (timeout or timedelta(minutes=30))
+        assert engine.dp_store is store
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("pending_pause", True),
+        ("engines_running", True),
+        ("ignore_start_dp_wave", False),
+    ],
+)
+def test_dp_control_group_requires_completed_consensus(
+    context, monkeypatch, flag, value
+):
+    module, _, _ = context
+    utils = ModuleType("vllm.distributed.utils")
+    events = []
+    utils.stateless_destroy_torch_distributed_process_group = lambda group: (
+        events.append(group)
+    )
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    group = object()
+    engine = SimpleNamespace(
+        dp_group=group,
+        pending_pause=False,
+        engines_running=False,
+        ignore_start_dp_wave=True,
+    )
+    setattr(engine, flag, value)
+    with pytest.raises(RuntimeError, match="consensus"):
+        module.close_engine_control_group(engine)
+    assert engine.dp_group is group and not events
+
+
+def test_single_engine_has_no_dp_control_owner(context):
+    module, _, _ = context
+    engine = SimpleNamespace()
+    module.close_engine_control_group(engine)
+    module.restore_engine_control_group(engine)
+    assert vars(engine) == {}
+
+
+def test_graph_release_uses_current_apis_and_renews_retained_pools(
+    context, monkeypatch
+):
+    module, _, _ = context
+    events = []
+
+    class Wrapper:
+        _all_instances = []
+
+        @classmethod
+        def clear_all_graphs(cls):
+            events.append("wrapper-clear")
+
+    class Breakable(Wrapper):
+        _all_instances = []
+
+    wrapper = Wrapper()
+    wrapper.graph_pool = object()
+    Wrapper._all_instances.append(wrapper)
+    path = ROOT / "vllm/v1/worker/gpu/cudagraph_utils.py"
+    original_cls = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "CudaGraphManager"
+    )
+    fn = next(
+        n
+        for n in original_cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "release_graphs"
+    )
+    namespace = {"BreakableCUDAGraphWrapper": Breakable}
+    only = ast.ClassDef(
+        name="CudaGraphManager", bases=[], keywords=[], body=[fn], decorator_list=[]
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[only], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    Manager = namespace["CudaGraphManager"]
+    first_pool, weights, kv, embeddings, cache = (object() for _ in range(5))
+    target, draft, inner = [Manager() for _ in range(3)]
+    for manager in (target, draft, inner):
+        manager.graphs, manager._graphs_captured = {1: object()}, True
+        manager._capture_descs = [object()]
+        manager.pool, manager.breakable_cg_runner = first_pool, object()
+    clear_encoder = lambda: events.append("encoder-clear")
+    encoder = SimpleNamespace(
+        clear=clear_encoder, inputs_embeds=embeddings, encoder_cache=cache
+    )
+    runner = SimpleNamespace(
+        cudagraph_manager=target,
+        speculator=SimpleNamespace(manager=draft),
+        model=weights,
+        kv_caches=kv,
+        model_state=SimpleNamespace(inner=inner, encoder_runner=encoder),
+    )
+
+    class Platform:
+        _global_graph_pool = first_pool
+
+        def graph_pool_handle(self):
+            return object()
+
+    modules = {
+        "vllm.compilation.cuda_graph": {"CUDAGraphWrapper": Wrapper},
+        "vllm.compilation.breakable_cudagraph": {
+            "BreakableCUDAGraphWrapper": Breakable
+        },
+        "vllm.v1.worker.gpu.cudagraph_utils": {"CudaGraphManager": Manager},
+        "vllm.platforms": {"current_platform": Platform()},
+    }
+    for name, attrs in modules.items():
+        mocked = ModuleType(name)
+        vars(mocked).update(attrs)
+        monkeypatch.setitem(sys.modules, name, mocked)
+    for cycle in range(2):
+        previous_pool = target.pool
+        module.clear_collective_graphs(SimpleNamespace(model_runner=runner))
+        assert (
+            target.pool is not previous_pool
+            and target.pool is Platform._global_graph_pool
+        )
+        assert all(
+            m.pool is target.pool
+            and not m.graphs
+            and not m._graphs_captured
+            and m._capture_descs
+            for m in (target, draft, inner)
+        )
+        assert wrapper.graph_pool is target.pool
+        assert runner.model is weights and runner.kv_caches is kv
+        assert encoder.inputs_embeds is embeddings and encoder.encoder_cache is cache
+    assert events.count("encoder-clear") == 2
+
+
+def worker_methods(scope):
+    path = ROOT / "vllm/v1/worker/gpu_worker.py"
+    cls = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "Worker"
+    )
+    names = {"network_sleep_status", "sleep_network", "wake_network"}
+    methods = [
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    extracted = ast.ClassDef(
+        name="Worker", bases=[], keywords=[], body=methods, decorator_list=[]
+    )
+    tree = ast.fix_missing_locations(ast.Module(body=[extracted], type_ignores=[]))
+    scope.update(Any=object, os=os, logger=SimpleNamespace(info=lambda *args: None))
+    exec(compile(tree, str(path), "exec"), scope)
+    return scope["Worker"]()
+
+
+def test_real_worker_sleep_wake_synchronizes_and_retains_model_and_cache(
+    context, monkeypatch
+):
+    module, ps, _ = context
+    ps.get_world_group = lambda: SimpleNamespace(rank=15)
+    events = []
+    groups = {"tp:0": object()}
+    module.check_network_sleep = lambda worker: events.append("check")
+    module.live_groups = lambda: groups
+    module.clear_collective_graphs = lambda worker: events.append("graphs-released")
+    module.close_transport = lambda original: events.append(("close", original))
+    module.restore_group_references = lambda original: events.append(
+        ("restore", original)
+    )
+    monkeypatch.setitem(sys.modules, "vllm.distributed.network_sleep", module)
+    worker = worker_methods(
+        {
+            "torch": SimpleNamespace(
+                accelerator=SimpleNamespace(
+                    synchronize=lambda: events.append("synchronize")
+                )
+            ),
+            "set_current_vllm_config": lambda config: nullcontext(),
+            "init_worker_distributed_environment": lambda *args, **kwargs: (
+                events.append(("init", kwargs["network_wake_generation"]))
+            ),
+            "current_platform": SimpleNamespace(dist_backend="nccl"),
+        }
+    )
+    worker.rank, worker.local_rank, worker.distributed_init_method = (
+        3,
+        0,
+        "tcp://host:1",
+    )
+    worker.synchronize_device = lambda: events.append("synchronize")
+    worker.vllm_config = object()
+    worker.model_runner = SimpleNamespace(
+        model=object(),
+        kv_cache=object(),
+        capture_model=lambda: events.append("capture"),
+    )
+    model, cache = worker.model_runner.model, worker.model_runner.kv_cache
+    # Current main exposes synchronize_device via WorkerBase.
+    for generation in (1, 2):
+        events.clear()
+        slept = worker.sleep_network()
+        assert slept == {
+            "state": "sleeping",
+            "rank": 15,
+            "pid": os.getpid(),
+            "generation": generation,
+        }
+        assert worker.sleep_network() == slept
+        assert events == ["check", "synchronize", "graphs-released", ("close", groups)]
+        events.clear()
+        woke = worker.wake_network()
+        assert woke["state"] == "active" and woke["generation"] == generation
+        assert worker.wake_network() == woke
+        assert events == [
+            ("init", generation),
+            ("restore", groups),
+            "capture",
+            "synchronize",
+        ]
+        assert (
+            worker.model_runner.model is model and worker.model_runner.kv_cache is cache
+        )
+
+
+def test_engine_control_lifecycle_order_and_idempotence(context, monkeypatch):
+    module, _, _ = context
+    events = []
+    engine = SimpleNamespace(
+        model_executor=SimpleNamespace(
+            collective_rpc=lambda method: events.append(method)
+        ),
+        pause_scheduler=lambda **kwargs: None,
+        resume_scheduler=lambda: events.append("resume"),
+    )
+    monkeypatch.setattr(
+        module, "close_engine_control_group", lambda e: events.append("control-close")
+    )
+    monkeypatch.setattr(
+        module, "restore_engine_control_group", lambda e: events.append("control-open")
+    )
+    for _ in range(2):
+        events.clear()
+        core_method("sleep")(engine, level=0, mode="wait")
+        core_method("sleep")(engine, level=0, mode="wait")
+        assert events == ["check_network_sleep", "sleep_network", "control-close"]
+        assert engine._network_sleep_state == "sleeping"
+        core_method("wake_up")(engine, tags=["scheduling"])
+        core_method("wake_up")(engine, tags=["scheduling"])
+        assert events[-3:] == ["control-open", "wake_network", "resume"]
+        assert engine._network_sleep_state == "active"
+
+
+def test_failed_control_close_leaves_engine_closed_to_retry(context, monkeypatch):
+    module, _, _ = context
+    events = []
+
+    def fail(engine):
+        raise RuntimeError("control close failed")
+
+    monkeypatch.setattr(module, "close_engine_control_group", fail)
+    engine = SimpleNamespace(
+        model_executor=SimpleNamespace(
+            collective_rpc=lambda method: events.append(method)
+        ),
+        pause_scheduler=lambda **kwargs: None,
+    )
+    with pytest.raises(RuntimeError, match="control close failed"):
+        core_method("sleep")(engine, level=0, mode="wait")
+    assert engine._network_sleep_state == "closing"
+    with pytest.raises(RuntimeError, match="did not finish"):
+        core_method("wake_up")(engine)
+    assert events == ["check_network_sleep", "sleep_network"]

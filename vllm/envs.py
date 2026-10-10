@@ -171,6 +171,11 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_SLEEP_RELEASE_TRANSPORT: bool = False
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
+    VLLM_ROCE_HIERARCHICAL_MIN_SIZE: str = "64KB"
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1476,6 +1481,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_HIERARCHICAL_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ROCE_HIERARCHICAL_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_HIERARCHICAL_MIN_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_HIERARCHICAL_MIN_SIZE", "64KB"
+    ),
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+    ),
     "VLLM_SLEEP_RELEASE_TRANSPORT": lambda: bool(
         int(os.getenv("VLLM_SLEEP_RELEASE_TRANSPORT", "0"))
     ),

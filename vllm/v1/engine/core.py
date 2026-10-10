@@ -959,9 +959,17 @@ class EngineCore:
         """
         release_transport = envs.VLLM_SLEEP_RELEASE_TRANSPORT
         if release_transport:
+            state = getattr(self, "_network_sleep_state", "active")
+            if state == "sleeping":
+                return None
+            if state != "active":
+                raise RuntimeError("Network sleep transition did not finish cleanly")
             if level != 0:
                 raise ValueError("Transport release requires level-0 sleep")
+            if mode != "wait":
+                raise ValueError("Transport sleep requires drained wait mode")
             self.model_executor.collective_rpc("check_network_sleep")
+            self._network_sleep_state = "closing"
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
@@ -972,7 +980,12 @@ class EngineCore:
 
         def suspend_executor():
             if release_transport:
-                return model_executor.collective_rpc("sleep_network")
+                from vllm.distributed.network_sleep import close_engine_control_group
+
+                result = model_executor.collective_rpc("sleep_network")
+                close_engine_control_group(self)
+                self._network_sleep_state = "sleeping"
+                return result
             return model_executor.sleep(level)
 
         if pause_future is None:
@@ -1005,8 +1018,18 @@ class EngineCore:
         if envs.VLLM_SLEEP_RELEASE_TRANSPORT:
             if tags not in (None, ["scheduling"]):
                 raise ValueError("Transport wake requires a full scheduling wake")
+            from vllm.distributed.network_sleep import restore_engine_control_group
+
+            state = getattr(self, "_network_sleep_state", "active")
+            if state == "active":
+                return True
+            if state != "sleeping":
+                raise RuntimeError("Network sleep did not finish cleanly")
+            self._network_sleep_state = "restoring"
+            restore_engine_control_group(self)
             self.model_executor.collective_rpc("wake_network")
             self.resume_scheduler()
+            self._network_sleep_state = "active"
             return True
 
         if tags is not None and "scheduling" in tags:

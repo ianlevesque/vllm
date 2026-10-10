@@ -184,6 +184,29 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
+    """An asynchronous output whose completion is followed by the RoCEnante check."""
+
+    def __init__(
+        self, inner: AsyncModelRunnerOutput, check: Callable[[], None]
+    ) -> None:
+        self._inner = inner
+        self._check = check
+
+    def get_output(self) -> ModelRunnerOutput:
+        """Wait for the wrapped output, then run the fail-stop check.
+
+        Returns:
+            The completed ModelRunnerOutput.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+        """
+        output = self._inner.get_output()
+        self._check()
+        return output
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -281,9 +304,11 @@ class Worker(WorkerBase):
         return check_network_sleep(self)
 
     def network_sleep_status(self) -> dict[str, Any]:
+        from vllm.distributed.network_sleep import worker_global_rank
+
         return {
             "state": getattr(self, "_network_sleep_state", "active"),
-            "rank": self.rank,
+            "rank": worker_global_rank(self),
             "pid": os.getpid(),
             "generation": getattr(self, "_network_sleep_generation", 0),
         }
@@ -299,6 +324,7 @@ class Worker(WorkerBase):
         if getattr(self, "_network_sleep_state", "active") == "sleeping":
             return self.network_sleep_status()
         check_network_sleep(self)
+        self.network_sleep_status()
         self._network_sleep_state = "closing"
         self.synchronize_device()
         self._network_sleep_groups = live_groups()
@@ -1329,12 +1355,52 @@ class Worker(WorkerBase):
             )
         return self.profiler.annotate_context_manager(annotation)
 
+    def _b12x_roce_health_check(self) -> Callable[[], None] | None:
+        """The RoCEnante health check of the TP communicator, if one is active.
+
+        Returns:
+            The check callable, or None when RoCEnante is not in use.
+        """
+        communicator = get_tp_group().device_communicator
+        comm = getattr(communicator, "b12x_ar_comm", None)
+        return getattr(comm, "check_health", None)
+
+    def _b12x_roce_guarded(self, output):
+        """Fail-stop RoCEnante check once the step's output is on the host.
+
+        A RoCEnante wait that timed out records itself and freezes the runtime.
+        A synchronous output already holds the sampled tokens on the host, so
+        every collective of the step has completed and the check runs now; an
+        asynchronous output is wrapped so the check runs right after its
+        ``get_output()`` completes the copy.  Either way a failed collective's
+        output never leaves the worker.  Every rank reaches the same state on
+        its own (a stalled rank starves its peers' waits), so the raise is
+        coordinated without a supervisor.  Two pinned-memory reads; no added
+        synchronization.
+
+        Args:
+            output: The model runner's output for this step, possibly None.
+
+        Returns:
+            The same output, or a wrapper for an asynchronous output.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+        """
+        check = self._b12x_roce_health_check()
+        if check is None:
+            return output
+        if isinstance(output, AsyncModelRunnerOutput):
+            return _B12xRoceCheckedAsyncOutput(output, check)
+        check()
+        return output
+
     @torch.inference_mode()
     @with_gpu_sync_check
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1376,7 +1442,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
-                return output
+                return self._b12x_roce_guarded(output)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config

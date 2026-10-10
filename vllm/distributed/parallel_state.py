@@ -683,6 +683,7 @@ class GroupCoordinator:
         maybe_ca_context = nullcontext()
         maybe_fi_pcie_ipc_context: AbstractContextManager[Any] = nullcontext()
         maybe_aiter_ar_context = nullcontext()
+        maybe_b12x_context = nullcontext()
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
@@ -703,6 +704,10 @@ class GroupCoordinator:
                 if fi_pcie_ipc_ar_comm is not None:
                     maybe_fi_pcie_ipc_context = fi_pcie_ipc_ar_comm.capture()
 
+            b12x_ar_comm = getattr(self.device_communicator, "b12x_ar_comm", None)
+            if b12x_ar_comm is not None:
+                maybe_b12x_context = b12x_ar_comm.capture(stream=stream)
+
             # Capture each group's own comm. A global lookup would double-capture
             aiter_ar_comm = getattr(self.device_communicator, "aiter_ar_comm", None)
             if aiter_ar_comm is not None:
@@ -719,6 +724,7 @@ class GroupCoordinator:
             maybe_ca_context,
             maybe_fi_pcie_ipc_context,
             maybe_aiter_ar_context,
+            maybe_b12x_context,
         ):
             yield graph_capture_context
 
@@ -1938,7 +1944,9 @@ def init_distributed_environment(
                 distributed_init_method,
                 rank,
                 world_size,
-                timeout if timeout is not None else _get_default_timeout(Backend(backend)),
+                timeout
+                if timeout is not None
+                else _get_default_timeout(Backend(backend)),
                 network_wake_generation,
                 store,
             )
