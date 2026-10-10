@@ -81,6 +81,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 and bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
             )
 
+        self.use_roce_allreduce = (
+            unique_name.split(":")[0] == "tp"
+            and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+            and not envs.VLLM_BATCH_INVARIANT
+        )
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
@@ -119,6 +124,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
+        self.b12x_ar_comm = None
+        if self.use_roce_allreduce and self.world_size > 1:
+            from .b12x_roce_all_reduce import B12xRoceAllReduce
+
+            self.b12x_ar_comm = B12xRoceAllReduce(
+                group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
+            )
 
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
         config = get_current_vllm_config_or_none()
@@ -294,6 +308,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "B12X_ROCENANTE",
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
@@ -304,6 +319,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.b12x_ar_comm is not None and not self.b12x_ar_comm.disabled:
+            enabled_ar_backends.append(self.b12x_ar_comm.backend_name)
         if (
             self.fi_pcie_ipc_ar_comm is not None
             and not self.fi_pcie_ipc_ar_comm.disabled
@@ -360,6 +377,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        b12x_ar_comm = self.b12x_ar_comm
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and b12x_ar_comm.should_custom_ar(input_)
+        ):
+            return b12x_ar_comm.custom_all_reduce(input_)
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -453,6 +477,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        b12x_ar_comm = self.b12x_ar_comm
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and b12x_ar_comm.should_all_gather(input_, dim)
+        ):
+            return b12x_ar_comm.all_gather(input_, dim)
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -767,6 +798,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        # Native RoCE teardown uses its live CPU exchange groups.
+        if self.b12x_ar_comm is not None:
+            self.b12x_ar_comm.close()
+            self.b12x_ar_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
