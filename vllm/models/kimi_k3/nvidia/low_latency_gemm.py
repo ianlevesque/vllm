@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 decode GEMM selection for unquantized BF16 on SM90/SM100/SM103/SM107.
+"""Kimi-K3 decode GEMM selection for unquantized BF16 on SM90/SM100/SM103/SM107/SM121.
 
 Dispatch is purely by local ``(N, K)`` shape and token count ``M`` — the module
 name plays no role. Each measured shape maps to a :class:`ProjectionSpec`
@@ -620,6 +620,83 @@ KIMI_K3_PROJECTIONS_SM90: dict[tuple[int, int], ProjectionSpec] = {
 }
 
 
+# SM121 winners measured 2026-10-04 on GB10 via kernel-validate
+# (tools/qualification/validate_dsv3_sm121.py and
+# validate_cute_skinny_sm121.py) against cuBLAS, with the same >=1.05x
+# threshold the SM103 table uses. Only measured (shape, M) pairs are
+# listed; everything else stays on the default GEMM. The DSV3 map is
+# authoritative on SM121 (not a filter of the SM103 token sets): K=7168
+# shapes were unmeasurable before the smem-budget fix and now win big
+# at M9 (shared_gate_up 2.06x, mla_g 1.84x, qkv_a 1.22x).
+_SM121_DSV3_TOKENS: dict[tuple[int, int], frozenset[int]] = {
+    (2304, 1536): frozenset({1, 9}),  # 1.40x / 1.11x
+    (4608, 1536): frozenset({1}),  # 1.21x (M9 loses at 0.82x)
+    (7168, 768): frozenset({1, 9}),  # 1.36x / 1.08x
+    (1152, 1536): frozenset({1, 9, 16}),  # 1.43x / 1.48x / 1.32x
+    (1536, 7168): frozenset({1, 9, 16}),  # 1.43x / 2.06x / 1.77x
+    (2112, 7168): frozenset({1, 9}),  # 1.06x / 1.22x (M16 1.045x misses)
+    (768, 7168): frozenset({1, 9, 16}),  # 1.98x / 1.84x / 1.58x
+    (3216, 7168): frozenset({9}),  # 1.06x (M1/M16 neutral at 1.01x/1.02x)
+    (4224, 7168): frozenset({9, 16}),  # 1.07x / 1.06x (M1 neutral at 1.01x)
+}
+_SM121_CUTE_TOKENS: frozenset[tuple[tuple[int, int], int]] = frozenset(
+    {
+        ((768, 7168), 1),  # 2.44x (M2-M4 lose at 0.63-0.66x)
+        ((1152, 1536), 1),  # 1.90x
+        ((3072, 7168), 1),  # 1.11x
+        ((3072, 7168), 2),  # 1.10x
+        ((3072, 7168), 3),  # 1.06x
+        ((3072, 7168), 4),  # 1.10x
+        ((3072, 7168), 5),  # 1.07x
+        ((3216, 7168), 1),  # 1.06x
+        ((3216, 7168), 2),  # 1.06x
+        ((3216, 7168), 3),  # 1.06x
+        ((3216, 7168), 4),  # 1.13x
+        ((3216, 7168), 5),  # 1.07x
+        ((3584, 7168), 1),  # 1.06x
+        ((4224, 7168), 1),  # 1.06x
+        ((6288, 7168), 1),  # 1.06x
+        ((7168, 1536), 1),  # 1.85x
+        ((7168, 3072), 1),  # 1.46x
+        ((7168, 3072), 2),  # 1.07x
+        ((7168, 3584), 1),  # 1.47x
+        ((7168, 4224), 1),  # 1.05x
+        ((8448, 7168), 1),  # 1.06x
+        ((12448, 7168), 3),  # 1.06x
+    }
+)
+_SM121_CUTE_RESIDUAL_TOKENS: frozenset[tuple[tuple[int, int], int]] = frozenset(
+    {
+        ((7168, 3584), 1),  # 1.44x
+        ((7168, 3584), 3),  # 1.06x
+        ((7168, 3584), 4),  # 1.07x
+    }
+)
+
+
+# Keep the measured SM121 subset separate from the upstream architecture tables.
+# No unknown shape/token pair inherits a datacenter-GPU performance decision.
+KIMI_K3_PROJECTIONS_SM121: dict[tuple[int, int], ProjectionSpec] = {
+    key: ProjectionSpec(
+        spec.n,
+        spec.k,
+        _SM121_DSV3_TOKENS.get(key, frozenset()),
+        tuple(
+            (m, config)
+            for m, config in spec.cute_configs
+            if (key, m) in _SM121_CUTE_TOKENS
+        ),
+        tuple(
+            (m, config)
+            for m, config in spec.residual_configs
+            if (key, m) in _SM121_CUTE_RESIDUAL_TOKENS
+        ),
+        name=spec.name,
+    )
+    for key, spec in KIMI_K3_PROJECTIONS.items()
+}
+
+
 def _backend_for(
     spec: ProjectionSpec, num_tokens: int, has_residual: bool
 ) -> Backend | None:
@@ -669,6 +746,8 @@ def _is_sm107() -> bool:
 
 def _low_latency_table() -> dict[tuple[int, int], ProjectionSpec] | None:
     """Measured dispatch table for the current device, or None if unsupported."""
+    if current_platform.is_device_capability((12, 1)):
+        return KIMI_K3_PROJECTIONS_SM121
     if _is_sm103() or _is_sm107():
         # SM107 reuses the SM103 table; see the module docstring.
         return KIMI_K3_PROJECTIONS
@@ -966,7 +1045,7 @@ class KimiK3LowLatencyEmbeddingMethod(
 def _enable_kda_projection_overlap(module: nn.Module) -> bool:
     from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT or current_platform.is_device_capability((12, 1)):
         return False
 
     enabled = False
