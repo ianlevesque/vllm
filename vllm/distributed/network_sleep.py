@@ -110,8 +110,8 @@ def check_network_sleep(worker: Any) -> dict[str, Any]:
 def clear_collective_graphs(worker: Any) -> None:
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
-    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
     from vllm.platforms import current_platform
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 
     # Reuse the V2 graph-release primitive used by elastic EP. Preserve the
     # capture descriptions and compiled model while dropping stale NCCL handles.
