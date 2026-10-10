@@ -84,8 +84,9 @@ def clear_collective_graphs(worker: Any) -> None:
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 
-    # Reuse the V2 graph-release primitive used by elastic EP. Preserve the
-    # capture descriptions and compiled model while dropping stale NCCL handles.
+    # Reuse this K3 lineage's V2 profiling primitive. Upstream elastic EP
+    # calls it release_graphs(), but this runner uses clear(), including
+    # the ModelCudaGraphManager output buffers. Capture descriptions remain.
     gc.unfreeze()
     CUDAGraphWrapper.clear_all_graphs()
     BreakableCUDAGraphWrapper.clear_all_graphs()
@@ -94,11 +95,10 @@ def clear_collective_graphs(worker: Any) -> None:
     for owner in (runner, getattr(runner, "speculator", None), runner.model_state):
         for manager in vars(owner).values() if owner is not None else ():
             if isinstance(manager, CudaGraphManager) and id(manager) not in seen:
-                manager.release_graphs()
+                manager.clear()
                 seen.add(id(manager))
-    encoder = getattr(runner.model_state, "encoder_runner", None)
-    if encoder is not None:
-        encoder.clear()
+    # Its V2 EncoderRunner has no graph manager or clear() method. Preserve
+    # encoder embeddings/cache; compiled wrappers were released above.
     gc.collect()
 
 

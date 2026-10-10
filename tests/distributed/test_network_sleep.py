@@ -18,6 +18,47 @@ import pytest
 ROOT = Path(__file__).parents[2]
 
 
+def test_graph_release_uses_installed_k3_manager_api_and_retains_cache(context, monkeypatch):
+    module, _, _ = context
+    tree = ast.parse((ROOT / "vllm/v1/worker/gpu/cudagraph_utils.py").read_text())
+    classes = []
+    for name in ("CudaGraphManager", "ModelCudaGraphManager"):
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
+        cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "clear"]
+        classes.append(cls)
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=classes, type_ignores=[])), "installed_graph_clear", "exec"), namespace)
+    manager = namespace["ModelCudaGraphManager"]()
+    manager.graphs = {"captured": object()}
+    manager._graphs_captured = True
+    manager.breakable_cg_runner = object()
+    manager.hidden_states = object()
+    manager.aux_hidden_states = [object()]
+    manager.intermediate_tensors = object()
+    descriptors, pool, weights, kv, embeddings, encoder_cache = (object() for _ in range(6))
+    manager._capture_descs, manager.pool = descriptors, pool
+    # The selected V2 EncoderRunner has no clear() or separate graph manager.
+    encoder = SimpleNamespace(inputs_embeds=embeddings, encoder_cache=encoder_cache)
+    runner = SimpleNamespace(cudagraph_manager=manager, speculator=SimpleNamespace(manager=manager),
+                             model=weights, kv_caches=kv, model_state=SimpleNamespace(encoder_runner=encoder))
+    wrappers = ModuleType("vllm.compilation.cuda_graph")
+    wrappers.CUDAGraphWrapper = SimpleNamespace(clear_all_graphs=lambda: None)
+    breakable = ModuleType("vllm.compilation.breakable_cudagraph")
+    breakable.BreakableCUDAGraphWrapper = SimpleNamespace(clear_all_graphs=lambda: None)
+    managers = ModuleType("vllm.v1.worker.gpu.cudagraph_utils")
+    managers.CudaGraphManager = namespace["CudaGraphManager"]
+    for item in (wrappers, breakable, managers):
+        monkeypatch.setitem(sys.modules, item.__name__, item)
+    module.clear_collective_graphs(SimpleNamespace(model_runner=runner))
+    assert not manager.graphs and not manager._graphs_captured
+    assert manager.hidden_states is None and not manager.aux_hidden_states
+    assert manager.intermediate_tensors is None and manager.breakable_cg_runner is None
+    assert manager._capture_descs is descriptors and manager.pool is pool
+    assert runner.model is weights and runner.kv_caches is kv
+    assert runner.model_state.encoder_runner is encoder
+    assert encoder.inputs_embeds is embeddings and encoder.encoder_cache is encoder_cache
+
+
 @pytest.fixture
 def context(monkeypatch):
     ps = ModuleType("vllm.distributed.parallel_state")
