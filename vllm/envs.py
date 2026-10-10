@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_COMPACT_ROPE: bool = False
     VLLM_KIMI_SHARD_QKV_A: bool = False
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_DCP_SHARD_DRAFT: bool = True
     VLLM_KIMI_FUSED_TOPK16: bool = False
     VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
     VLLM_ROCE_HIERARCHICAL_MIN_SIZE: str = "64KB"
@@ -1492,6 +1493,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
     ),
+    "VLLM_DCP_SHARD_DRAFT": lambda: bool(int(os.getenv("VLLM_DCP_SHARD_DRAFT", "1"))),
     "VLLM_KIMI_FUSED_TOPK16": lambda: bool(
         int(os.getenv("VLLM_KIMI_FUSED_TOPK16", "0"))
     ),
