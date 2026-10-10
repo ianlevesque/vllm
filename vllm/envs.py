@@ -173,6 +173,9 @@ if TYPE_CHECKING:
     VLLM_SLEEP_RELEASE_TRANSPORT: bool = False
     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
     VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_KIMI_SHARD_QKV_A: bool = False
+    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_KIMI_FUSED_TOPK16: bool = False
     VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
     VLLM_ROCE_HIERARCHICAL_MIN_SIZE: str = "64KB"
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
@@ -1484,6 +1487,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
     "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
         int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
+    ),
+    "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
+    "VLLM_KIMI_FUSED_TOPK16": lambda: bool(
+        int(os.getenv("VLLM_KIMI_FUSED_TOPK16", "0"))
     ),
     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
