@@ -195,6 +195,17 @@ def restore_group_references(previous: dict[str, Any]) -> None:
         original.__dict__.clear()
         original.__dict__.update(fresh.__dict__)
         ps._groups[name] = weakref.ref(original)
+    # Fresh AgRs managers retain TP/DP coordinator references of their own.
+    # Rebind those to the canonical originals as well, so future generations
+    # cannot leave shadow coordinators holding retired transports.
+    for group in previous.values():
+        dc = group.device_communicator
+        for owner in (dc, getattr(dc, "all2all_manager", None)):
+            if owner is not None:
+                for name, value in list(vars(owner).items()):
+                    replacement = replacements.get(id(value))
+                    if replacement is not None:
+                        setattr(owner, name, replacement)
     for name, value in list(vars(ps).items()):
         replacement = replacements.get(id(value))
         if replacement is not None:

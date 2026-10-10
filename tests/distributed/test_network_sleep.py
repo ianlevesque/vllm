@@ -818,3 +818,144 @@ def test_failed_control_close_leaves_engine_closed_to_retry(context, monkeypatch
     with pytest.raises(RuntimeError, match="did not finish"):
         core_method("wake_up")(engine)
     assert events == ["check_network_sleep", "sleep_network"]
+
+
+def test_restore_rebinds_ags_manager_to_original_group_objects(context):
+    module, ps, _ = context
+    old_tp, old_dp = put(ps, "tp:0"), put(ps, "dp:0")
+    fresh_tp, fresh_dp = put(ps, "tp:0"), put(ps, "dp:0")
+    manager = SimpleNamespace(tp_group=fresh_tp, dp_group=fresh_dp)
+    ep = put(ps, "ep:0", transport=SimpleNamespace(all2all_manager=manager))
+    old_ep = ps.GroupCoordinator("ep:0", [0, 1], None)
+    ps._TP, ps._DP, ps._EP = fresh_tp, fresh_dp, ep
+    module.restore_group_references({"tp:0": old_tp, "dp:0": old_dp, "ep:0": old_ep})
+    assert ps._EP.device_communicator.all2all_manager is manager
+    assert manager.tp_group is old_tp and manager.dp_group is old_dp
+
+
+def test_actual_dp_busy_loop_pauses_before_control_close_and_never_uses_closed_group(
+    context, monkeypatch
+):
+    """Execute real pause/callback/DP loop code through consensus and sleeping idle."""
+    import queue
+    from functools import partial
+    from typing import Literal, get_args
+
+    module, _, _ = context
+    path = ROOT / "vllm/v1/engine/core.py"
+    tree = ast.parse(path.read_text())
+    selections = {
+        "EngineCore": {"sleep", "_finish_pause"},
+        "EngineCoreProc": {
+            "pause_scheduler",
+            "has_work",
+            "_process_input_queue",
+            "_notify_idle_state_callbacks",
+        },
+        "DPEngineCoreProc": {
+            "_pause_complete",
+            "_has_global_unfinished_reqs",
+            "run_busy_loop",
+        },
+    }
+    methods = []
+    for cls in tree.body:
+        if isinstance(cls, ast.ClassDef) and cls.name in selections:
+            for fn in cls.body:
+                if isinstance(fn, ast.FunctionDef) and fn.name in selections[cls.name]:
+                    fn.decorator_list = []
+                    methods.append(fn)
+    extracted = ast.ClassDef(
+        name="Engine", bases=[], keywords=[], body=methods, decorator_list=[]
+    )
+    prefix = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    events = []
+    group = object()
+
+    def sync(group_arg, **kw):
+        assert group_arg is group
+        assert kw == {"has_unfinished": False, "pending_pause": True}
+        events.append("consensus")
+        return False, True
+
+    scope = dict(
+        Any=object,
+        Future=Future,
+        partial=partial,
+        get_args=get_args,
+        PauseMode=Literal["abort", "keep", "wait"],
+        PauseState=SimpleNamespace(PAUSED_ALL=2, PAUSED_NEW=1),
+        envs=SimpleNamespace(VLLM_SLEEP_RELEASE_TRANSPORT=True),
+        queue=queue,
+        DEBUG=10,
+        ParallelConfig=SimpleNamespace(sync_dp_state=sync),
+        EngineCoreOutputs=lambda **kw: SimpleNamespace(**kw),
+        logger=SimpleNamespace(
+            info=lambda *a: None, debug=lambda *a: None, isEnabledFor=lambda _: False
+        ),
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[prefix, extracted], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        scope,
+    )
+    engine = scope["Engine"]()
+    engine.model_executor = SimpleNamespace(
+        is_sleeping=False, collective_rpc=lambda m: events.append(m)
+    )
+    engine.scheduler = SimpleNamespace(
+        set_pause_state=lambda state: None,
+        has_requests=lambda: False,
+        has_unfinished_requests=lambda: False,
+    )
+    engine.batch_queue = None
+    engine._idle_state_callbacks = []
+    engine.pending_pause, engine.engines_running, engine.ignore_start_dp_wave = (
+        False,
+        False,
+        False,
+    )
+    engine.dp_rank, engine.dp_size, engine.dp_group = 0, 4, group
+    engine.dp_sync_interval, engine.step_counter, engine.current_wave = 32, 0, 0
+    engine.input_queue, engine.output_queue, engine.aborts_queue = (
+        queue.Queue(),
+        queue.Queue(),
+        queue.Queue(),
+    )
+    engine.process_input_queue_block = False
+    engine.is_running = lambda: True
+    engine._maybe_publish_request_counts = lambda: None
+    engine._process_engine_step = lambda: False
+    engine.eep_scaling_state = None
+    engine.has_coordinator = True
+    engine.capture_iteration_details = lambda _: nullcontext(None)
+    engine.execute_dummy_batch = lambda: events.append("dummy")
+    remaining = iter([True, True, True, False])
+    engine._handle_shutdown = lambda: next(remaining)
+    utils = ModuleType("vllm.distributed.utils")
+    utils.stateless_destroy_torch_distributed_process_group = lambda g: events.append(
+        "control-close"
+    )
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    result = engine.sleep(level=0, mode="wait")
+    assert not result.done() and engine.pending_pause and engine.engines_running
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+    assert result.done() and result.exception() is None
+    assert events == [
+        "check_network_sleep",
+        "dummy",
+        "consensus",
+        "synchronize_device",
+        "sleep_network",
+        "control-close",
+    ]
+    assert engine.dp_group is None and not engine.engines_running
+    assert engine.ignore_start_dp_wave and engine._network_sleep_state == "sleeping"
