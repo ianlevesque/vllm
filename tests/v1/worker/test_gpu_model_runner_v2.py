@@ -8,10 +8,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
-from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import MultiModuleMTPSpeculator
-
 import vllm.v1.worker.gpu.model_runner as model_runner_module
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
@@ -32,6 +28,11 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+    MultiModuleMTPSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 
 

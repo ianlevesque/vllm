@@ -1580,7 +1580,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
-            input_batch.num_tokens
+            input_batch.num_tokens_after_padding
         )
         return block_tables, slot_mappings
 
@@ -1845,6 +1845,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # so MoE memory is measured and MoE kernels are exercised.
                 is_padding=not is_profile,
                 num_tokens_after_padding=batch_desc.num_tokens,
+                uniform_token_count=(
+                    dp_sync_state.uniform_token_count
+                    if dp_sync_state is not None
+                    else None
+                ),
             )
             if randomize_inputs:
                 # All-zero input_ids route every token to the same experts.

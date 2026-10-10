@@ -132,10 +132,16 @@ class InputBatch:
         max_query_len: int | None = None,
         is_padding: bool = True,
         num_tokens_after_padding: int | None = None,
+        uniform_token_count: int | None = None,
     ) -> "InputBatch":
-        assert 0 < num_reqs <= num_tokens
         if num_tokens_after_padding is None:
             num_tokens_after_padding = num_tokens
+        if uniform_token_count is not None:
+            # Idle DP ranks share the target's query width and request budget.
+            # Execution padding must not fabricate requests or widen queries.
+            assert uniform_token_count > 0
+            num_tokens = num_reqs * uniform_token_count
+        assert 0 < num_reqs <= num_tokens
         assert num_tokens <= num_tokens_after_padding <= input_buffers.max_num_tokens
         device = input_buffers.device
 
