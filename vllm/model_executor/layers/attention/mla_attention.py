@@ -1095,8 +1095,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+            # Native B12X owns query gather and output reduce/scatter.
+            impl_handles_dcp = bool(
+                not qrep_decode
+                and getattr(self.impl, "handles_dcp_query_and_output", False)
+            )
             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
-            if self.impl.dcp_world_size > 1:
+            if self.impl.dcp_world_size > 1 and not impl_handles_dcp:
                 assert self.dcp_manager is not None
                 if self.use_pcp:
                     if self.impl.dcp_world_size > self.impl.pcp_world_size:
@@ -1117,7 +1122,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
+            if self.impl.dcp_world_size > 1 and not impl_handles_dcp:
                 assert lse is not None
                 assert self.dcp_manager is not None
                 decode_metadata = getattr(attn_metadata, "decode", None)

@@ -178,6 +178,7 @@ def attn_res(
     block_write_idx: int,
     eps: float,
     output_norm_eps: float,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = prefix.shape
     assert prefix.stride(-1) == 1
@@ -186,11 +187,17 @@ def attn_res(
     assert norm_weight.stride(-1) == 1
     assert qk_weight.stride(-1) == 1
     assert output_norm_weight is None or output_norm_weight.stride(-1) == 1
+    if output is not None:
+        assert output.shape == prefix.shape
+        assert output.device == prefix.device
+        assert output.dtype == prefix.dtype
+        assert output.stride(-1) == 1
     # The native kernel covers every Kimi-K3 AttnRes variant on dense SM100
     # inputs. The op is only compiled under CUDA >= 13, so a device check alone
     # is not enough to know it exists.
     if (
-        hidden_size == 7168
+        output is None
+        and hidden_size == 7168
         and prefix.stride(0) == hidden_size
         and (delta is None or delta.stride(0) == hidden_size)
         and 0 <= num_blocks <= 8
@@ -211,7 +218,8 @@ def attn_res(
             eps,
             output_norm_eps,
         )
-    output = prefix.new_empty(prefix.shape)
+    if output is None:
+        output = prefix.new_empty(prefix.shape)
     # Tuned on GB300: source tiling helps decode, while one-source tiles scale
     # better for prefill.
     # Keep get_attn_res_triton_warmup_profiles in sync with these fallbacks.

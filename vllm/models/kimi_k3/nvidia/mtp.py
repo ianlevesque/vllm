@@ -10,6 +10,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -272,7 +273,10 @@ class KimiK3MTP(nn.Module):
         if use_full_rank_gate:
             stacked_params_mapping.append((".in_proj_qkvgfab", ".g_proj", 3))
         if getattr(self.config, "q_lora_rank", None) is not None:
-            if self.config.mla_use_output_gate:
+            if self.config.mla_use_output_gate and not (
+                envs.VLLM_KIMI_SHARD_QKV_A
+                and get_tensor_model_parallel_world_size() > 1
+            ):
                 stacked_params_mapping += [
                     (".fused_qkv_a_g_proj", ".q_a_proj", 0),
                     (".fused_qkv_a_g_proj", ".kv_a_proj_with_mqa", 1),

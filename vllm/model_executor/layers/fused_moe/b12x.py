@@ -83,16 +83,20 @@ def _b12x_moe_execution_plan(
 ) -> Any:
     fused_moe = _require_b12x_fused_moe()
 
-    return fused_moe.plan_execution(
-        num_tokens=max(int(tokens), 1),
-        num_topk=int(topk),
-        device=prepared.w1_fp4.device,
-        weight_plan=prepared.plan,
-        quant_mode=quant_mode,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
+    # plan_execution returns a logical launch descriptor, not caller-owned
+    # scratch. The public plan(Caps) contract owns scratch_specs and bind.
+    return fused_moe.plan(
+        fused_moe.Caps(
+            max_tokens=max(int(tokens), 1),
+            num_topk=int(topk),
+            device=prepared.w1_fp4.device,
+            weight_plan=prepared.plan,
+            quant_mode=quant_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
     )
 
 
@@ -446,8 +450,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             ):
                 return (
                     False,
-                    "MXFP4 W4A8 requires hidden size divisible by 256 and "
-                    "per-rank intermediate size divisible by 32",
+                    (
+                        "MXFP4 W4A8 requires hidden size divisible by 256 and "
+                        "per-rank intermediate size divisible by 32"
+                    ),
                 )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format

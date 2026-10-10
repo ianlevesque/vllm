@@ -1626,6 +1626,13 @@ package_data = {
 }
 
 
+package_data.setdefault("vllm", []).extend(
+    [
+        "models/kimi_k3/nvidia/ops/topk16.cu",
+    ]
+)
+
+
 def add_vllm_package_data(filename: str) -> None:
     vllm_files = package_data.setdefault("vllm", [])
     if filename not in vllm_files:

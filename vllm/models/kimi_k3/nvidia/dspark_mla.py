@@ -8,7 +8,9 @@ import torch
 import torch.nn as nn
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -30,6 +32,8 @@ from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 _GROUPED_KV_CACHE_DTYPES = frozenset(
     {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
@@ -56,6 +60,32 @@ def _duplicate_context_kv_weights(
         fused_weight = weight.detach()
         fused_weight.shard_id = layer_idx
         yield f"context_kv_proj.{param_name}", fused_weight
+
+
+def _fill_compact_rope_cache(
+    positions: torch.Tensor,
+    inv_freq: torch.Tensor,
+    freqs_workspace: torch.Tensor,
+    cache_workspace: torch.Tensor,
+    *,
+    mscale: float,
+) -> torch.Tensor:
+    """Materialize RoPE rows consumed by one K3 draft forward."""
+    num_positions = int(positions.shape[0])
+    if num_positions > int(freqs_workspace.shape[0]):
+        raise ValueError(
+            "K3 DSpark compact RoPE workspace is too small: "
+            f"positions={num_positions}, capacity={freqs_workspace.shape[0]}."
+        )
+    freqs = freqs_workspace[:num_positions]
+    cache = cache_workspace[:num_positions]
+    half_dim = int(inv_freq.shape[0])
+    torch.mul(positions[:, None], inv_freq[None, :], out=freqs)
+    torch.cos(freqs, out=cache[:, :half_dim])
+    torch.sin(freqs, out=cache[:, half_dim:])
+    if mscale != 1.0:
+        cache.mul_(mscale)
+    return cache
 
 
 class K3DSparkDecoderLayer(nn.Module):
@@ -108,6 +138,7 @@ class K3DSparkDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             # First layer: hidden_states is the (already reduced) embedding.
@@ -121,6 +152,7 @@ class K3DSparkDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            rope_cos_sin_cache=rope_cos_sin_cache,
         )
         hidden_states, residual = fused_allreduce_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
@@ -206,6 +238,99 @@ class K3DSparkModel(nn.Module):
         self._max_num_context_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self._compact_rope_enabled = bool(envs.VLLM_DSPARK_COMPACT_ROPE)
+        if self._compact_rope_enabled:
+            self._init_compact_rope()
+
+    def _init_compact_rope(self) -> None:
+        rotary_modules = [layer.self_attn.rotary_emb for layer in self.layers]
+        if not rotary_modules or any(rotary is None for rotary in rotary_modules):
+            raise RuntimeError("K3 DSpark compact RoPE requires rotary draft layers.")
+        rotary = rotary_modules[0]
+        assert rotary is not None
+        if any(candidate is not rotary for candidate in rotary_modules[1:]):
+            raise RuntimeError(
+                "K3 DSpark compact RoPE requires all draft layers to share one "
+                "immutable rotary embedding."
+            )
+        if not hasattr(rotary, "scaling_factor"):
+            raise TypeError(
+                "K3 DSpark compact RoPE requires a YaRN rotary embedding, got "
+                f"{type(rotary).__name__}."
+            )
+
+        full_cache = rotary.cos_sin_cache
+        if full_cache.dtype != torch.float32 or full_cache.ndim != 2:
+            raise TypeError(
+                "K3 DSpark compact RoPE requires a 2-D fp32 source cache, got "
+                f"shape={tuple(full_cache.shape)}, dtype={full_cache.dtype}."
+            )
+        with torch.device(full_cache.device):
+            inv_freq = rotary._compute_inv_freq(rotary.scaling_factor)  # noqa: SLF001
+        inv_freq = inv_freq.to(dtype=torch.float32)
+        half_dim = int(inv_freq.shape[0])
+        if int(full_cache.shape[1]) != 2 * half_dim:
+            raise ValueError(
+                "K3 DSpark compact RoPE frequency width does not match its "
+                f"source table: inv_freq={half_dim}, cache={full_cache.shape[1]}."
+            )
+
+        self.register_buffer("_compact_rope_inv_freq", inv_freq, persistent=False)
+        self.register_buffer(
+            "_compact_rope_freqs",
+            torch.empty(
+                (self._max_num_context_tokens, half_dim),
+                dtype=torch.float32,
+                device=full_cache.device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_compact_rope_cache",
+            torch.empty(
+                (self._max_num_context_tokens, 2 * half_dim),
+                dtype=torch.float32,
+                device=full_cache.device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_compact_rope_positions",
+            torch.arange(
+                self._max_num_context_tokens,
+                dtype=torch.int64,
+                device=full_cache.device,
+            ),
+            persistent=False,
+        )
+        self._compact_rope_mscale = float(rotary.mscale)
+
+        released_bytes = full_cache.numel() * full_cache.element_size()
+        rotary.cos_sin_cache = torch.empty(
+            (0, 2 * half_dim), dtype=torch.float32, device=full_cache.device
+        )
+        logger.info_once(
+            "K3 DSpark compact RoPE released %.2f MiB/rank; materializing at "
+            "most %d fp32 rows per forward.",
+            released_bytes / (1024**2),
+            self._max_num_context_tokens,
+        )
+
+    def _get_rope_inputs(
+        self, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rotary = self.layers[0].self_attn.rotary_emb
+        assert rotary is not None
+        if not self._compact_rope_enabled:
+            return positions, rotary.cos_sin_cache
+        cache = _fill_compact_rope_cache(
+            positions,
+            self._compact_rope_inv_freq,
+            self._compact_rope_freqs,
+            self._compact_rope_cache,
+            mscale=self._compact_rope_mscale,
+        )
+        return self._compact_rope_positions[: positions.shape[0]], cache
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -293,7 +418,8 @@ class K3DSparkModel(nn.Module):
             ((num_layers * self._max_num_context_tokens,), torch.int64),
         )
         repeated_positions = repeated_positions[: num_layers * num_ctx]
-        repeated_positions.view(num_layers, num_ctx).copy_(context_positions)
+        rope_positions, cos_sin_cache = self._get_rope_inputs(context_positions)
+        repeated_positions.view(num_layers, num_ctx).copy_(rope_positions)
         # Keep the single-tensor context RoPE on vLLM's optimized CUDA op;
         # DeepSeek YaRN's FlashInfer wrapper assumes a non-null key tensor.
         rotary_emb = self.layers[0].self_attn.rotary_emb
@@ -303,7 +429,7 @@ class K3DSparkModel(nn.Module):
             all_k_pe_flat,
             None,
             rotary_emb.head_size,
-            rotary_emb.cos_sin_cache,
+            cos_sin_cache,
             rotary_emb.is_neox_style,
         )
         all_k_pe = all_k_pe_flat.view(num_layers, num_ctx, 1, self._context_rope_dim)
@@ -416,6 +542,7 @@ class K3DSparkModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
 
+        positions, rope_cos_sin_cache = self._get_rope_inputs(positions)
         hidden_states = inputs_embeds
         residual = None
         for layer in self.layers:
@@ -423,6 +550,7 @@ class K3DSparkModel(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                rope_cos_sin_cache=rope_cos_sin_cache,
             )
         hidden_states, _ = fused_allreduce_rms_norm(
             hidden_states, residual, self.final_norm

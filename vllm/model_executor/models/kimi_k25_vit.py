@@ -27,7 +27,6 @@ from vllm.model_executor.layers.fusion.mm_input_norm import IdentityInputNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -844,7 +843,12 @@ def mm_projector_forward(mm_projector: torch.nn.Module, vt_output: list[torch.Te
     """Apply MM projector to vision tower outputs."""
     num_embedding_list = [x.shape[0] for x in vt_output]
     batched = torch.cat(vt_output, dim=0)
-    projector_dtype = next(mm_projector.parameters()).dtype
+    projector_norm = getattr(mm_projector, "pre_norm", None)
+    if projector_norm is None:
+        projector_norm = getattr(mm_projector, "post_norm", None)
+    projector_dtype = (
+        projector_norm.weight.dtype if projector_norm is not None else batched.dtype
+    )
     if batched.dtype != projector_dtype:
         batched = batched.to(projector_dtype)
     proj_out = mm_projector(batched)
@@ -908,18 +912,20 @@ class KimiK25MultiModalProjector(nn.Module):
         self.hidden_size = config.hidden_size * merge_h * merge_w
 
         if self.mm_projector_type == "patchmergerv2":
-            self.linear_1 = ReplicatedLinear(
+            self.linear_1 = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=use_data_parallel,
                 prefix=f"{prefix}.linear_1",
             )
-            self.linear_2 = ReplicatedLinear(
+            self.linear_2 = RowParallelLinear(
                 self.hidden_size,
                 out_hidden_size,
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=use_data_parallel,
                 prefix=f"{prefix}.linear_2",
             )
             self.post_norm = torch.nn.RMSNorm(
@@ -930,18 +936,20 @@ class KimiK25MultiModalProjector(nn.Module):
             return
 
         self.pre_norm = torch.nn.LayerNorm(config.hidden_size, eps=1e-5)
-        self.linear_1 = ReplicatedLinear(
+        self.linear_1 = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
+            disable_tp=use_data_parallel,
             prefix=f"{prefix}.linear_1",
         )
-        self.linear_2 = ReplicatedLinear(
+        self.linear_2 = RowParallelLinear(
             self.hidden_size,
             out_hidden_size,
             bias=True,
             quant_config=quant_config,
+            disable_tp=use_data_parallel,
             prefix=f"{prefix}.linear_2",
         )
         self.act = GELUActivation()

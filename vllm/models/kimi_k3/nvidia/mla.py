@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -45,7 +46,10 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
@@ -102,7 +106,12 @@ from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    get_kv_quant_mode,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
@@ -118,6 +127,67 @@ _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Apply the sigmoid output gate to a precomputed gate projection."""
     return attn_out * gate.sigmoid()
+
+
+def _restore_merged_output_order(
+    rank_major_output: torch.Tensor,
+    output_sizes: list[int],
+    tp_size: int,
+) -> torch.Tensor:
+    """Convert rank-major merged shards into logical projection order."""
+    if tp_size == 1:
+        return rank_major_output
+    if any(size % tp_size for size in output_sizes):
+        raise ValueError(
+            f"Merged output sizes {output_sizes} must be divisible by TP={tp_size}"
+        )
+    local_sizes = [size // tp_size for size in output_sizes]
+    local_total = sum(local_sizes)
+    expected_width = local_total * tp_size
+    if rank_major_output.shape[-1] != expected_width:
+        raise ValueError(
+            "Unexpected gathered merged projection width: "
+            f"got {rank_major_output.shape[-1]}, expected {expected_width}"
+        )
+    rank_major = rank_major_output.unflatten(-1, (tp_size, local_total))
+    logical_local_shards = rank_major.split(local_sizes, dim=-1)
+    return torch.cat(
+        [shards.flatten(-2) for shards in logical_local_shards],
+        dim=-1,
+    )
+
+
+class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Merged column projection with one gather and logical-shard reorder."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, output_bias = super().forward(x)
+        if self.tp_size == 1:
+            return output_parallel, output_bias
+        rank_major_output = tensor_model_parallel_all_gather(output_parallel, dim=-1)
+        output = _restore_merged_output_order(
+            rank_major_output,
+            self.output_sizes,
+            self.tp_size,
+        )
+        return output, output_bias
 
 
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
@@ -152,6 +222,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.kv_lora_rank = kv_lora_rank
         self.use_output_gate = use_output_gate
         self.non_causal_multi_token_decode = non_causal_multi_token_decode
+        self.draft_kv_window = (
+            int(envs.VLLM_DSPARK_DRAFT_KV_WINDOW)
+            if non_causal_multi_token_decode
+            else 0
+        )
+        if self.draft_kv_window < 0:
+            raise ValueError("VLLM_DSPARK_DRAFT_KV_WINDOW must be non-negative")
         # Latent "head" seen by the attention kernel / KV cache.
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.scale = self.qk_head_dim**-0.5
@@ -209,11 +286,32 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.aux_stream: torch.cuda.Stream | None = None
         self._gate_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
 
+        # Shard auxiliary Q/KV projections only for the qualified opt-in path.
+        # The upstream fused-gate layout remains the default.
+        self.shard_qkv_a = envs.VLLM_KIMI_SHARD_QKV_A and tp_size > 1
         # Kimi-K3: low-rank Q and KV projections share one input projection.
         if self.q_lora_rank is not None:
             # The latent Q and KV shards are replicated across TP ranks. Their
             # TP splitting happens in q_b_proj and kv_b_proj instead.
-            if use_output_gate:
+            if self.shard_qkv_a:
+                self.fused_qkv_a_proj = KimiShardedMergedColumnParallelLinear(
+                    self.hidden_size,
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
+                if use_output_gate:
+                    self.g_proj = ColumnParallelLinear(
+                        self.hidden_size,
+                        self.num_heads * self.v_head_dim,
+                        bias=False,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.g_proj",
+                    )
+                    if aux_stream is not None:
+                        self.aux_stream = aux_stream
+                        self._gate_events = (torch.cuda.Event(), torch.cuda.Event())
+            elif use_output_gate:
                 # The output gate is shard 2 of the same input projection.
                 self.fused_qkv_a_g_proj = KimiK3MergedQKVGateLinear(
                     hidden_size=self.hidden_size,
@@ -418,8 +516,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # TODO: Remove this mypy workaround once the K3 PR is fully merged.
-        return MLAAttentionSpec(  # type: ignore[call-arg]
+        kwargs = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             max_tp_shards=1,
@@ -431,6 +528,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
+        if self.draft_kv_window:
+            if self.draft_kv_window < vllm_config.cache_config.block_size:
+                raise ValueError(
+                    "VLLM_DSPARK_DRAFT_KV_WINDOW must be at least one KV block"
+                )
+            return SlidingWindowMLASpec(**kwargs, sliding_window=self.draft_kv_window)
+        return MLAAttentionSpec(**kwargs)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Absorb ``kv_b_proj`` into decode-time ``W_UK_T`` / ``W_UV`` bmm weights.
@@ -511,6 +615,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         qkv_lora: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Expand q-LoRA output and run attention."""
         q_lora_rank = self.q_lora_rank
@@ -532,18 +637,47 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._attention(positions, q, kv_c_normed, k_pe.unsqueeze(1), attn_out)
+        self._attention(
+            positions, q, kv_c_normed, k_pe.unsqueeze(1), attn_out, rope_cos_sin_cache
+        )
         return attn_out
 
     def _forward_q_lora(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the q-LoRA path, including gate overlap when eligible."""
         q_lora_rank = self.q_lora_rank
         assert q_lora_rank is not None
         qkv_a_rows = q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+
+        if self.shard_qkv_a:
+            assert self.fused_qkv_a_proj is not None
+
+            def project_attention():
+                return self._apply_q_lora_attention(
+                    positions,
+                    hidden_states,
+                    self.fused_qkv_a_proj(hidden_states)[0],
+                    rope_cos_sin_cache,
+                )
+
+            if self.g_proj is None:
+                return project_attention(), None
+            if (
+                self._gate_events is not None
+                and hidden_states.shape[0] < _GATE_MULTI_STREAM_TOKEN_THRESHOLD
+            ):
+                return maybe_execute_in_parallel(
+                    project_attention,
+                    lambda: self.g_proj(hidden_states)[0],
+                    self._gate_events[0],
+                    self._gate_events[1],
+                    self.aux_stream,
+                )
+            return project_attention(), self.g_proj(hidden_states)[0]
 
         # run g_proj in aux_stream
         if (
@@ -561,6 +695,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     positions,
                     hidden_states,
                     self._unquantized_gemm(hidden_states, qkv_a_weight),
+                    rope_cos_sin_cache,
                 ),
                 lambda: self._unquantized_gemm(hidden_states, gate_weight),
                 start_event,
@@ -581,13 +716,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             qkv_lora = qkv_a_proj(hidden_states)[0]
             gate = None
 
-        attn_out = self._apply_q_lora_attention(positions, hidden_states, qkv_lora)
+        attn_out = self._apply_q_lora_attention(
+            positions, hidden_states, qkv_lora, rope_cos_sin_cache
+        )
         return attn_out, gate
 
     def _forward_full_rank_q(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the full-rank Q path with an optional sequential gate."""
         q_proj = self.q_proj
@@ -604,7 +742,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._attention(positions, q, kv_c_normed, k_pe.unsqueeze(1), attn_out)
+        self._attention(
+            positions, q, kv_c_normed, k_pe.unsqueeze(1), attn_out, rope_cos_sin_cache
+        )
 
         gate = self.g_proj(hidden_states)[0] if self.g_proj is not None else None
         return attn_out, gate
@@ -613,11 +753,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.q_lora_rank is None:
-            attn_out, gate = self._forward_full_rank_q(positions, hidden_states)
+            attn_out, gate = self._forward_full_rank_q(
+                positions, hidden_states, rope_cos_sin_cache
+            )
         else:
-            attn_out, gate = self._forward_q_lora(positions, hidden_states)
+            attn_out, gate = self._forward_q_lora(
+                positions, hidden_states, rope_cos_sin_cache
+            )
 
         if gate is not None:
             attn_out = _gate_sigmoid_mul(attn_out, gate)
@@ -635,6 +780,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         attn_out: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_by_layer = forward_context.attn_metadata
@@ -647,6 +793,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         num_actual_toks = attn_metadata.num_actual_tokens
+        # Persistent graph padding must not enter recurrent downstream state.
+        if num_actual_toks < attn_out.shape[0]:
+            attn_out[num_actual_toks:].zero_()
         slot_mapping_by_layer = forward_context.slot_mapping
         assert isinstance(slot_mapping_by_layer, dict)
         slot_mapping = slot_mapping_by_layer[self.layer_name]
@@ -662,7 +811,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if self.rotary_emb is not None:
             # Pass the fp32 cos/sin table straight to the fused epilogue (it reads
             # fp32 and does the RoPE math in fp32) -- no per-forward dtype cast.
-            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            cos_sin_cache = (
+                self.rotary_emb.cos_sin_cache
+                if rope_cos_sin_cache is None
+                else rope_cos_sin_cache
+            )
             rope_positions = positions
 
         # Decode tokens are laid out first, prefill tokens after. The fused
@@ -705,14 +858,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
             )
-            if self.dcp_world_size > 1:
+            impl_handles_dcp = getattr(self.impl, "handles_dcp_query_and_output", False)
+            if self.dcp_world_size > 1 and not impl_handles_dcp:
                 assert self.dcp_manager is not None
                 assert self.dcp_manager.query_gather is not None
                 mqa_q = self.dcp_manager.query_gather(mqa_q)
             latent_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self
             )
-            if self.dcp_world_size > 1:
+            if self.dcp_world_size > 1 and not impl_handles_dcp:
                 assert lse is not None
                 assert self.dcp_manager is not None
                 assert attn_metadata.decode is not None
