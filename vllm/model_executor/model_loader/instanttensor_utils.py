@@ -39,6 +39,8 @@ def instanttensor_loading_group(world_group: Any) -> Generator[Any, None, None]:
 
     import torch.distributed as dist
 
+    from vllm.distributed.utils import get_distributed_timeout_or_none
+
     # A device-bound default group can make new_group split its communicator.
     # Such a child's channels are capped by its parent's channel count.
     if dist.group.WORLD.bound_device_id is not None:
@@ -53,7 +55,9 @@ def instanttensor_loading_group(world_group: Any) -> Generator[Any, None, None]:
         list(world_group.ranks),
         backend="nccl",
         pg_options=options,
-        timeout=world_group.device_group.options._timeout,
+        # Match GroupCoordinator's configured NCCL timeout (or Torch's
+        # backend default). Generic ProcessGroup has no .options property.
+        timeout=get_distributed_timeout_or_none(),
         group_desc="instanttensor:loading",
     )
     try:

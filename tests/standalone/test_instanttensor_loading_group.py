@@ -26,9 +26,9 @@ def groups(monkeypatch):
     world = SimpleNamespace(
         world_size=16,
         ranks=list(range(16)),
-        device_group=SimpleNamespace(
-            options=SimpleNamespace(_timeout=timedelta(seconds=90))
-        ),
+        # Current Torch returns a generic ProcessGroup, which has no options
+        # property. Do not model the old backend-specific API here.
+        device_group=object(),
     )
     private = object()
     created, destroyed = [], []
@@ -48,6 +48,13 @@ def groups(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(distributed=dist))
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.utils",
+        SimpleNamespace(
+            get_distributed_timeout_or_none=lambda: timedelta(seconds=90)
+        ),
+    )
     return world, private, default, created, destroyed
 
 
@@ -61,7 +68,7 @@ def test_default_reuses_but_does_not_destroy_inference_group(groups):
 def test_loading_group_has_independent_options_and_same_membership(groups, monkeypatch):
     world, private, _, created, destroyed = groups
     monkeypatch.setenv("VLLM_INSTANTTENSOR_NCCL_CTAS", "8")
-    before = dict(world.device_group.options.__dict__)
+    before = world.device_group
     with utils.instanttensor_loading_group(world) as group:
         assert group is private
         assert destroyed == []
@@ -72,7 +79,21 @@ def test_loading_group_has_independent_options_and_same_membership(groups, monke
     assert options["pg_options"].config.min_ctas == 8
     assert options["pg_options"].config.max_ctas == 8
     assert options["timeout"] == timedelta(seconds=90)
-    assert world.device_group.options.__dict__ == before
+    assert world.device_group is before
+
+
+def test_default_timeout_uses_torch_backend_default(groups, monkeypatch):
+    world, private, _, created, destroyed = groups
+    monkeypatch.setenv("VLLM_INSTANTTENSOR_NCCL_CTAS", "8")
+    monkeypatch.setattr(
+        sys.modules["vllm.distributed.utils"],
+        "get_distributed_timeout_or_none",
+        lambda: None,
+    )
+    with utils.instanttensor_loading_group(world) as group:
+        assert group is private
+    assert created[0][1]["timeout"] is None
+    assert destroyed == [private]
 
 
 def test_private_group_is_destroyed_when_loading_fails(groups, monkeypatch):
