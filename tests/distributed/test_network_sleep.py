@@ -18,6 +18,55 @@ import pytest
 ROOT = Path(__file__).parents[2]
 
 
+@pytest.mark.parametrize("timeout", [None, timedelta(seconds=123)])
+@pytest.mark.parametrize("backend,available", [("nccl", True), ("gloo", True), ("nccl", False)])
+def test_actual_distributed_wake_resolves_backend_timeout(monkeypatch, timeout, backend, available):
+    """Execute the installed initialization body with production's unset timeout."""
+    path = ROOT / "vllm/distributed/parallel_state.py"
+    fn = next(n for n in ast.parse(path.read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "init_distributed_environment")
+    config = ModuleType("vllm.config")
+    config.get_current_vllm_config_or_none = lambda: None
+    network = ModuleType("vllm.distributed.network_sleep")
+    calls, defaults = [], []
+    store = object()
+    expected_backend = backend if available else "gloo"
+    default_timeout = timedelta(minutes=10 if expected_backend == "nccl" else 30)
+
+    def resolve_default(selected):
+        defaults.append(selected)
+        return default_timeout
+
+    def rendezvous(*args):
+        calls.append(args)
+        return store
+
+    network.transport_rendezvous_store = rendezvous
+    monkeypatch.setitem(sys.modules, "vllm.config", config)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.network_sleep", network)
+    initialized = []
+    scope = {
+        "timedelta": timedelta,
+        "logger": SimpleNamespace(**{n: lambda *a: None for n in ("debug", "info", "warning")}),
+        "Backend": str, "_get_default_timeout": resolve_default,
+        "torch": SimpleNamespace(distributed=SimpleNamespace(
+            is_initialized=lambda: False, is_backend_available=lambda b: available,
+            is_gloo_available=lambda: True, get_world_size=lambda: 16,
+            init_process_group=lambda **kwargs: initialized.append(kwargs))),
+        "envs": SimpleNamespace(VLLM_DISTRIBUTED_USE_SPLIT_GROUP=False),
+        "_WORLD": None, "_NODE_COUNT": None, "_INNER_DP_WORLD": None,
+        "init_world_group": lambda *a: SimpleNamespace(cpu_group=object()),
+        "_node_count": lambda group: 16,
+    }
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), scope)
+    scope[fn.name](16, 3, "tcp://example:25000", 0, backend, timeout, 2)
+    assert calls == [("tcp://example:25000", 3, 16,
+                      timeout if timeout is not None else default_timeout, 2, None)]
+    assert defaults == ([expected_backend] if timeout is None else [])
+    assert initialized == [dict(backend=expected_backend, init_method=None, store=store,
+                               world_size=16, rank=3, timeout=timeout)]
+
+
 def test_graph_release_uses_installed_k3_manager_api_and_retains_cache(context, monkeypatch):
     module, _, _ = context
     tree = ast.parse((ROOT / "vllm/v1/worker/gpu/cudagraph_utils.py").read_text())
