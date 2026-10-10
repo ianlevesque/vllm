@@ -1636,10 +1636,19 @@ class MLADCPManager:
             )
             self._kv_gather = direct_workspace.gather
         else:
-            self._kv_gather = functools.partial(
-                torch.distributed.all_gather_into_tensor,
-                group=self.group.device_group,
-            )
+            self._kv_gather = self._torch_kv_gather
+
+    def _torch_kv_gather(
+        self,
+        gathered_kv: torch.Tensor,
+        local_kv: torch.Tensor,
+    ) -> object:
+        # The coordinator survives retained network sleep, but its raw
+        # ProcessGroup is destroyed and replaced. Resolve it at call time;
+        # an initialized layer must not retain the aborted transport.
+        return torch.distributed.all_gather_into_tensor(
+            gathered_kv, local_kv, group=self.group.device_group
+        )
 
     def kv_gather(
         self,
