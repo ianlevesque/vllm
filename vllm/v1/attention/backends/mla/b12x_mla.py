@@ -635,6 +635,7 @@ class B12xMLABackend(MLACommonBackend):
 
 class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_dcp: bool = True
     supports_quant_query_input: bool = True
     supports_dcp_quant_query_input: bool = True
     handles_dcp_query_and_output: bool = True
