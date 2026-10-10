@@ -83,20 +83,16 @@ def _b12x_moe_execution_plan(
 ) -> Any:
     fused_moe = _require_b12x_fused_moe()
 
-    # plan_execution returns a logical launch descriptor, not caller-owned
-    # scratch. The public plan(Caps) contract owns scratch_specs and bind.
-    return fused_moe.plan(
-        fused_moe.Caps(
-            max_tokens=max(int(tokens), 1),
-            num_topk=int(topk),
-            device=prepared.w1_fp4.device,
-            weight_plan=prepared.plan,
-            quant_mode=quant_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        )
+    return fused_moe.plan_execution(
+        num_tokens=max(int(tokens), 1),
+        num_topk=int(topk),
+        device=prepared.w1_fp4.device,
+        weight_plan=prepared.plan,
+        quant_mode=quant_mode,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
 
 

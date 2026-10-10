@@ -191,12 +191,15 @@ def test_dcp_lengths_cover_every_token_once(size, interleave):
     torch.testing.assert_close(sum(all_outputs), global_lengths)
 
 
-def test_b12x_adapter_requests_bindable_scratch_plan(monkeypatch):
+def test_b12x_adapter_scratch_and_warmup_use_distinct_public_plans(monkeypatch):
+    from types import MethodType
+
     fused_moe = pytest.importorskip("b12x.moe.fused_moe")
     from b12x.moe.fused_moe import _impl
 
-    # CPU planner gate with the Spark SM count supplied explicitly. This does
-    # not compile or execute a GPU kernel.
+    # Exercise actual B12X planning and actual adapter methods without CUDA
+    # execution. Warmup needs the logical descriptor; apply needs bindable
+    # caller-owned scratch. Conflating these broke startup before execution.
     monkeypatch.setattr(_impl, "get_num_sm", lambda _: 40)
     weight_plan = fused_moe.plan_weights(
         quant_modes="w4a16",
@@ -204,29 +207,70 @@ def test_b12x_adapter_requests_bindable_scratch_plan(monkeypatch):
         activation="situ",
         params_dtype=torch.bfloat16,
         num_experts=896,
-        hidden_size=2048,
+        hidden_size=3584,
         intermediate_size=192,
         w13_layout="w31",
+    )
+    prepared = SimpleNamespace(
+        w1_fp4=torch.empty(0),
+        plan=weight_plan,
+        num_experts=896,
+        hidden_size=3584,
     )
     ns = load_source(
         "vllm/model_executor/layers/fused_moe/b12x.py",
         ["_b12x_moe_execution_plan", "_b12x_scratch_nbytes"],
         _require_b12x_fused_moe=lambda: fused_moe,
     )
-    plan = ns._b12x_moe_execution_plan(
+    logical = ns._b12x_moe_execution_plan(
         tokens=9,
         topk=16,
-        prepared=SimpleNamespace(w1_fp4=torch.empty(0), plan=weight_plan),
+        prepared=prepared,
         quant_mode="w4a16",
         apply_router_weight_on_input=False,
         swiglu_limit=None,
         swiglu_alpha=None,
         swiglu_beta=None,
     )
+    assert logical.implementation
+    assert logical.execution
+    launches = []
+
+    def record_launch(**kwargs):
+        assert callable(kwargs["plan"].bind)
+        assert kwargs["scratch"].numel() == ns._b12x_scratch_nbytes(kwargs["plan"])
+        launches.append(kwargs["hidden_states"].shape[0])
+
+    methods = load_source(
+        "vllm/model_executor/layers/fused_moe/b12x.py",
+        ["_plan", "warmup_launches"],
+        parent="B12xExperts",
+        _require_b12x_fused_moe=lambda: fused_moe,
+        _is_current_stream_capturing=lambda: False,
+        _b12x_moe_execution_plan=ns._b12x_moe_execution_plan,
+        _b12x_scratch_nbytes=ns._b12x_scratch_nbytes,
+        _run_b12x_moe_plan=record_launch,
+    )
+    adapter = SimpleNamespace(
+        _plans={},
+        _quant_mode="w4a16",
+        _prepared=lambda: prepared,
+        _swiglu_params=lambda _: (None, None, None),
+        moe_config=SimpleNamespace(in_dtype=torch.bfloat16, experts_per_token=16),
+    )
+    adapter._plan = MethodType(methods._plan, adapter)
+    plan = adapter._plan(tokens=9, topk=16, activation="situ")
     assert callable(plan.bind)
     assert ns._b12x_scratch_nbytes(plan) > 0
     assert plan.caps.weight_plan == weight_plan
     assert plan.caps.max_tokens == 9
+    assert plan.caps.frozen
+    assert adapter._plan(tokens=9, topk=16, activation="situ") is plan
+    layer = SimpleNamespace(activation="situ", apply_router_weight_on_input=False)
+    count = methods.warmup_launches(adapter, layer, token_counts=(0, 1, 9, 16, 4096, 9))
+    assert count == len(launches) and count > 0
+    assert len(set(launches)) == count
+    assert set(launches) <= {1, 9, 16, 4096}
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
