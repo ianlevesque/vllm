@@ -34,12 +34,16 @@ def get_drafter_hidden_states(
 
 def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
     """Avoid collectives that include PP ranks without a draft model."""
-    if get_pp_group().world_size > 1 and load_config.load_format == "fastsafetensors":
+    if get_pp_group().world_size > 1 and load_config.load_format in (
+        "fastsafetensors",
+        "instanttensor",
+    ):
         logger.warning_once(
-            "fastsafetensors cannot load a draft model instantiated on only "
+            "%s cannot load a draft model instantiated on only "
             "one pipeline stage; falling back to the standard safetensors "
             "loader for the draft model. The target model still uses "
-            "fastsafetensors."
+            "the configured loader.",
+            load_config.load_format,
         )
         return replace(load_config, load_format="auto")
     return load_config

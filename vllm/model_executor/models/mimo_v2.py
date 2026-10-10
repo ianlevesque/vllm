@@ -897,7 +897,10 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
         prefix, qkv_kind = name.rsplit(".", 1)
         entry = fp8_qkv_proj_dict.setdefault(prefix, {})
-        entry[qkv_kind] = tensor
+        # Streaming loaders may recycle their staging tensor before the partner
+        # arrives (including across load_weights calls). The pending pair owns
+        # the first half until both tensors have been sharded together.
+        entry[qkv_kind] = tensor.clone()
         if "weight" not in entry or "weight_scale_inv" not in entry:
             # Still waiting for the other param.
             return True

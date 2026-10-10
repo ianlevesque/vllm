@@ -311,7 +311,9 @@ class MiMoV2MTP(nn.Module):
                     ):
                         continue
                     entry = pending_qkv_proj.setdefault(prefix, {})
-                    entry[kind] = loaded_weight
+                    # A streaming loader may reuse staging storage between
+                    # calls; pending halves need independent ownership.
+                    entry[kind] = loaded_weight.clone()
                     if "weight" not in entry or "weight_scale_inv" not in entry:
                         # Waiting for the other half of the fused projection.
                         continue

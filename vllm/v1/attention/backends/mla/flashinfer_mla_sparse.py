@@ -236,9 +236,12 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                     "FLASHINFER_MLA_SPARSE_SM120 requires a model with "
                     "index_topk config"
                 )
-            if int(index_topk) != 2048:
+            # FlashInfer 0.7.0.post1 accepts a runtime sparse width. GLM's
+            # kpool appends tail tokens and pads that width, so raw index_topk
+            # need not be 2048 (the qualified TP16 profile uses 2044).
+            if int(index_topk) <= 0:
                 return (
-                    "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "
+                    "FLASHINFER_MLA_SPARSE_SM120 requires a positive index_topk; "
                     f"got {index_topk}"
                 )
         return None
