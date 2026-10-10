@@ -269,7 +269,7 @@ class Worker(WorkerBase):
             return self.network_sleep_status()
         check_network_sleep(self)
         self._network_sleep_state = "closing"
-        self.synchronize_device()
+        torch.accelerator.synchronize()
         self._network_sleep_groups = live_groups()
         clear_collective_graphs(self)
         close_transport(self._network_sleep_groups)
@@ -303,7 +303,7 @@ class Worker(WorkerBase):
             )
             restore_group_references(self._network_sleep_groups)
             self.model_runner.capture_model()
-        self.synchronize_device()
+        torch.accelerator.synchronize()
         self._network_sleep_groups = {}
         self._network_sleep_state = "active"
         logger.info(

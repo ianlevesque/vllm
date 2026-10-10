@@ -4,9 +4,11 @@
 
 import ast
 import importlib.util
+import os
 import sys
 import weakref
 from concurrent.futures import Future
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -257,6 +259,66 @@ def test_failed_transport_restore_does_not_resume_scheduler():
     with pytest.raises(RuntimeError, match="restore failed"):
         core_method("wake_up")(engine)
     assert not events
+
+
+def worker_methods(scope):
+    path = ROOT / "vllm/v1/worker/gpu_worker.py"
+    cls = next(
+        n for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "Worker"
+    )
+    names = {"network_sleep_status", "sleep_network", "wake_network"}
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    extracted = ast.ClassDef(
+        name="Worker", bases=[], keywords=[], body=methods, decorator_list=[]
+    )
+    tree = ast.fix_missing_locations(ast.Module(body=[extracted], type_ignores=[]))
+    scope.update(Any=object, os=os, logger=SimpleNamespace(info=lambda *args: None))
+    exec(compile(tree, str(path), "exec"), scope)
+    return scope["Worker"]()
+
+
+def test_real_worker_sleep_wake_synchronizes_and_retains_model_and_cache(
+    context, monkeypatch
+):
+    module, _, _ = context
+    events = []
+    groups = {"tp:0": object()}
+    module.check_network_sleep = lambda worker: events.append("check")
+    module.live_groups = lambda: groups
+    module.clear_collective_graphs = lambda worker: events.append("graphs-released")
+    module.close_transport = lambda original: events.append(("close", original))
+    module.restore_group_references = lambda original: events.append(("restore", original))
+    monkeypatch.setitem(sys.modules, "vllm.distributed.network_sleep", module)
+    worker = worker_methods({
+        "torch": SimpleNamespace(accelerator=SimpleNamespace(
+            synchronize=lambda: events.append("synchronize")
+        )),
+        "set_current_vllm_config": lambda config: nullcontext(),
+        "init_worker_distributed_environment": lambda *args, **kwargs:
+            events.append(("init", kwargs["network_wake_generation"])),
+        "current_platform": SimpleNamespace(dist_backend="nccl"),
+    })
+    worker.rank, worker.local_rank, worker.distributed_init_method = 3, 0, "tcp://host:1"
+    worker.vllm_config = object()
+    worker.model_runner = SimpleNamespace(
+        model=object(), kv_cache=object(), capture_model=lambda: events.append("capture")
+    )
+    model, cache = worker.model_runner.model, worker.model_runner.kv_cache
+    # Worker has no synchronize_device method; execute its actual lifecycle bodies.
+    for generation in (1, 2):
+        events.clear()
+        slept = worker.sleep_network()
+        assert slept == {"state": "sleeping", "rank": 3, "pid": os.getpid(),
+                         "generation": generation}
+        assert worker.sleep_network() == slept
+        assert events == ["check", "synchronize", "graphs-released", ("close", groups)]
+        events.clear()
+        woke = worker.wake_network()
+        assert woke["state"] == "active" and woke["generation"] == generation
+        assert worker.wake_network() == woke
+        assert events == [("init", generation), ("restore", groups), "capture", "synchronize"]
+        assert worker.model_runner.model is model and worker.model_runner.kv_cache is cache
 
 
 def test_wake_store_isolates_old_keys_and_separate_sleep_generations(
