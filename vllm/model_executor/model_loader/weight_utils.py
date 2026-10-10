@@ -1617,7 +1617,10 @@ def _restrict_instanttensor_to_selected_ranges(
     instant_open.tensor_offsets = selected_offsets
     instant_open.tensor_sizes = selected_sizes
     instant_open.total_tensor_size = sum(selected_sizes)
-    instant_open._determine_buffer_size(None)
+    # The iterator skips native I/O when every selected tensor uses CPU.
+    # InstantTensor buffer sizing requires at least one GPU tensor (max).
+    if selected_metadata:
+        instant_open._determine_buffer_size(None)
     return cpu_fallback_weights
 
 

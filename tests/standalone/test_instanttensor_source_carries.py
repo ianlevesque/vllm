@@ -253,3 +253,41 @@ def test_oversized_tensors_bypass_gpu_ring_without_stale_overlay(tmp_path, monke
     assert calls[0]["load_now"] is False
     assert calls[0]["copy"] is True
     assert reader.ordered_tensor_metadatas == []
+
+
+@pytest.mark.parametrize("buffer_size", [1, 32])
+def test_real_instanttensor_constructor_handles_cpu_only_and_mixed_selection(
+    tmp_path, monkeypatch, buffer_size
+):
+    """Use installed metadata parsing/buffer sizing; stub only CUDA/native probes.
+
+    The older layout fixture mocks _determine_buffer_size and cannot detect
+    InstantTensor's max([]) failure when no GPU tensors remain.
+    """
+    instanttensor = pytest.importorskip("instanttensor")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (16 << 30, 16 << 30))
+    monkeypatch.setattr(instanttensor._C, "file_in_memory", lambda _: False)
+    monkeypatch.setattr(instanttensor._C, "backend_available", lambda _: True)
+    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(buffer_size))
+    path = str(tmp_path / "weights.safetensors")
+    save_file({"small": torch.arange(2), "large": torch.arange(40)}, path)
+    # This executes the dependency's real safe_open constructor, metadata
+    # reader and _determine_buffer_size, with native I/O deliberately unopened.
+    reader = instanttensor.safe_open(
+        [path], framework="pt", device="cuda:0", load_now=False, copy=True
+    )
+    assert reader.loader_handle is None
+    fallback = restrict()(
+        reader,
+        indexed_tensor_files={"small": path, "large": path},
+        is_unused_weight=None,
+        max_tensor_size=buffer_size,
+    )
+    gpu_names = [name for name, _ in reader.ordered_tensor_metadatas]
+    assert gpu_names == ([] if buffer_size == 1 else ["small"])
+    assert {name for name, _ in fallback} == (
+        {"small", "large"} if buffer_size == 1 else {"large"}
+    )
+    assert reader.loader_handle is None
+    if gpu_names:
+        assert reader.buffer_size == 16
