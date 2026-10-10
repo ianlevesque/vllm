@@ -43,6 +43,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup, Store
 from torch.distributed.constants import default_pg_timeout
+from torch.distributed.distributed_c10d import _get_default_timeout
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -1937,7 +1938,7 @@ def init_distributed_environment(
                 distributed_init_method,
                 rank,
                 world_size,
-                timeout or default_pg_timeout,
+                timeout if timeout is not None else _get_default_timeout(Backend(backend)),
                 network_wake_generation,
                 store,
             )
