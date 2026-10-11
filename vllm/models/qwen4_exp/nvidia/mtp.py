@@ -427,6 +427,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return _remap_mtp_weight_name(name) is None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
             for name, weight in weights:

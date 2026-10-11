@@ -5,7 +5,10 @@
 import json
 import struct
 import sys
+from collections import defaultdict
+from collections.abc import Iterable
 from types import SimpleNamespace as NS
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +18,8 @@ from safetensors.torch import save_file
 from test_shared_source_carries import load
 
 WEIGHTS = "vllm/model_executor/model_loader/weight_utils.py"
+QWEN_MTP = "vllm/models/qwen4_exp/nvidia/mtp.py"
+DEFAULT_LOADER = "vllm/model_executor/model_loader/default_loader.py"
 
 
 def layout(files):
@@ -291,3 +296,223 @@ def test_real_instanttensor_constructor_handles_cpu_only_and_mixed_selection(
     assert reader.loader_handle is None
     if gpu_names:
         assert reader.buffer_size == 16
+
+
+def qwen_mtp_without_device_parameters(**namespace):
+    """Load the real class; only device-allocating construction is bypassed."""
+    model_type = load(
+        QWEN_MTP,
+        "Qwen4ExpMTP",
+        nn=torch.nn,
+        SupportsPP=type("SupportsPP", (), {}),
+        Qwen4ExpMixtureOfExperts=type("Qwen4ExpMixtureOfExperts", (), {}),
+        _remap_mtp_weight_name=load(QWEN_MTP, "_remap_mtp_weight_name"),
+        **namespace,
+    )
+    model = model_type.__new__(model_type)
+    torch.nn.Module.__init__(model)
+    return model
+
+
+@pytest.mark.parametrize("buffer_size", [1, 32, 4096])
+@pytest.mark.parametrize("prefix", ["", "model.language_model.", "language_model."])
+def test_qwen_mtp_prefilter_preserves_values_without_reading_target_payload(
+    tmp_path, monkeypatch, buffer_size, prefix
+):
+    """Actual hook -> loader -> selected ranges -> real file bytes on CPU.
+
+    CUDA/native I/O is replaced at InstantTensor's boundary. Shard filtering,
+    range selection, oversized fallback, and draft name mapping are real.
+    """
+    embedding = prefix + "embed_tokens.weight"
+    draft = prefix + "mtp.layers.0.mlp.experts.gate_up_proj"
+    ple = prefix + "layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    mixed_ple = prefix + "layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight"
+    unused = prefix + "layers.0.mlp.experts.gate_up_proj"
+    only_target = str(tmp_path / "target.safetensors")
+    mixed = str(tmp_path / "mixed.safetensors")
+    fixtures = {
+        only_target: {ple: torch.arange(128, dtype=torch.float32)},
+        mixed: {
+            embedding: torch.tensor([1.0, 2.0]),
+            unused: torch.arange(256, dtype=torch.float32),
+            mixed_ple: torch.arange(128, dtype=torch.float32),
+            draft: torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            "lm_head.weight": torch.tensor([3.0, 4.0]),
+        },
+    }
+    for path, weights in fixtures.items():
+        save_file(weights, path)
+    index = tmp_path / "model.safetensors.index.json"
+    index.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    name: str(path)
+                    for path, weights in fixtures.items()
+                    for name in weights
+                }
+            }
+        )
+    )
+    expected_names = {embedding, draft, "lm_head.weight"}
+    expected = {name: fixtures[mixed][name] for name in expected_names}
+    opened, copied, fallback, entered = [], [], [], []
+
+    class Reader(NS):
+        def __enter__(self):
+            entered.append(self)
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def tensors(self):
+            # Consume the selected physical ranges, including disjoint runs.
+            offset_pos = 0
+            for name, metadata in self.ordered_tensor_metadatas:
+                file_idx, start = self.tensor_offsets[offset_pos]
+                _, end = self.tensor_offsets[offset_pos + 1]
+                with open(self.filename[file_idx], "rb") as handle:
+                    header_size = struct.unpack("<Q", handle.read(8))[0]
+                    handle.seek(8 + header_size + start)
+                    raw = bytearray(handle.read(end - start))
+                assert len(raw) == end - start
+                copied.append(name)
+                yield (
+                    name,
+                    torch.frombuffer(raw, dtype=torch.float32)
+                    .reshape(metadata["shape"])
+                    .clone(),
+                )
+                offset_pos += 1
+                if (
+                    offset_pos + 1 < len(self.tensor_offsets)
+                    and self.tensor_offsets[offset_pos + 1][0] != file_idx
+                ):
+                    offset_pos += 1
+
+    def open_reader(files, **kwargs):
+        assert kwargs["load_now"] is False
+        assert kwargs["copy"] is True
+        opened.extend(files)
+        return Reader(**vars(layout(files)))
+
+    def select(reader, **kwargs):
+        selected = restrict()(reader, **kwargs)
+        fallback.extend(name for name, _ in selected)
+        return selected
+
+    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(buffer_size))
+    monkeypatch.setitem(sys.modules, "instanttensor", NS(safe_open=open_reader))
+    iterator = load(
+        WEIGHTS,
+        "_instanttensor_weights_iterator",
+        current_platform=NS(is_cuda=lambda: True, current_device=lambda: 0),
+        safe_open=safe_open,
+        defaultdict=defaultdict,
+        logger=Mock(),
+        _restrict_instanttensor_to_selected_ranges=select,
+        tqdm=Progress,
+        enable_tqdm=lambda _: False,
+        _BAR_FORMAT="",
+    )
+    method = load(
+        DEFAULT_LOADER,
+        "DefaultModelLoader._get_weights_iterator",
+        json=json,
+        filter_safetensors_files_by_weight_name=load(
+            WEIGHTS,
+            "filter_safetensors_files_by_weight_name",
+            safe_open=safe_open,
+            logger=Mock(),
+        ),
+        instanttensor_weights_iterator=iterator,
+    )
+    owner = NS(
+        load_config=NS(
+            model_loader_extra_config={},
+            load_format="instanttensor",
+            use_tqdm_on_load=False,
+        ),
+        _prepare_weights=lambda *args: (
+            str(tmp_path),
+            list(fixtures),
+            True,
+            index.name,
+        ),
+        _encoder_only_lm_prefixes=None,
+        counter_before_loading_weights=1.0,
+    )
+    owner._get_weights_iterator = lambda source: method(owner, source)
+    get_all = load(
+        DEFAULT_LOADER,
+        "DefaultModelLoader.get_all_weights",
+        DefaultModelLoader=NS(Source=load(DEFAULT_LOADER, "DefaultModelLoader.Source")),
+        Iterable=Iterable,
+        cast=cast,
+    )
+    actual = dict(
+        get_all(
+            owner,
+            NS(model=str(tmp_path), revision=None),
+            qwen_mtp_without_device_parameters(),
+        )
+    )
+    assert set(actual) == expected_names
+    assert opened == [mixed]  # Target-only shard never reaches native construction.
+    assert set(copied).isdisjoint({ple, mixed_ple, unused})
+    assert set(fallback).isdisjoint({ple, mixed_ple, unused})
+    assert set(copied) | set(fallback) == expected_names
+    assert bool(entered) == (buffer_size != 1)
+    assert set(fallback) == {
+        name
+        for name, value in expected.items()
+        if value.numel() * value.element_size() > buffer_size
+    }
+    for name, expected_value in expected.items():
+        torch.testing.assert_close(actual[name], expected_value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("prefix", ["", "model.language_model.", "language_model."])
+@pytest.mark.parametrize(
+    "name, mapped",
+    [
+        ("embed_tokens.weight", "model.embed_tokens.weight"),
+        ("model.embed_tokens.weight", "model.embed_tokens.weight"),
+        ("lm_head.weight", "lm_head.weight"),
+        ("model.lm_head.weight", "lm_head.weight"),
+        ("shared_head.head.weight", "lm_head.weight"),
+        ("model.shared_head.head.weight", "lm_head.weight"),
+        ("mtp.shared_head.head.weight", "lm_head.weight"),
+        ("mtp.layers.0.weight", "model.layers.0.weight"),
+        ("model.mtp.layers.0.weight", "model.layers.0.weight"),
+    ],
+)
+def test_qwen_mtp_prefilter_preserves_existing_alias_consumer_values(
+    prefix, name, mapped
+):
+    received = {}
+
+    class CaptureLoader:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load_weights(self, weights, **kwargs):
+            received.update(weights)
+            return set(received)
+
+    model = qwen_mtp_without_device_parameters(
+        AutoWeightsLoader=CaptureLoader,
+        WeightsMapper=lambda **kwargs: None,
+        _QWEN4_EXP_IGNORED_MISSING_SUFFIXES=[],
+    )
+    value = torch.tensor([7.0, 11.0])
+    weights = [(prefix + name, value), (prefix + "layers.0.weight", torch.zeros(1))]
+    selected = (
+        (key, tensor)
+        for key, tensor in weights
+        if not model.is_unused_checkpoint_weight(key)
+    )
+    assert model.load_weights(selected) == {mapped}
+    assert received[mapped] is value
