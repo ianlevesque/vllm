@@ -333,6 +333,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
+    VLLM_STARTUP_MEMORY_DIAGNOSTICS: bool = False
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
@@ -2236,6 +2237,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
     ),
+    # CPU-only stage/allocator/proc diagnostics; adds no device synchronization.
+    "VLLM_STARTUP_MEMORY_DIAGNOSTICS": lambda: bool(
+        int(os.getenv("VLLM_STARTUP_MEMORY_DIAGNOSTICS", "0"))
+    ),
     # Force N-contiguous weight layout for all XPU unquantized linears.
     "VLLM_XPU_FORCE_N_CONTIG_WEIGHT": lambda: bool(
         int(os.getenv("VLLM_XPU_FORCE_N_CONTIG_WEIGHT", "0"))
@@ -2379,6 +2384,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # Observation only; the profiling workload and compiled graphs are unchanged.
+        "VLLM_STARTUP_MEMORY_DIAGNOSTICS",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

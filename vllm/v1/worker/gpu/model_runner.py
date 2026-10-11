@@ -62,6 +62,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.startup_memory import startup_memory_stage, startup_profile_metadata
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -885,12 +886,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors = self.intermediate_tensors[:num_tokens]
 
         max_loras = self.lora_config.max_loras if self.lora_config is not None else 0
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
-            num_sampled_tokens=None,
-            remove_lora=True,
-            num_active_loras=max_loras,
+        with (
+            self.maybe_dummy_run_with_lora(
+                self.lora_config,
+                num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
+                num_sampled_tokens=None,
+                remove_lora=True,
+                num_active_loras=max_loras,
+            ),
+            startup_memory_stage(
+                "profile.target",
+                self.device,
+                enabled=is_profile,
+                metadata=lambda: startup_profile_metadata(self),
+            ),
         ):
             # Execute the model.
             self.execute_model(
@@ -936,7 +945,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
-            with use_workspace_lane(self._draft_workspace_lane):
+            with (
+                startup_memory_stage(
+                    "profile.draft",
+                    self.device,
+                    enabled=is_profile,
+                    metadata=lambda: startup_profile_metadata(self),
+                ),
+                use_workspace_lane(self._draft_workspace_lane),
+            ):
                 self.speculator.propose(
                     input_batch=input_batch,
                     attn_metadata=attn_metadata,
@@ -989,13 +1006,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
-                mm_budget = MultiModalBudget(
-                    self.vllm_config, self.mm_registry, enable_cache=False
-                )
-                dummy_mm_inputs = mm_budget.get_dummy_encoder_profile_inputs()
-                self.model_state.encoder_runner.profile_encoder_cache(
-                    dummy_mm_inputs, mm_budget
-                )
+                with startup_memory_stage(
+                    "profile.mm_inputs",
+                    self.device,
+                    metadata=lambda: startup_profile_metadata(self),
+                ):
+                    mm_budget = MultiModalBudget(
+                        self.vllm_config, self.mm_registry, enable_cache=False
+                    )
+                    dummy_mm_inputs = mm_budget.get_dummy_encoder_profile_inputs()
+                with startup_memory_stage(
+                    "profile.encoder",
+                    self.device,
+                    metadata=lambda: startup_profile_metadata(self, dummy_mm_inputs),
+                ):
+                    self.model_state.encoder_runner.profile_encoder_cache(
+                        dummy_mm_inputs, mm_budget
+                    )
 
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens,
@@ -1008,14 +1035,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.is_last_pp_rank:
             assert sample_hidden_states is not None
             if self.pooling_runner is None:
-                self._dummy_sampler_run(sample_hidden_states)
+                with startup_memory_stage("profile.sampler", self.device):
+                    self._dummy_sampler_run(sample_hidden_states)
             else:
                 self._dummy_pooler_run(hidden_states)
 
-        torch.accelerator.synchronize()
-        del hidden_states, sample_hidden_states
-        self.reset_encoder_cache()
-        gc.collect()
+        with startup_memory_stage("profile.cleanup", self.device):
+            torch.accelerator.synchronize()
+            del hidden_states, sample_hidden_states
+            self.reset_encoder_cache()
+            gc.collect()
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:

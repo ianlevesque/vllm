@@ -83,6 +83,7 @@ from vllm.utils.mem_utils import (
     format_gib,
     memory_profiling,
 )
+from vllm.utils.startup_memory import startup_memory_stage, startup_profile_metadata
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -771,7 +772,12 @@ class Worker(WorkerBase):
         if (
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ) and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            with startup_memory_stage(
+                "profile.graphs",
+                self.device,
+                metadata=lambda: startup_profile_metadata(self.model_runner),
+            ):
+                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
