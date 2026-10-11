@@ -362,6 +362,11 @@ class Worker(WorkerBase):
             self.model_runner.capture_model()
         self.synchronize_device()
         self._network_sleep_groups = {}
+        # Graph release and recapture unfreeze the static worker heap. Restore
+        # the post-warmup policy only after the wake has completed, with old
+        # transport references gone. The helper preserves gc.isenabled().
+        if getattr(self, "_freeze_gc_after_network_wake", False):
+            self._freeze_gc_heap()
         self._network_sleep_state = "active"
         logger.info(
             "Network wake rank %s generation %s: "
@@ -1144,7 +1149,7 @@ class Worker(WorkerBase):
 
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
-        freeze_gc_heap()
+        self._freeze_gc_heap()
         maybe_attach_gc_debug_callback()
 
         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
@@ -1155,6 +1160,12 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _freeze_gc_heap(self) -> None:
+        freeze_gc_heap()
+        # Record startup intent explicitly: CPython can put immortal objects
+        # in the permanent generation even without a user-requested freeze.
+        self._freeze_gc_after_network_wake = True
 
     def _maybe_activate_jit_monitor(self) -> None:
         # When JIT warmup is disabled (e.g. enforce_eager), runtime JIT
