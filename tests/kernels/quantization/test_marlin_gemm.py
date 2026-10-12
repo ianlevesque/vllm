@@ -479,8 +479,20 @@ def test_marlin_gemm(
     assert max_diff < 0.04
 
 
-def test_marlin_persistent_locks_cuda_graph_streams(workspace_init):
-    """Compiled GEMMs select stream-local locks at runtime and survive replay."""
+def test_marlin_persistent_locks_cuda_graph_streams(workspace_init, monkeypatch):
+    """Stream-local locks survive replay and locked graph release/recapture."""
+    from vllm.distributed import parallel_state
+
+    # Exercise the real capture contexts without initializing collectives. Network
+    # transport replacement has its own distributed gate; only the CUDA stream
+    # and persistent-resource lifecycle are under test here.
+    def replace_groups():
+        group = object.__new__(parallel_state.GroupCoordinator)
+        group.device_communicator = None
+        for name in ("get_tp_group", "get_pp_group", "get_dp_group"):
+            monkeypatch.setattr(parallel_state, name, lambda: group)
+
+    replace_groups()
     size_m, size_k, size_n = 32, 1024, 2048
     inputs = [rand_data((size_m, size_k)) for _ in range(2)]
     weight = rand_data((size_k, size_n))
@@ -520,8 +532,20 @@ def test_marlin_persistent_locks_cuda_graph_streams(workspace_init):
                 outputs.append(run(x))
         torch.cuda.current_stream().wait_stream(stream)
 
-    assert locks[0].data_ptr() != locks[1].data_ptr()
-    current_workspace_manager().lock()
+    with parallel_state.graph_capture(inputs[0].device) as context:
+        capture_stream = context.stream
+        capture_locks = get_marlin_workspace(inputs[0].device)
+        run(inputs[0])
+        capture_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture_graph, stream=capture_stream):
+            capture_output = run(inputs[0])
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    assert len({lock.data_ptr() for lock in [*locks, capture_locks]}) == 3
+    manager = current_workspace_manager()
+    manager.lock()
+    resource_count = sum(len(slot) for slot in manager._persistent_resources)
+    capture_lock_ptr = capture_locks.data_ptr()
     for _ in range(3):
         for stream, graph, x, lock in zip(streams, graphs, inputs, locks):
             with torch.cuda.stream(stream):
@@ -533,6 +557,43 @@ def test_marlin_persistent_locks_cuda_graph_streams(workspace_init):
         for x, output, lock in zip(inputs, outputs, locks):
             assert compute_max_diff(output, x @ w_ref) < 0.04
             assert torch.count_nonzero(lock) == 0
+
+    for _ in range(2):
+        # Destroy every graph before recapture: resetting any graph also clears
+        # the cuBLAS workspace on its stream. No surviving graph may replay it.
+        torch.cuda.synchronize()
+        for graph in [*graphs, capture_graph]:
+            graph.reset()
+        graphs.clear()
+        replace_groups()
+        assert manager.is_locked()
+        with parallel_state.graph_capture(inputs[0].device) as context:
+            assert get_marlin_workspace(inputs[0].device) is capture_locks
+            assert context.stream is capture_stream
+            inputs[0].add_(0.1)
+            # The production failure occurs in this recapture warmup, before
+            # torch.cuda.graph: a new stream needs an unregistered lock buffer.
+            run(inputs[0])
+            capture_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(
+                capture_graph,
+                pool=torch.cuda.graph_pool_handle(),
+                stream=context.stream,
+            ):
+                capture_output = run(inputs[0])
+            inputs[0].add_(0.1)
+            capture_graph.replay()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        assert compute_max_diff(capture_output, inputs[0] @ w_ref) < 0.04
+        assert torch.count_nonzero(capture_locks) == 0
+        assert capture_locks.data_ptr() == capture_lock_ptr
+        assert (
+            sum(len(slot) for slot in manager._persistent_resources) == resource_count
+        )
+        assert manager.is_locked()
+
+    torch.cuda.synchronize()
+    capture_graph.reset()
 
 
 def test_marlin_gemm_subset_input():
