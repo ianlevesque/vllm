@@ -82,13 +82,64 @@ def test_scoped_max_split_keeps_freed_large_blocks_releasable():
         torch.accelerator.empty_cache()
         return reserved
 
-    baseline = torch.accelerator.memory_reserved()
-    # Without the limit the small tensor is split off the freed block and pins it.
-    assert reserved_while_small_is_live(nullcontext()) - baseline >= large
-    scoped = gpu_worker.Worker._scoped_allocator_max_split(
-        SimpleNamespace(), max_split_size_mb=20
-    )
-    assert reserved_while_small_is_live(scoped) - baseline < large
+    original = torch.cuda.memory._snapshot()["allocator_settings"][
+        "PYTORCH_CUDA_ALLOC_CONF"
+    ]
+    try:
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:False")
+        baseline = torch.accelerator.memory_reserved()
+        # Without the limit the small tensor splits and pins the freed block.
+        assert reserved_while_small_is_live(nullcontext()) - baseline >= large
+        scoped = gpu_worker.Worker._scoped_allocator_max_split(
+            SimpleNamespace(), max_split_size_mb=20
+        )
+        assert reserved_while_small_is_live(scoped) - baseline < large
+    finally:
+        torch._C._accelerator_setAllocatorSettings(original)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike()
+    or not torch.accelerator.is_available()
+    or torch.cuda.memory.get_allocator_backend() != "native",
+    reason="needs the native CUDA or ROCm allocator",
+)
+@create_new_process_for_each_test("spawn")
+def test_scoped_max_split_reuses_expandable_interior_blocks():
+    """Live fences must not make the profiling scope grow one segment per cycle.
+
+    Allocation pattern follows the upstream PyTorch #193400 regression.
+    """
+    mib = 1024 * 1024
+    held = []
+    original = torch.cuda.memory._snapshot()["allocator_settings"][
+        "PYTORCH_CUDA_ALLOC_CONF"
+    ]
+
+    def cycle():
+        a = torch.empty(64 * mib, dtype=torch.uint8, device="cuda")
+        b = torch.empty(32 * mib, dtype=torch.uint8, device="cuda")
+        held.append(torch.empty(2 * mib, dtype=torch.uint8, device="cuda"))
+        del a, b
+
+    try:
+        torch.accelerator.empty_cache()
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
+        with gpu_worker.Worker._scoped_allocator_max_split(SimpleNamespace(), 20):
+            settings = torch.cuda.memory._snapshot()["allocator_settings"]
+            assert settings["expandable_segments"]
+            assert settings["max_split_size"] > 128 * mib
+            cycle()
+            assert any(s.get("is_expandable") for s in torch.cuda.memory_snapshot())
+            baseline = torch.accelerator.memory_reserved()
+            for _ in range(5):
+                cycle()
+            # A rejected 96MiB free region would grow by ~100MiB per cycle.
+            assert torch.accelerator.memory_reserved() - baseline < 96 * mib
+    finally:
+        held.clear()
+        torch.accelerator.empty_cache()
+        torch._C._accelerator_setAllocatorSettings(original)
 
 
 @pytest.mark.skipif(

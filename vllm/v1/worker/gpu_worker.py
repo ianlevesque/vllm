@@ -20,6 +20,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.config.profiler import validate_profile_prefix
 from vllm.device_allocator import get_mem_allocator_instance
+from vllm.device_allocator.alloc_conf import expandable_segments_enabled
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -491,11 +492,21 @@ class Worker(WorkerBase):
 
     @contextmanager
     def _scoped_allocator_max_split(self, max_split_size_mb: int):
-        """Limit CUDA/ROCm allocator splitting, restoring settings on exit."""
+        """Limit ordinary allocator splitting, restoring settings on exit."""
         if (
             not current_platform.is_cuda_alike()
             or torch.cuda.memory.get_allocator_backend() != "native"
         ):
+            yield
+            return
+
+        # Expandable segments can release individual pages; they do not need
+        # this workaround for pinned cudaMalloc blocks. Combining the policies
+        # can instead reject reusable interior blocks and grow reserved memory
+        # until OOM (pytorch/pytorch#193400). Read the live state: CuMem disables
+        # expandable segments inside its weight pool, then restores them.
+        # If inspection is unavailable, preserve the user's configuration.
+        if expandable_segments_enabled() is not False:
             yield
             return
 
