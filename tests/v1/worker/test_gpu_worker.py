@@ -128,7 +128,9 @@ def test_scoped_max_split_reuses_expandable_interior_blocks():
         with gpu_worker.Worker._scoped_allocator_max_split(SimpleNamespace(), 20):
             settings = torch.cuda.memory._snapshot()["allocator_settings"]
             assert settings["expandable_segments"]
-            assert settings["max_split_size"] > 128 * mib
+            # Torch serializes size_t SIZE_MAX through int64_t in snapshots.
+            assert settings["max_split_size"] in (-1, (1 << 64) - 1)
+            assert settings["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
             cycle()
             assert any(s.get("is_expandable") for s in torch.cuda.memory_snapshot())
             baseline = torch.accelerator.memory_reserved()
