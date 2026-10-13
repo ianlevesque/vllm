@@ -107,7 +107,7 @@ def _fwd_kernel(
 
     # initialize pointer to m and l
     if USE_SINKS:
-        sink = tl.load(Sinks + cur_head) * 1.4426950408889634
+        sink = tl.load(Sinks + cur_head).to(tl.float32) * 1.4426950408889634
         if SINKS_BIAS_KEY0:
             # Sinks bias the logit of key 0, so the softmax starts empty and
             # normalizes over the biased scores as usual.
