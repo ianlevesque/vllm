@@ -304,6 +304,7 @@ def qwen_mtp_without_device_parameters(**namespace):
         QWEN_MTP,
         "Qwen4ExpMTP",
         nn=torch.nn,
+        SupportsHCSP=type("SupportsHCSP", (), {}),
         SupportsPP=type("SupportsPP", (), {}),
         Qwen4ExpMixtureOfExperts=type("Qwen4ExpMixtureOfExperts", (), {}),
         _remap_mtp_weight_name=load(QWEN_MTP, "_remap_mtp_weight_name"),
