@@ -328,6 +328,7 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    local_expert_ids=self.local_expert_ids,
                     indexed_tensor_files=indexed_tensor_files,
                     is_unused_weight=source.is_unused_weight,
                 )

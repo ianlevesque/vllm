@@ -43,7 +43,8 @@ def layout(files):
         total_tensor_size=sum(sizes),
         tensor_name_to_index={},
         loader_handle=None,
-        _determine_buffer_size=Mock(),
+        tensor_keep=[True] * len(metadata),
+        _finalize_buffer_size=Mock(),
     )
 
 
@@ -84,7 +85,7 @@ def test_indexed_overlay_selects_correct_physical_owner_before_io(
         assert reader.filename[-1] == overlay
         assert reader.tensor_sizes[gpu_names.index("expert")] == 12
     if gpu_names:
-        reader._determine_buffer_size.assert_called_once_with(None)
+        reader._finalize_buffer_size.assert_called_once_with(max_size)
 
 
 def test_noncontiguous_selection_emits_disjoint_file_runs(tmp_path):
@@ -193,6 +194,7 @@ def test_default_loader_passes_custom_index_and_current_unused_weight_filter(tmp
         _prepare_weights=lambda *args: (str(tmp_path), ["shard"], True, index.name),
         _encoder_only_lm_prefixes=None,
         counter_before_loading_weights=1.0,
+        local_expert_ids=None,
     )
     source = NS(
         model_or_path="model",
@@ -260,26 +262,36 @@ def test_oversized_tensors_bypass_gpu_ring_without_stale_overlay(tmp_path, monke
     assert reader.ordered_tensor_metadatas == []
 
 
-@pytest.mark.parametrize("buffer_size", [1, 32])
+@pytest.mark.parametrize("buffer_size", [1, 16384])
 def test_real_instanttensor_constructor_handles_cpu_only_and_mixed_selection(
     tmp_path, monkeypatch, buffer_size
 ):
     """Use installed metadata parsing/buffer sizing; stub only CUDA/native probes.
 
-    The older layout fixture mocks _determine_buffer_size and cannot detect
+    The older layout fixture mocks _finalize_buffer_size and cannot detect
     InstantTensor's max([]) failure when no GPU tensors remain.
     """
     instanttensor = pytest.importorskip("instanttensor")
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (16 << 30, 16 << 30))
     monkeypatch.setattr(instanttensor._C, "file_in_memory", lambda _: False)
-    monkeypatch.setattr(instanttensor._C, "backend_available", lambda _: True)
+    monkeypatch.setattr(
+        instanttensor._C, "backend_status", lambda _: (True, None, None)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda _: NS(is_integrated=False)
+    )
     monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(buffer_size))
     path = str(tmp_path / "weights.safetensors")
-    save_file({"small": torch.arange(2), "large": torch.arange(40)}, path)
+    save_file({"small": torch.arange(2), "large": torch.arange(40000)}, path)
     # This executes the dependency's real safe_open constructor, metadata
-    # reader and _determine_buffer_size, with native I/O deliberately unopened.
+    # reader and _finalize_buffer_size, with native I/O deliberately unopened.
     reader = instanttensor.safe_open(
-        [path], framework="pt", device="cuda:0", load_now=False, copy=True
+        [path],
+        framework="pt",
+        device="cuda:0",
+        load_now=False,
+        copy=True,
+        defer_layout_validation=True,
     )
     assert reader.loader_handle is None
     fallback = restrict()(
@@ -295,7 +307,7 @@ def test_real_instanttensor_constructor_handles_cpu_only_and_mixed_selection(
     )
     assert reader.loader_handle is None
     if gpu_names:
-        assert reader.buffer_size == 16
+        assert reader.buffer_size == 4096
 
 
 def qwen_mtp_without_device_parameters(**namespace):
@@ -444,6 +456,7 @@ def test_qwen_mtp_prefilter_preserves_values_without_reading_target_payload(
         ),
         _encoder_only_lm_prefixes=None,
         counter_before_loading_weights=1.0,
+        local_expert_ids=None,
     )
     owner._get_weights_iterator = lambda source: method(owner, source)
     get_all = load(

@@ -1354,6 +1354,7 @@ def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     *,
+    local_expert_ids: set[int] | None = None,
     indexed_tensor_files: dict[str, str] | None = None,
     is_unused_weight: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -1368,6 +1369,30 @@ def instanttensor_weights_iterator(
         world_group = get_world_group()
     except AssertionError:
         world_group = None
+    ep_filter_names = None
+    if local_expert_ids is not None:
+        checkpoint_names = []
+        for path in hf_weights_files:
+            with safe_open(path, framework="pt") as metadata:
+                checkpoint_names.extend(metadata.keys())
+        # Adopt PR61167: make this decision uniformly, including ranks owning
+        # no experts. Fused-only checkpoints retain the collective path.
+        if any(should_skip_weight(name, set()) for name in checkpoint_names):
+            ep_filter_names = [
+                name
+                for name in checkpoint_names
+                if not should_skip_weight(name, local_expert_ids)
+            ]
+    if ep_filter_names is not None:
+        yield from _instanttensor_weights_iterator(
+            hf_weights_files,
+            use_tqdm_on_load,
+            indexed_tensor_files=indexed_tensor_files,
+            is_unused_weight=is_unused_weight,
+            process_group=None,
+            ep_filter_names=ep_filter_names,
+        )
+        return
     with instanttensor_loading_group(world_group) as process_group:
         yield from _instanttensor_weights_iterator(
             hf_weights_files,
@@ -1385,6 +1410,7 @@ def _instanttensor_weights_iterator(
     indexed_tensor_files: dict[str, str] | None = None,
     is_unused_weight: Callable[[str], bool] | None = None,
     process_group: Any = None,
+    ep_filter_names: list[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over weights in model safetensor files with InstantTensor.
 
@@ -1424,6 +1450,13 @@ def _instanttensor_weights_iterator(
     open_kwargs: dict[str, Any] = {}
     if restrict_before_io:
         open_kwargs["load_now"] = False
+        open_kwargs["defer_layout_validation"] = True
+
+    if ep_filter_names is not None:
+        if process_group is not None:
+            raise RuntimeError("Rank-local EP filtering requires independent I/O")
+        open_kwargs["tensor_filter"] = ep_filter_names
+        open_kwargs["tensor_name_match_mode"] = "exact"
 
     # Retain upstream ownership: yielded tensors survive buffer reuse.
     instant_open = instanttensor.safe_open(
@@ -1501,7 +1534,8 @@ def _restrict_instanttensor_to_selected_ranges(
         "total_tensor_size",
         "tensor_name_to_index",
         "loader_handle",
-        "_determine_buffer_size",
+        "tensor_keep",
+        "_finalize_buffer_size",
     )
     missing = [name for name in required_attrs if not hasattr(instant_open, name)]
     if missing:
@@ -1515,6 +1549,8 @@ def _restrict_instanttensor_to_selected_ranges(
     filenames = list(instant_open.filename)
     metadata = list(instant_open.ordered_tensor_metadatas)
     offsets = list(instant_open.tensor_offsets)
+    original_keep = list(instant_open.tensor_keep)
+    keep_pos = 0
     selected_filenames: list[str] = []
     selected_metadata: list[tuple[str, dict[str, Any]]] = []
     selected_offsets: list[tuple[int, int]] = []
@@ -1527,14 +1563,24 @@ def _restrict_instanttensor_to_selected_ranges(
         with safe_open(filename, framework="pt") as physical_file:
             physical_names = list(physical_file.offset_keys())
         tensor_count = len(physical_names)
-        file_metadata = metadata[metadata_pos : metadata_pos + tensor_count]
+        file_keep = original_keep[keep_pos : keep_pos + tensor_count]
+        if len(file_keep) != tensor_count or any(
+            type(v) is not bool for v in file_keep
+        ):
+            raise RuntimeError("InstantTensor native tensor_keep count/type mismatch")
+        kept_names = [name for name, keep in zip(physical_names, file_keep) if keep]
+        file_metadata = metadata[metadata_pos : metadata_pos + len(kept_names)]
+        metadata_by_name = dict(file_metadata)
         file_offsets = offsets[offset_pos : offset_pos + tensor_count + 1]
-        if len(file_metadata) != tensor_count or len(file_offsets) != tensor_count + 1:
+        if (
+            len(file_metadata) != len(kept_names)
+            or len(file_offsets) != tensor_count + 1
+        ):
             raise RuntimeError(
                 "InstantTensor metadata/offset count does not match safetensors "
                 f"header for {filename}"
             )
-        if [name for name, _ in file_metadata] != physical_names:
+        if [name for name, _ in file_metadata] != kept_names:
             raise RuntimeError(
                 "InstantTensor tensor order does not match safetensors offset order "
                 f"for {filename}"
@@ -1545,8 +1591,10 @@ def _restrict_instanttensor_to_selected_ranges(
             indexed_here = indexed_tensor_files is None or (
                 indexed_tensor_files.get(name) == filename_abs
             )
-            selected_here = indexed_here and (
-                is_unused_weight is None or not is_unused_weight(name)
+            selected_here = (
+                file_keep[item_index]
+                and indexed_here
+                and (is_unused_weight is None or not is_unused_weight(name))
             )
             tensor_size = int(file_offsets[item_index + 1][1]) - int(
                 file_offsets[item_index][1]
@@ -1572,7 +1620,10 @@ def _restrict_instanttensor_to_selected_ranges(
 
             logical_file_index = len(selected_filenames)
             selected_filenames.append(filename)
-            selected_metadata.extend(file_metadata[run_start:run_end])
+            selected_metadata.extend(
+                (name, metadata_by_name[name])
+                for name in physical_names[run_start:run_end]
+            )
             selected_offsets.extend(
                 (logical_file_index, int(file_offsets[index][1]))
                 for index in range(run_start, run_end)
@@ -1580,10 +1631,15 @@ def _restrict_instanttensor_to_selected_ranges(
             selected_offsets.append((logical_file_index, int(file_offsets[run_end][1])))
             run_start = run_end
 
-        metadata_pos += tensor_count
+        metadata_pos += len(kept_names)
+        keep_pos += tensor_count
         offset_pos += tensor_count + 1
 
-    if metadata_pos != len(metadata) or offset_pos != len(offsets):
+    if (
+        metadata_pos != len(metadata)
+        or offset_pos != len(offsets)
+        or keep_pos != len(original_keep)
+    ):
         raise RuntimeError(
             "InstantTensor layout contains unaccounted metadata or offsets"
         )
@@ -1615,12 +1671,13 @@ def _restrict_instanttensor_to_selected_ranges(
         name: index for index, name in enumerate(selected_names)
     }
     instant_open.tensor_offsets = selected_offsets
+    instant_open.tensor_keep = [True] * len(selected_metadata)
     instant_open.tensor_sizes = selected_sizes
     instant_open.total_tensor_size = sum(selected_sizes)
     # The iterator skips native I/O when every selected tensor uses CPU.
     # InstantTensor buffer sizing requires at least one GPU tensor (max).
     if selected_metadata:
-        instant_open._determine_buffer_size(None)
+        instant_open._finalize_buffer_size(max_tensor_size)
     return cpu_fallback_weights
 
 
