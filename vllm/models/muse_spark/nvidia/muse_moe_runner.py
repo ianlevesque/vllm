@@ -575,7 +575,13 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         super().__init__(quant_config, moe_config)
         self.use_route_major = (
             self.nvfp4_backend == NvFp4MoeBackend.MARLIN
-            and current_platform.is_device_capability_family(90)
+            and (
+                current_platform.is_device_capability_family(90)
+                # GB10/SM12x fork carry: TRT-LLM NVFP4 experts are gated to
+                # SM100, so SM12x takes the same Marlin W4A16 route-major
+                # path (MarlinExperts supports sm75+; Triton finalization).
+                or current_platform.is_device_capability_family(120)
+            )
         )
         if self.use_route_major:
             _validate_route_major_deployment(moe_config)
@@ -746,7 +752,12 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
     muse_post_expert_finalize: MusePostExpertFinalize
 
     def __init__(self, moe: FusedMoEConfig) -> None:
-        self.use_route_major = current_platform.is_device_capability_family(90)
+        self.use_route_major = (
+            current_platform.is_device_capability_family(90)
+            # GB10/SM12x fork carry: TRT-LLM BF16 experts are SM100-only;
+            # unquantized layers take the Triton route-major path instead.
+            or current_platform.is_device_capability_family(120)
+        )
         if self.use_route_major:
             _validate_route_major_deployment(moe)
             FusedMoEMethodBase.__init__(self, moe)
