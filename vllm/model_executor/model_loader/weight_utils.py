@@ -890,24 +890,32 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def local_checkpoint_dir(
+    model_name_or_path: str,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> Path | None:
+    """The local directory of an already-downloaded checkpoint, or None."""
+    if os.path.isdir(model_name_or_path):
+        return Path(model_name_or_path)
+    with suppress(OSError, ValueError):
+        return Path(
+            hf_api().snapshot_download(
+                model_name_or_path,
+                revision=revision,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+        )
+    return None
+
+
 def drop_checkpoint_cache(
     model_name_or_path: str,
     revision: str | None = None,
     cache_dir: str | None = None,
 ) -> None:
-    checkpoint_dir: Path | None = None
-    if os.path.isdir(model_name_or_path):
-        checkpoint_dir = Path(model_name_or_path)
-    else:
-        with suppress(OSError, ValueError):
-            checkpoint_dir = Path(
-                hf_api().snapshot_download(
-                    model_name_or_path,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    local_files_only=True,
-                )
-            )
+    checkpoint_dir = local_checkpoint_dir(model_name_or_path, revision, cache_dir)
     if checkpoint_dir is None:
         logger.info_once(
             "No local checkpoint found for %s; skipping page-cache eviction",
