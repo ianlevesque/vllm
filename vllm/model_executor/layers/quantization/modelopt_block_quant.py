@@ -79,13 +79,29 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
             raise ValueError("Block-quantized routed experts require BF16 activations")
         if (
             moe_config.activation
-            not in (MoEActivation.SILU, MoEActivation.RELU2_NO_MUL)
+            not in (
+                MoEActivation.SILU,
+                MoEActivation.SITU,
+                MoEActivation.RELU2_NO_MUL,
+            )
             or moe_config.has_bias
         ):
             raise ValueError(
-                "Block-quantized routed experts require bias-free SiLU or ReLU2"
+                "Block-quantized routed experts require bias-free SiLU, "
+                "SiTU, or ReLU2"
             )
-        self.gated = moe_config.activation == MoEActivation.SILU
+        if moe_config.activation == MoEActivation.SITU and (
+            moe_config.activation_situ_beta != 4.0
+            or moe_config.activation_situ_linear_beta != 25.0
+        ):
+            raise ValueError(
+                "B12X block-quantized MoE supports only SiTU beta 4.0 / "
+                "linear beta 25.0"
+            )
+        self.gated = moe_config.activation in (
+            MoEActivation.SILU,
+            MoEActivation.SITU,
+        )
         if any(
             value is not None
             for value in (
