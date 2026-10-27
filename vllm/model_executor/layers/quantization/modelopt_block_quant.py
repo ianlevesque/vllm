@@ -122,12 +122,17 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         moe_parallel_config,
     ):
         alignment = max(128, self.block_size)
-        if hidden_size % alignment or intermediate_size_per_partition % alignment:
+        if hidden_size % alignment:
             raise ValueError(
-                f"{self.codec.upper()} hidden and per-rank intermediate sizes "
-                f"must align to {alignment}"
+                f"{self.codec.upper()} hidden size must align to {alignment}, "
+                f"got {hidden_size}"
             )
-        return hidden_size, intermediate_size_per_partition
+        # A block is atomic, so a per-rank intermediate below the block
+        # alignment (e.g. 3072/16=192 for 256-blocks) cannot shard evenly.
+        # Round the partition up; weight_loader zero-fills the padded
+        # region, whose all-zero blocks decode to exact zeros.
+        padded = -(-intermediate_size_per_partition // alignment) * alignment
+        return hidden_size, padded
 
     def create_weights(
         self,
@@ -167,7 +172,10 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
             layer.register_parameter(
                 name,
                 ModelWeightParameter(
-                    data=torch.empty(shape, dtype=torch.uint8),
+                    # Zeros, not empty: regions past the checkpoint's real
+                    # intermediate are never written by weight_loader and
+                    # must remain exact zero blocks.
+                    data=torch.zeros(shape, dtype=torch.uint8),
                     input_dim=2,
                     output_dim=1,
                     weight_loader=self.weight_loader,
@@ -190,31 +198,62 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         local_i = self.moe.intermediate_size_per_partition
         global_i = local_i * self.moe.moe_parallel_config.tp_size
         hidden = self.moe.hidden_dim
-        expected = (
-            (hidden, global_i // self.block_size, self.block_bytes)
-            if shard_id == "w2"
-            else (global_i, hidden // self.block_size, self.block_bytes)
-        )
-        if loaded_weight.dtype != torch.uint8 or tuple(loaded_weight.shape) != expected:
+        # The checkpoint may carry the model's real (unpadded) global
+        # intermediate when maybe_roundup_sizes padded the partition:
+        # accept any block-aligned size up to the padded global size and
+        # copy only this rank's intersection with it.  The remainder of
+        # the partition stays zero blocks from create_weights.
+        if loaded_weight.dtype != torch.uint8 or loaded_weight.ndim != 3:
             raise ValueError(
-                f"invalid packed tensor {weight_name}: expected uint8{expected}, "
-                f"got {loaded_weight.dtype}{tuple(loaded_weight.shape)}"
+                f"invalid packed tensor {weight_name}: expected a 3D uint8 "
+                f"block tensor, got {loaded_weight.dtype}"
+                f"{tuple(loaded_weight.shape)}"
+            )
+        if shard_id == "w2":
+            fixed_dims = (hidden, self.block_bytes)
+            actual_dims = (loaded_weight.shape[0], loaded_weight.shape[2])
+            loaded_global_i = loaded_weight.shape[1] * self.block_size
+        else:
+            fixed_dims = (hidden // self.block_size, self.block_bytes)
+            actual_dims = (loaded_weight.shape[1], loaded_weight.shape[2])
+            loaded_global_i = loaded_weight.shape[0]
+        if (
+            actual_dims != fixed_dims
+            or loaded_global_i % self.block_size != 0
+            or not 0 < loaded_global_i <= global_i
+        ):
+            expected = (
+                (hidden, global_i // self.block_size, self.block_bytes)
+                if shard_id == "w2"
+                else (global_i, hidden // self.block_size, self.block_bytes)
+            )
+            raise ValueError(
+                f"invalid packed tensor {weight_name}: expected uint8{expected} "
+                f"(global intermediate may be any block-aligned size up to "
+                f"{global_i}), got {loaded_weight.dtype}"
+                f"{tuple(loaded_weight.shape)}"
             )
         if not 0 <= expert_id < param.shape[0]:
             raise ValueError(f"invalid Block-quantized expert index: {expert_id}")
         destination = param.data[expert_id]
-        if shard_id == "w2":
-            source = loaded_weight.narrow(
-                1,
-                self.moe.tp_rank * (local_i // self.block_size),
-                local_i // self.block_size,
-            )
-        else:
-            source = loaded_weight.narrow(0, self.moe.tp_rank * local_i, local_i)
-            destination = destination.narrow(
-                0, 0 if shard_id == "w1" else local_i, local_i
-            )
-        destination.copy_(source)
+        rank_start = self.moe.tp_rank * local_i
+        copy_len = min(local_i, loaded_global_i - rank_start)
+        if copy_len > 0:
+            if shard_id == "w2":
+                source = loaded_weight.narrow(
+                    1,
+                    rank_start // self.block_size,
+                    copy_len // self.block_size,
+                )
+                destination = destination.narrow(
+                    1, 0, copy_len // self.block_size
+                )
+            else:
+                source = loaded_weight.narrow(0, rank_start, copy_len)
+                destination = destination.narrow(
+                    0, 0 if shard_id == "w1" else local_i, copy_len
+                )
+            destination.copy_(source)
         return True if return_success else None
 
     def get_fused_moe_quant_config(self, layer):
