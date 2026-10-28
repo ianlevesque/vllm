@@ -129,9 +129,10 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
             )
         # A block is atomic, so a per-rank intermediate below the block
         # alignment (e.g. 3072/16=192 for 256-blocks) cannot shard evenly.
-        # Round the partition up; weight_loader zero-fills the padded
-        # region, whose all-zero blocks decode to exact zeros.
-        padded = -(-intermediate_size_per_partition // alignment) * alignment
+        # B12X supports ragged FC2 K at 128 granularity (3072/8=384), so
+        # round the partition up to 128 only; weight_loader zero-fills any
+        # padded remainder, whose all-zero blocks decode to exact zeros.
+        padded = -(-intermediate_size_per_partition // 128) * 128
         return hidden_size, padded
 
     def create_weights(
@@ -164,7 +165,7 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
                 (
                     num_experts,
                     hidden_size,
-                    intermediate_size_per_partition // self.block_size,
+                    -(-intermediate_size_per_partition // self.block_size),
                     self.block_bytes,
                 ),
             ),
@@ -208,6 +209,41 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
                 f"invalid packed tensor {weight_name}: expected a 3D uint8 "
                 f"block tensor, got {loaded_weight.dtype}"
                 f"{tuple(loaded_weight.shape)}"
+            )
+        # A segmented w2 checkpoint encodes each rank's ragged partition
+        # (e.g. 384 at TP8) as its own whole blocks, tail block zero-padded
+        # past the logical K: loaded blocks = ceil(local_i/block) * tp.
+        # Detect it by shape; the standard layout cannot express a ragged
+        # slice without splitting atomic blocks.
+        seg_blocks = -(-local_i // self.block_size)
+        segmented = (
+            shard_id == "w2"
+            and local_i % self.block_size != 0
+            and loaded_weight.ndim == 3
+            and loaded_weight.shape[1] == seg_blocks * self.moe.moe_parallel_config.tp_size
+        )
+        if segmented:
+            if (
+                loaded_weight.dtype != torch.uint8
+                or (loaded_weight.shape[0], loaded_weight.shape[2])
+                != (hidden, self.block_bytes)
+            ):
+                raise ValueError(
+                    f"invalid segmented packed tensor {weight_name}: expected "
+                    f"uint8{(hidden, seg_blocks * self.moe.moe_parallel_config.tp_size, self.block_bytes)}, "
+                    f"got {loaded_weight.dtype}{tuple(loaded_weight.shape)}"
+                )
+            if not 0 <= expert_id < param.shape[0]:
+                raise ValueError(f"invalid Block-quantized expert index: {expert_id}")
+            source = loaded_weight.narrow(
+                1, self.moe.tp_rank * seg_blocks, seg_blocks
+            )
+            param.data[expert_id].narrow(1, 0, seg_blocks).copy_(source)
+            return True if return_success else None
+        if shard_id == "w2" and local_i % self.block_size != 0:
+            raise ValueError(
+                f"ragged intermediate partition {local_i} for {weight_name} "
+                "requires a segmented w2 checkpoint layout"
             )
         if shard_id == "w2":
             fixed_dims = (hidden, self.block_bytes)
