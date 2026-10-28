@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
@@ -52,6 +53,31 @@ def _load_dense_mla() -> Any:
     from b12x.attention import dense_mla
 
     return dense_mla
+
+
+_LAYOUTS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+
+
+def _dense_mla_layout(plan: Any, device: torch.device | None = None) -> Any:
+    """Native scratch plan behind a declared dense-MLA plan.
+
+    B12X >= 1.5 ``dense_mla.plan()`` returns a preparation declaration;
+    geometry (caps, splits, scratch specs) lives on the prepared state's
+    layout.  Resolving it lazy-prepares the plan with its default config.
+    """
+    if hasattr(plan, "shapes_and_dtypes"):
+        return plan
+    try:
+        layout = _LAYOUTS.get(plan)
+    except TypeError:
+        layout = None
+    if layout is None:
+        layout = _load_dense_mla().state(plan, device=device).layout
+        try:
+            _LAYOUTS[plan] = layout
+        except TypeError:
+            pass
+    return layout
 
 
 def _page_table_width(max_cache_tokens: int, page_size: int) -> int:
@@ -136,6 +162,7 @@ def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
     first 64-token chunk is beyond every live sequence, so this does not alter
     the reduction order of any contributing partial.
     """
+    plan = _dense_mla_layout(plan)
     num_splits = int(getattr(plan, "num_splits", 1))
     chunks_per_split = int(getattr(plan, "chunks_per_split", 1))
     if num_splits <= 0 or chunks_per_split <= 0:
@@ -320,7 +347,8 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             max_total_q=self._max_dense_mla_rows,
             dcp_size=self.dcp_world_size,
         )
-        self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
+        self._dense_mla_layout = _dense_mla_layout(self._dense_mla_plan, device)
+        self._workspace_specs = self._dense_mla_layout.shapes_and_dtypes()
         if len(self._workspace_specs) != 1:
             raise RuntimeError("B12X_MLA expected exactly one scratch buffer.")
         scratch_shape, scratch_dtype = self._workspace_specs[0]
@@ -355,7 +383,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         self._dense_mla_flat_global_seq_lens: torch.Tensor | None = None
         self._dense_mla_flat_dcp_remainder: torch.Tensor | None = None
         if self.reorder_batch_threshold > 1:
-            max_table_width = int(self._dense_mla_plan.caps.max_page_table_width)
+            max_table_width = int(self._dense_mla_layout.caps.max_page_table_width)
             self._dense_mla_flat_block_table = torch.zeros(
                 (self._max_dense_mla_rows, max_table_width),
                 dtype=torch.int32,
@@ -398,7 +426,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             self.page_size,
             self._max_dense_mla_rows,
             _max_dcp_local_cache_tokens(vllm_config, dcp_size=self.dcp_world_size),
-            self._dense_mla_plan.num_splits,
+            self._dense_mla_layout.num_splits,
             self._dense_mla_scratch.nbytes / (1 << 20),
         )
 
@@ -422,7 +450,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         metadata.dense_mla_padded_output = self._dense_mla_padded_output
         flatten_decode = False
         if metadata.decode is not None and metadata.num_decodes > 0:
-            plan_table_width = int(self._dense_mla_plan.caps.max_page_table_width)
+            plan_table_width = int(self._dense_mla_layout.caps.max_page_table_width)
             flatten_decode = (
                 metadata.num_decode_tokens > metadata.num_decodes
                 or int(metadata.decode.block_table.shape[1]) > plan_table_width
@@ -733,7 +761,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         users may not, so retain the per-backend private allocation as a compatibility
         path rather than borrowing vLLM's resizable general workspace.
         """
-        specs = plan.shapes_and_dtypes()
+        specs = _dense_mla_layout(plan).shapes_and_dtypes()
         key = id(plan)
         scratch = self._scratch_by_plan.get(key)
         if scratch is None:
@@ -916,7 +944,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         # adaptive branch below on every replay.  If another graph mode ever
         # captures this backend directly, retain the full plan for correctness.
         if q.is_cuda and torch.cuda.is_current_stream_capturing():
-            active_splits = int(plan.num_splits)
+            active_splits = int(_dense_mla_layout(plan).num_splits)
         else:
             active_splits = _active_dense_mla_splits(
                 plan,
