@@ -300,7 +300,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         if self._source_format in B12X_BLOCK_CODECS:
             fused_moe = _require_b12x_fused_moe()
-            block_size, _ = B12X_BLOCK_CODECS[self._source_format]
+            # The w2 block count only bounds the logical intermediate: a
+            # ragged partition (384 = 256 + 128) still occupies two blocks,
+            # so deriving the size from w2 would overstate it as 512 and
+            # B12X preparation would reject the loaded w13 rows.  The w13
+            # row count encodes the exact per-partition size.
+            gated = _b12x_activation_name(activation) in ("silu", "situ")
+            intermediate_size = int(w1.shape[1]) // (2 if gated else 1)
             plan = fused_moe.plan_weights(
                 source=fused_moe.PackedSource(
                     format=self._source_format, w13_layout=self._w13_layout
@@ -313,7 +319,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 geometry=fused_moe.MoEGeometry(
                     num_experts=w1.shape[0],
                     hidden_size=w2.shape[1],
-                    intermediate_size=w2.shape[2] * block_size,
+                    intermediate_size=intermediate_size,
                 ),
             )
             prepared = fused_moe.prepare_weights(
