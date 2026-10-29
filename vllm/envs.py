@@ -227,6 +227,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
+    VLLM_KIMI_K3_REPLICATE_ROUTER_GATE: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1715,6 +1716,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-AR kernel for eligible Kimi-K3 row-parallel
     # attention projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_AR": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_AR", "1"))),
+    # Kimi K3 only. Keep the full MoE router gate weight on every TP rank
+    # (replicated GEMV on the replicated hidden states) instead of sharding
+    # it by expert and all-gathering the fp32 logits each layer. Trades one
+    # small collective per MoE layer for reading the whole (tiny) gate
+    # weight per rank, and makes the gate branch collective-free so it can
+    # overlap the routed down projection on the auxiliary stream. Wins
+    # where collective latency dominates the gate weight read (multi-node
+    # proxy-staged NCCL); off by default elsewhere.
+    "VLLM_KIMI_K3_REPLICATE_ROUTER_GATE": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_REPLICATE_ROUTER_GATE", "0"))
+    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP
