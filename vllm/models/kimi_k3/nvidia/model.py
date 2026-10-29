@@ -325,6 +325,18 @@ def shard_auxiliary_projections(use_sequence_parallel: bool) -> bool:
     return get_tensor_model_parallel_world_size() > 1 and not use_sequence_parallel
 
 
+def _replicate_router_gate(shard_auxiliary: bool) -> bool:
+    """Whether the router gate keeps its full weight on every TP rank.
+
+    The gate input (the replicated hidden states) is identical on all ranks,
+    so a replicated gate produces identical fp32 logits everywhere with no
+    collective, at the cost of each rank reading the whole gate weight.
+    Under sequence parallelism the gate is already replicated; under feature
+    TP sharding it is opt-in via ``VLLM_KIMI_K3_REPLICATE_ROUTER_GATE``.
+    """
+    return (not shard_auxiliary) or envs.VLLM_KIMI_K3_REPLICATE_ROUTER_GATE
+
+
 def _load_padded_tp_shard(
     param: nn.Parameter,
     loaded_weight: torch.Tensor,
@@ -782,6 +794,9 @@ class KimiMoE(nn.Module):
         self.shard_auxiliary_projections = shard_auxiliary_projections(
             use_sequence_parallel
         )
+        self.replicate_router_gate = _replicate_router_gate(
+            self.shard_auxiliary_projections
+        )
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
@@ -825,7 +840,7 @@ class KimiMoE(nn.Module):
         )
 
         # Route with fp32 logits for numerically stable expert selection.
-        if self.shard_auxiliary_projections:
+        if self.shard_auxiliary_projections and not self.replicate_router_gate:
             self.gate = KimiColumnParallelGate(
                 hidden_size, num_experts, f"{prefix}.gate"
             )
@@ -1052,6 +1067,10 @@ class KimiMoE(nn.Module):
             router_output, topk_ids = _router(hidden_states)
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
+        # The aux stream may only carry the down projection while the gate
+        # runs on the default stream when the gate branch is collective-free:
+        # with a TP-sharded gate both branches would issue collectives on the
+        # same communicator from different streams.
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
                 lambda: _router(hidden_states),
@@ -1059,7 +1078,7 @@ class KimiMoE(nn.Module):
                 self._down_proj_events[0],
                 self._down_proj_events[1],
                 self._down_proj_stream
-                if not self.shard_auxiliary_projections
+                if self.replicate_router_gate
                 and num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
                 else None,
             )
