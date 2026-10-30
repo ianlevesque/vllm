@@ -15,6 +15,15 @@ import regex as re
 # (no numeric id) — those are intentionally left unfiltered so the full
 # tensor is loaded and sliced later by RoutedExperts.weight_loader.
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+_WEIGHT_TENSOR_SUFFIXES = (".weight", ".weight_packed")
+_BLOCK_WEIGHT_SCALE_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".qscale_weight",
+    "_weight_scale",
+    "_weight_scale_inv",
+    "_qscale_weight",
+)
 
 
 def parse_expert_id(weight_name: str) -> int | None:
@@ -77,9 +86,13 @@ def should_skip_weight(
     if eid is None:
         # Not an expert weight (dense / shared-expert / embedding) → keep.
         return False
-    # Only skip heavy weight tensors, never scale/metadata tensors.
-    # Scale tensors are tiny and some backends need them from ALL experts
-    # (e.g. FlashInfer NVFP4 computes a global max of activation scales).
-    if not weight_name.endswith((".weight", ".weight_packed")):
+    # Skip the heavy per-expert tensors RoutedExperts ignores for a
+    # non-local expert: weights and block weight scales. Keep scalar
+    # activation/global scales (``input_scale``, ``weight_scale_2`` and
+    # ``*_global_scale``), which some NVFP4 backends aggregate across all
+    # experts before discarding the non-local weights.
+    if not weight_name.endswith(
+        _WEIGHT_TENSOR_SUFFIXES + _BLOCK_WEIGHT_SCALE_SUFFIXES
+    ):
         return False
     return eid not in local_expert_ids

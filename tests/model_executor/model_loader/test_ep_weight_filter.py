@@ -197,9 +197,39 @@ class TestShouldSkipWeight:
             "model.layers.0.mlp.experts.200.gate_proj.weight_packed", self.local_ids
         )
 
-    def test_remote_expert_scale_not_skipped(self):
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            ".weight_scale",
+            ".weight_scale_inv",
+            ".qscale_weight",
+            "_weight_scale",
+            "_weight_scale_inv",
+            "_qscale_weight",
+        ],
+    )
+    def test_remote_expert_block_scale_skipped(self, suffix):
+        assert should_skip_weight(
+            f"model.layers.0.mlp.experts.200.gate_proj{suffix}", self.local_ids
+        )
+
+    def test_local_expert_block_scale_not_skipped(self):
         assert not should_skip_weight(
-            "model.layers.0.mlp.experts.200.gate_proj.weight_scale", self.local_ids
+            "model.layers.0.mlp.experts.10.gate_proj.weight_scale", self.local_ids
+        )
+
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            ".input_scale",
+            ".weight_scale_2",
+            ".weight_global_scale",
+            ".input_global_scale",
+        ],
+    )
+    def test_remote_expert_scalar_scale_not_skipped(self, suffix):
+        assert not should_skip_weight(
+            f"model.layers.0.mlp.experts.200.gate_proj{suffix}", self.local_ids
         )
 
     def test_boundary_expert(self):

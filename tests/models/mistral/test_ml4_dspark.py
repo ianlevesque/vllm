@@ -22,14 +22,20 @@ if current_platform.is_rocm():
         _to_draft_weight_name,
         draft_attention_windows,
     )
-    from vllm.models.mistral_large4.amd.model import MistralLarge4Model
+    from vllm.models.mistral_large4.amd.model import (
+        MistralLarge4ForCausalLM,
+        MistralLarge4Model,
+    )
 else:
     from vllm.models.mistral_large4.nvidia.dspark import (
         MistralLarge4DSparkModel,
         _to_draft_weight_name,
         draft_attention_windows,
     )
-    from vllm.models.mistral_large4.nvidia.model import MistralLarge4Model
+    from vllm.models.mistral_large4.nvidia.model import (
+        MistralLarge4ForCausalLM,
+        MistralLarge4Model,
+    )
 
 
 @pytest.mark.parametrize(
@@ -74,6 +80,20 @@ else:
 )
 def test_checkpoint_weight_mapping(checkpoint_name: str, runtime_name: str):
     assert _to_draft_weight_name(checkpoint_name) == runtime_name
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "unused"),
+    [
+        ("mtp_dspark.backbone.layers.0.attention_norm.weight", True),
+        ("mtp_other.weight", True),
+        ("layers.0.attention.wq.weight", False),
+        ("lerope.alpha", False),
+    ],
+)
+def test_target_checkpoint_weight_selection(checkpoint_name: str, unused: bool):
+    model = MistralLarge4ForCausalLM.__new__(MistralLarge4ForCausalLM)
+    assert model.is_unused_checkpoint_weight(checkpoint_name) is unused
 
 
 def _trainer_rnn_logits(

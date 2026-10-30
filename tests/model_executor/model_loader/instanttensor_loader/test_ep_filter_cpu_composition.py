@@ -87,10 +87,13 @@ class CompositionTest(unittest.TestCase):
             self.assertEqual(
                 set(call["ep_filter_names"]) & set(names), {names[i] for i in ids}
             )
-            self.assertTrue(set(scales + shared).issubset(call["ep_filter_names"]))
+            self.assertEqual(
+                set(call["ep_filter_names"]) & set(scales), {scales[i] for i in ids}
+            )
+            self.assertTrue(set(shared).issubset(call["ep_filter_names"]))
         self.assertEqual(groups, [])
         list(run(["file"], False, local_expert_ids=set()))
-        self.assertEqual(set(calls[-1]["ep_filter_names"]), set(scales + shared))
+        self.assertEqual(set(calls[-1]["ep_filter_names"]), set(shared))
         keys[:] = ["model.layers.0.mlp.experts.gate_up_proj.weight"]
         list(run(["file"], False, local_expert_ids={0}))
         self.assertEqual(calls[-1]["process_group"], "existing-collective")

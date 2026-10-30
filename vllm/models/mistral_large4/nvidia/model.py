@@ -486,5 +486,10 @@ class MistralLarge4ForCausalLM(nn.Module, SupportsEagle3):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        # `_load_weights` skips the embedded DSpark heads; let loaders
+        # that can restrict physical I/O skip them before reading.
+        return name.startswith("mtp_")
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return _load_weights(self, self.model, weights)
