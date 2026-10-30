@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import json
 import os
 import time
 from collections.abc import Callable, Generator, Iterable
@@ -317,10 +318,21 @@ class DefaultModelLoader(BaseModelLoader):
             elif self.load_config.load_format == "instanttensor":
                 vllm_config = get_current_vllm_config_or_none()
                 engram_config = vllm_config.engram_config if vllm_config else None
+                indexed_tensor_files = None
+                index_path = os.path.join(hf_folder, index_file)
+                if os.path.isfile(index_path):
+                    with open(index_path, encoding="utf-8") as index_handle:
+                        weight_map = json.load(index_handle)["weight_map"]
+                    indexed_tensor_files = {
+                        name: os.path.abspath(os.path.join(hf_folder, filename))
+                        for name, filename in weight_map.items()
+                    }
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                     local_expert_ids=self.local_expert_ids,
+                    indexed_tensor_files=indexed_tensor_files,
+                    is_unused_weight=source.is_unused_weight,
                     load_engram_on_cpu=bool(
                         engram_config and engram_config.cpu_offload
                     ),
