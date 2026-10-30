@@ -35,6 +35,14 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
 
     is_sparse = True
     supports_dense_mha_prefill = False
+    # The trtllm-gen return path produces a base-2 LSE, matching the
+    # generic FlashInfer sparse impl's declaration. DCP support rides
+    # the common sparse path (index filtering + LSE combine); adapted
+    # from upstream PR vllm-project/vllm#47779 via the fleet's
+    # unified/2026-08-dcp carry for GLM TP16+DCP2.
+    can_return_lse_for_decode: bool = True
+    supports_dcp: bool = True
+    lse_base_on_e: bool = False
 
     def __init__(
         self,
@@ -112,6 +120,12 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         attn_metadata: FlashInferMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not isinstance(self.index_group, HiSparseMLAIndexGroup):
+            # The common sparse path handles DCP top-k filtering and
+            # valid-count computation, then calls _forward_mqa_kernel
+            # below. HiSparse keeps its dedicated path here (HiSparse
+            # does not support DCP).
+            return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
 
@@ -186,30 +200,6 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             output = torch.cat(outputs) if len(outputs) > 1 else outputs[0]
             return output, None
 
-        kv_rows, block_stride_rows = flat_kv_row_view(
-            kv_c_and_k_pe_cache, attn_metadata.block_size
-        )
-        topk_indices_physical = cast(
-            torch.Tensor,
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-            ),
-        )
-        return (
-            self._run_mqa_kernel(
-                q,
-                # The SM120 kernels are built for 64-row pages only.
-                kv_rows.view(-1, 64, kv_rows.shape[-1]),
-                topk_indices_physical,
-            ),
-            None,
-        )
-
     def _run_mqa_kernel(
         self,
         q: torch.Tensor,
@@ -248,3 +238,105 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             kv_scale_format=self.kv_scale_format,
         )
         return out.squeeze(1)
+
+    def _forward_mqa_kernel(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+        *,
+        layer: AttentionLayer,
+        block_size: int,
+        is_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
+        num_actual_toks = q.shape[0]
+        # Under DCP the incoming query is already head-gathered across
+        # the DCP group (dcp_world_size * local heads) and the shared
+        # reducer reduce-scatters that same head set back, so the
+        # returned width must be the incoming width, not
+        # self.num_heads.
+        in_num_heads = q.shape[1]
+
+        kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
+        # The SM120 kernels are built for 64-row pages only.
+        kv_cache = kv_rows.view(-1, 64, kv_rows.shape[-1])
+
+        output = q.new_empty(
+            (num_actual_toks, in_num_heads, self.kv_lora_rank),
+            dtype=q.dtype,
+        )
+        if self._workspace_buffer is None:
+            self._workspace_buffer = _get_workspace_buffer(q.device)
+
+        from vllm.utils.flashinfer import (
+            flashinfer_trtllm_batch_decode_with_kv_cache_mla,
+        )
+
+        sparse_capacity = topk_indices.shape[1]
+        # Under DCP each rank holds only its interleaved KV shard; the
+        # common path already compacted this rank's top-k slots and
+        # counted the valid prefix per token. The SM120 route maps
+        # seq_lens to the kernel's per-token topk_length. Keep the
+        # uniform-top-k behaviour (seq_lens=None) otherwise.
+        seq_lens = valid_counts if self.dcp_world_size > 1 else None
+        kernel_out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+            query=q.unsqueeze(1),
+            kv_cache=kv_cache.view(torch.uint8).unsqueeze(1),
+            workspace_buffer=self._workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=topk_indices.unsqueeze(1),
+            seq_lens=seq_lens,
+            max_seq_len=sparse_capacity,
+            out=output.unsqueeze(1),
+            bmm1_scale=self.scale,
+            bmm2_scale=1.0,
+            sparse_mla_top_k=sparse_capacity,
+            return_lse=self.need_to_return_lse_for_decode,
+            kv_scale_format=self.kv_scale_format,
+        )
+        if self.need_to_return_lse_for_decode:
+            assert isinstance(kernel_out, tuple)
+            out, lse = kernel_out
+        else:
+            assert isinstance(kernel_out, torch.Tensor)
+            out = kernel_out
+            lse = None
+        out = out.squeeze(1)
+        if lse is None:
+            return out, None
+        lse = self._normalize_lse(lse, num_actual_toks, in_num_heads)
+        # Rows whose top-k slots all live on other DCP ranks must not
+        # contribute to the cross-rank merge.
+        empty_rows = valid_counts == 0
+        out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        return out, lse
+
+    @staticmethod
+    def _normalize_lse(
+        lse: torch.Tensor,
+        num_tokens: int,
+        num_heads: int,
+    ) -> torch.Tensor:
+        # FlashInfer returns the decode LSE either as 2D (num_tokens,
+        # num_heads) or 3D ((num_tokens, num_heads, 1) /
+        # (num_tokens, 1, num_heads)). Collapse all of these to the
+        # (num_tokens, num_heads) the shared DCP reducer expects.
+        if lse.dim() == 3:
+            if lse.shape[-1] == 1:
+                lse = lse.squeeze(-1)
+            elif lse.shape[1] == 1:
+                lse = lse.squeeze(1)
+            elif lse.shape[0] * lse.shape[1] == num_tokens:
+                lse = lse.reshape(num_tokens, lse.shape[-1])
+        if lse.shape != (num_tokens, num_heads):
+            raise RuntimeError(
+                "Unexpected FlashInfer SM120 sparse MLA LSE shape: "
+                f"{tuple(lse.shape)}, expected ({num_tokens}, {num_heads})."
+            )
+        return lse
