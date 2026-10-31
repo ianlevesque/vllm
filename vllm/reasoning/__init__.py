@@ -152,6 +152,17 @@ _REASONING_PARSERS_TO_REGISTER = {
         "muse_glimmer_reasoning_parser",
         "MuseGlimmerReasoningParser",
     ),
+    # Restored Muse Spark carry (upstream #61879 merged the model code but
+    # not the registration; the muse_spark checkpoint needs these names).
+    "muse": (
+        "muse_reasoning_parser",
+        "MuseReasoningParser",
+    ),
+    # Aliases of "muse".
+    "musespark1x": (
+        "muse_reasoning_parser",
+        "MuseReasoningParser",
+    ),
     "qwen3": (
         "qwen3_engine_reasoning_parser",
         "Qwen3ParserReasoningAdapter",

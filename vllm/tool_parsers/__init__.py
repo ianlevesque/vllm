@@ -178,6 +178,17 @@ _TOOL_PARSERS_TO_REGISTER = {
         "muse_glimmer_tool_parser",
         "MuseGlimmerToolParser",
     ),
+    # Restored Muse Spark carry (upstream #61879 merged the model code but
+    # not the registration; the muse_spark checkpoint needs these names).
+    "muse": (
+        "muse_tool_parser",
+        "MuseToolParser",
+    ),
+    # Aliases of "muse".
+    "musespark1x": (
+        "muse_tool_parser",
+        "MuseToolParser",
+    ),
     "openai": (
         "gptoss_tool_parser",
         "GptOssToolParser",

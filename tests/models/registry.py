@@ -1175,6 +1175,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "MuseGlimmerForConditionalGeneration": _HfExamplesInfo(
         "meta-models/Muse-Glimmer-30B",
     ),
+    "MuseSparkForConditionalGeneration": _HfExamplesInfo(
+        "meta-models/Muse-Spark-1.2-816B-A42B-open",
+        is_available_online=False,
+    ),
     "MuseGlimmerForCausalLM": _HfExamplesInfo(
         "meta-models/Muse-Glimmer-30B",
     ),
@@ -1494,6 +1498,11 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         speculative_model="meta-models/Muse-Glimmer-30B-assistant",
         max_model_len=8192,  # Reduce max len to ensure test runs in low-VRAM CI env
         max_num_seqs=32,
+    ),
+    "MuseSparkDSparkModel": _HfExamplesInfo(
+        "meta-models/Muse-Spark-1.2-816B-A42B-open",
+        speculative_model="meta-models/Muse-Spark-1.2-816B-A42B-open",
+        is_available_online=False,
     ),
     "DFlashMuseGlimmerAssistantModel": _HfExamplesInfo(
         "meta-models/Muse-Glimmer-30B",
