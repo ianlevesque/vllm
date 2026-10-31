@@ -150,8 +150,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
-    VLLM_ROCM_USE_AITER_FP8BMM: bool = False
-    VLLM_ROCM_USE_AITER_FP4BMM: bool = False
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
@@ -336,6 +334,27 @@ if TYPE_CHECKING:
     VLLM_REQUEST_BODY_LOG_LEVEL: str = "DEBUG"
 
 
+    VLLM_DCP_SHARD_DRAFT: bool = True
+    VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_KIMI_FUSED_TOPK16: bool = False
+    VLLM_KIMI_SHARD_QKV_A: bool = False
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
+    VLLM_ROCE_HIERARCHICAL_MIN_SIZE: str = "64KB"
+    VLLM_ROCM_AITER_MEGA_MOE_FUSE_SHARED_EXPERTS: bool = False
+    VLLM_ROCM_AITER_MLA_DCP_VERIFY: Literal["auto", "asm", "segmented"] = "auto"
+    VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
+    VLLM_ROCM_USE_AITER_FP4BMM: bool = True
+    VLLM_ROCM_USE_AITER_FP8BMM: bool = True
+    VLLM_SLEEP_RELEASE_TRANSPORT: bool = False
+    VLLM_STARTUP_MEMORY_DIAGNOSTICS: bool = False
+    VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
+    VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
+    VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
+    VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
 def get_default_cache_root():
     return os.getenv(
         "XDG_CACHE_HOME",
@@ -1359,14 +1378,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use aiter triton fp8 bmm kernel for MLA kv_b_proj.
     # By default is disabled: it re-quantizes the projection weights online,
     # regardless of the precision the checkpoint asked for.
-    "VLLM_ROCM_USE_AITER_FP8BMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_FP8BMM", "False").lower() in ("true", "1")
-    ),
     # Whether to use aiter triton fp4 bmm kernel for MLA kv_b_proj.
     # By default is disabled, for the same reason as the fp8 variant above.
-    "VLLM_ROCM_USE_AITER_FP4BMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_FP4BMM", "False").lower() in ("true", "1")
-    ),
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
@@ -1829,9 +1842,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Custom routing strategies can be registered by
     # RoutingSimulator.register_strategy()
     # Note: custom strategies may not produce correct model outputs
-    "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": lambda: os.environ.get(
-        "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", ""
-    ).lower(),
     # Regex timeout for use by the vLLM tool parsing plugins.
     "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
@@ -1913,7 +1923,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Used to set the process name prefix for vLLM processes.
     # This is useful for debugging and monitoring purposes.
     # The default value is "VLLM".
-    "VLLM_PROCESS_NAME_PREFIX": lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
     # Allow chunked local attention with hybrid kv cache manager.
     # Currently using the Hybrid KV cache manager with chunked local attention
     # in the Llama4 models (the only models currently using chunked local attn)
@@ -2231,9 +2240,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_XPU_INC_WNA16_BACKEND", "auto", ["auto", "ark", "w4a16", "w4a8"]
     ),
     # Enable simple KV offload.
-    "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
-        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
-    ),
     # Direct DCP ops default on when applicable; set to 1 to enforce or 0 to disable.
     "VLLM_USE_DIRECT_DCP_A2A": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_A2A")
@@ -2252,7 +2258,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
-    "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
     "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),
@@ -2277,6 +2282,77 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_REQUEST_BODY_LOG_LEVEL": lambda: os.getenv(
         "VLLM_REQUEST_BODY_LOG_LEVEL", "DEBUG"
     ).upper(),
+    "VLLM_DCP_SHARD_DRAFT": lambda: bool(int(os.getenv("VLLM_DCP_SHARD_DRAFT", "1"))),
+    "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
+    ),
+    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_KIMI_FUSED_TOPK16": lambda: bool(
+        int(os.getenv("VLLM_KIMI_FUSED_TOPK16", "0"))
+    ),
+    "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": lambda: os.environ.get(
+        "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", ""
+    ).lower(),
+    "VLLM_PROCESS_NAME_PREFIX": lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+    ),
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    "VLLM_ROCE_HIERARCHICAL_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ROCE_HIERARCHICAL_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_HIERARCHICAL_MIN_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_HIERARCHICAL_MIN_SIZE", "64KB"
+    ),
+    "VLLM_ROCM_AITER_MEGA_MOE_FUSE_SHARED_EXPERTS": lambda: (
+        os.getenv("VLLM_ROCM_AITER_MEGA_MOE_FUSE_SHARED_EXPERTS", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_ROCM_AITER_MLA_DCP_VERIFY": env_with_choices(
+        "VLLM_ROCM_AITER_MLA_DCP_VERIFY",
+        "auto",
+        ["auto", "asm", "segmented"],
+        case_sensitive=False,
+    ),
+    "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FP4_ASM_GEMM", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_USE_AITER_FP4BMM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FP4BMM", "True").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_USE_AITER_FP8BMM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FP8BMM", "True").lower() in ("true", "1")
+    ),
+    "VLLM_SLEEP_RELEASE_TRANSPORT": lambda: bool(
+        int(os.getenv("VLLM_SLEEP_RELEASE_TRANSPORT", "0"))
+    ),
+    "VLLM_STARTUP_MEMORY_DIAGNOSTICS": lambda: bool(
+        int(os.getenv("VLLM_STARTUP_MEMORY_DIAGNOSTICS", "0"))
+    ),
+    "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE": env_with_choices(
+        "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "auto", ["auto", "nccl", "shm"]
+    ),
+    "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM": lambda: bool(
+        int(os.getenv("VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM", "0"))
+    ),
+    "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": lambda: bool(
+        int(os.getenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1"))
+    ),
+    "VLLM_USE_RAY_WRAPPED_PP_COMM": lambda: bool(
+        int(os.getenv("VLLM_USE_RAY_WRAPPED_PP_COMM", "1"))
+    ),
+    "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
+        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
+    ),
+    "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
 }
 
 
