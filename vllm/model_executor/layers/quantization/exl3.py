@@ -57,6 +57,20 @@ EXL3_MANIFEST_FILENAME = "exl3-manifest.json"
 EXL3_CODEC = "EXL3_K2_LUT_E4M3"
 
 
+def make_exl3_activation_spec(activation_spec: Any, nonlinearity: str) -> Any:
+    """B12X activation contract for EXL3 routed experts.
+
+    Public activations stay BF16, while the trellis boundary rotations
+    execute through B12X's FP16 full-rotation path.
+    """
+    return activation_spec(
+        mode="a16",
+        nonlinearity=nonlinearity,
+        io_dtype=torch.bfloat16,
+        rotation_dtype=torch.float16,
+    )
+
+
 def plan_exl3_extent(
     num_slots: int, slot_channels: int, tp_world: int, tp_rank: int,
     intermediate_size_per_partition: int,
@@ -340,12 +354,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         device = layer.w13_weight.device
         plan = fused_moe.plan_weights(
             source=source,
-            activation=fused_moe.ActivationSpec(
-                mode="a16",
-                nonlinearity=(
-                    "situ" if layer.activation == MoEActivation.SITU else "silu"
-                ),
-                io_dtype=torch.bfloat16,
+            activation=make_exl3_activation_spec(
+                fused_moe.ActivationSpec,
+                "situ" if layer.activation == MoEActivation.SITU else "silu",
             ),
             geometry=fused_moe.MoEGeometry(
                 num_experts=geometry.num_experts,
