@@ -42,3 +42,32 @@ def test_plan_extent_rejects_ragged():
         plan_exl3_extent(96, 32, 8, 0, 400)
     with pytest.raises(ValueError, match="split evenly"):
         plan_exl3_extent(96, 32, 7, 0, 416)
+
+
+def test_dense_fp8_config_and_predicate():
+    from vllm.model_executor.layers.quantization.exl3 import dense_fp8_applies
+
+    cfg = Exl3Config.from_config(
+        {
+            "quant_method": "exl3",
+            "exl3": {"codec": "EXL3_K2_LUT_E4M3"},
+            "dense_fp8": {"scheme": "per_tensor_e4m3"},
+        }
+    )
+    assert cfg.dense_fp8 is True
+    plain = Exl3Config.from_config({"exl3": {}})
+    assert plain.dense_fp8 is False
+    with pytest.raises(ValueError, match="dense_fp8"):
+        Exl3Config.from_config({"dense_fp8": {"scheme": "block"}})
+
+    base = "language_model.model.layers.0"
+    assert dense_fp8_applies(f"{base}.self_attn.q_proj", 3584, 3584)
+    assert dense_fp8_applies(
+        f"{base}.block_sparse_moe.shared_experts.gate_up_proj", 3584, 6144
+    )
+    assert not dense_fp8_applies(
+        f"{base}.block_sparse_moe.gate", 3584, 896
+    )
+    assert not dense_fp8_applies("vision_tower.blocks.0.attn.qkv", 1280, 3840)
+    assert not dense_fp8_applies(f"{base}.input_layernorm", 3584, 1)
+    assert not dense_fp8_applies("language_model.model.embed_tokens", 3584, 163840)
