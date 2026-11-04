@@ -615,6 +615,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+        # A dense impl would silently ignore the top-k indices.
+        if use_sparse and not self.impl.is_sparse:
+            raise RuntimeError(
+                f"{prefix}: sparse (DSA) attention layer requires a sparse "
+                f"attention backend, but got {self.attn_backend.get_name()}. "
+                "Serving with it would silently run full attention."
+            )
+        if use_sparse:
+            logger.info_once(
+                "Sparse (DSA) attention active: backend=%s, impl=%s",
+                self.attn_backend.get_name(),
+                type(self.impl).__name__,
+            )
+
         self.prefill_backend: MLAPrefillBackend | None
         if self.impl.is_sparse and not (
             self.impl.supports_dense_mha_prefill and self.supports_dense_mha_prefill

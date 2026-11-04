@@ -106,6 +106,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MLP,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -1118,6 +1119,7 @@ class KimiDecoderLayer(nn.Module):
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
         run_gemm_rs_ar: bool = False,
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1172,24 +1174,41 @@ class KimiDecoderLayer(nn.Module):
             assert v_head_dim is not None
             assert kv_lora_rank is not None
             assert mla_use_nope, "Kimi-K3 MLA (MultiHeadLatentAttention) is NoPE-only"
+            if config.is_dsa_layer(layer_idx):
+                self.self_attn = KimiK3DSAAttention(
+                    config=config,
+                    hidden_size=self.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    v_head_dim=v_head_dim,
+                    q_lora_rank=config.q_lora_rank,
+                    kv_lora_rank=kv_lora_rank,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                    topk_indices_buffer=topk_indices_buffer,
+                    aux_stream=aux_stream,
+                )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.
-            self.self_attn = MultiHeadLatentAttention(
-                config=config,
-                hidden_size=self.hidden_size,
-                num_heads=config.num_attention_heads,
-                qk_nope_head_dim=qk_nope_head_dim,
-                qk_rope_head_dim=qk_rope_head_dim,
-                v_head_dim=v_head_dim,
-                q_lora_rank=config.q_lora_rank,
-                kv_lora_rank=kv_lora_rank,
-                use_output_gate=bool(config.mla_use_output_gate),
-                cache_config=cache_config,
-                quant_config=quant_config,
-                prefix=f"{prefix}.self_attn",
-                aux_stream=aux_stream,
-                run_gemm_rs_ar=run_gemm_rs_ar,
-            )
+            else:
+                self.self_attn = MultiHeadLatentAttention(
+                    config=config,
+                    hidden_size=self.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    v_head_dim=v_head_dim,
+                    q_lora_rank=config.q_lora_rank,
+                    kv_lora_rank=kv_lora_rank,
+                    use_output_gate=bool(config.mla_use_output_gate),
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                    aux_stream=aux_stream,
+                    run_gemm_rs_ar=run_gemm_rs_ar,
+                )
 
         if self.use_sequence_parallel:
             self.self_attn.o_proj.reduce_results = False
@@ -1384,6 +1403,21 @@ class KimiDecoderLayer(nn.Module):
         return hidden_states, prefix_sum, residual
 
 
+# (param_name, shard_name, shard_id) for the merged DSA wkv_index.
+_DSA_STACKED_PARAMS_MAPPING = [
+    (".self_attn.dsa_indexer.wkv_index.", ".self_attn.indexer.wk.", 0),
+    (".self_attn.dsa_indexer.wkv_index.", ".self_attn.indexer.weights_proj.", 1),
+]
+
+# DSA indexer weight rename mapping. Specific rules must come before the
+# generic prefix rule.
+_DSA_RENAME_PARAMS_MAPPING = [
+    (".self_attn.dsa_indexer.wq_index.", ".self_attn.indexer.wq_b."),
+    (".self_attn.dsa_indexer.k_index_norm.", ".self_attn.indexer.k_norm."),
+    (".self_attn.dsa_indexer.", ".self_attn.indexer."),
+]
+
+
 class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1436,6 +1470,28 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # level and threaded into each attention layer).
         aux_stream = torch.cuda.Stream()
 
+        # Single model-level top-k buffer shared by all DSA layers.
+        # [max_num_batched_tokens + dcp_kg_slack, index_topk] int32.
+        self.topk_indices_buffer: torch.Tensor | None = None
+        if config.dsa_config is not None and any(
+            config.is_dsa_layer(layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
+        ):
+            topk_buffer_device = "cuda" if torch.cuda.is_available() else "cpu"
+            dcp_kg_slack = (
+                parallel_config.decode_context_parallel_size - 1
+                if parallel_config.decode_context_parallel_size > 1
+                else 0
+            )
+            self.topk_indices_buffer = torch.empty(
+                (
+                    vllm_config.scheduler_config.max_num_batched_tokens + dcp_kg_slack,
+                    config.dsa_config.index_topk,
+                ),
+                dtype=torch.int32,
+                device=topk_buffer_device,
+            )
+
         def get_layer(prefix: str):
             return KimiDecoderLayer(
                 config,
@@ -1443,6 +1499,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 prefix,
                 aux_stream=aux_stream,
                 run_gemm_rs_ar=self.run_gemm_rs_ar,
+                topk_indices_buffer=self.topk_indices_buffer,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -1450,6 +1507,22 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+
+        if config.dsa_config is not None:
+            # A DSA layer silently built as dense MLA would be invisible in
+            # outputs; check the wiring matches dsa_config.
+            n_dsa_built = sum(
+                isinstance(layer.self_attn, KimiK3DSAAttention)
+                for layer in self.layers[self.start_layer : self.end_layer]
+            )
+            n_dsa_expected = sum(
+                config.is_dsa_layer(layer_idx)
+                for layer_idx in range(self.start_layer, self.end_layer)
+            )
+            assert n_dsa_built == n_dsa_expected, (
+                f"DSA wiring broken: built {n_dsa_built} DSA attention layers "
+                f"but dsa_config expects {n_dsa_expected}."
+            )
         self.num_attn_res_blocks = (
             cdiv(self.end_layer, self.attn_res_block_size)
             if self.attn_res_block_size is not None
@@ -1819,6 +1892,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     (".fused_qkv_a_proj", ".q_a_proj", 0),
                     (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
                 ]
+            if self.config.dsa_config is not None and self.config.mla_use_output_gate:
+                # DSA layers have no fused_qkv_a_g_proj param; fall back to
+                # the plain fused_qkv_a_proj mapping.
+                stacked_params_mapping += [
+                    (".fused_qkv_a_proj", ".q_a_proj", 0),
+                    (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
+                ]
+        if self.config.dsa_config is not None:
+            stacked_params_mapping += _DSA_STACKED_PARAMS_MAPPING
         use_mega_moe = any(
             module.use_mega_moe
             for module in self.modules()
@@ -1913,6 +1995,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     )
                     break
                 else:
+                    # Rename indexer checkpoint names into the module tree
+                    # before the param lookup below.
+                    if self.config.dsa_config is not None:
+                        for param_name, weight_name in _DSA_RENAME_PARAMS_MAPPING:
+                            if weight_name in name:
+                                name = name.replace(weight_name, param_name)
+                                break
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias")
@@ -2068,6 +2157,11 @@ class KimiLinearForCausalLM(
         # non-contiguous streamed prefixes. Finalize only after the full stream.
         self.model.finalize_mega_moe_weights()
         self.model.reserve_attn_res_workspace()
+        # DSA fused-forward packing (no-op unless its preconditions hold;
+        # at DCP>1 or without the low-latency GEMM it keeps the wrapper path).
+        for module in self.model.modules():
+            if isinstance(module, KimiK3DSAAttention):
+                module.pack_projections()
         # The fused MultiHeadLatentAttention's process_weights_after_loading
         # (W_UK_T / W_UV absorption) is driven by the loader's generic post-load
         # hook for any AttentionLayerBase, so no manual trigger is needed here.

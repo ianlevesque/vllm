@@ -36,6 +36,18 @@ def get_paged_mqa_page_sizes() -> tuple[int, ...]:
     return (64,) if current_platform.is_device_capability_family(120) else (32, 64)
 
 
+def mqa_logits_use_mx_scales() -> bool:
+    """Whether the MQA logits kernels take only MX-scaled inputs.
+
+    On SM100 they need MXFP8/MXFP4 Q and K with packed UE8M0 scales and BF16
+    weights, and return BF16 logits. FP8 indexer K caches then store each
+    token's power-of-two scale as four equal UE8M0 bytes instead of an fp32.
+    """
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
+
+
 def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     """Check if DeepGemm should be auto-disabled for this model on Blackwell.
 
