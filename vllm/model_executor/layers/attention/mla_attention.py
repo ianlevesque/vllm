@@ -316,6 +316,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
     get_kv_quant_mode,
     is_quantized_kv_cache,
 )
@@ -2801,9 +2802,18 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         ):
             self.dcp_world_size = 1
             self.dcp_virtual_block_size = self.dcp_local_block_size
+        # Hybrid grouping wraps uniform layer specs in
+        # UniformTypeKVCacheSpecs; unwrap so the sliding-window draft spec is
+        # recognized (otherwise the window compaction below never runs and
+        # the draft reads evicted block-table entries past the window).
+        _window_spec = (
+            kv_cache_spec.first_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
+            else kv_cache_spec
+        )
         self._non_causal_mla_window = (
-            kv_cache_spec.sliding_window
-            if isinstance(kv_cache_spec, SlidingWindowMLASpec)
+            _window_spec.sliding_window
+            if isinstance(_window_spec, SlidingWindowMLASpec)
             and self.non_causal_multi_token_decode
             else 0
         )
