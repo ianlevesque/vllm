@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_COMPACT_ROPE: bool = False
     VLLM_KIMI_SHARD_QKV_A: bool = False
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_DSPARK_WINDOW_DEBUG: bool = False
     VLLM_DCP_SHARD_DRAFT: bool = True
     VLLM_KIMI_FUSED_TOPK16: bool = False
     VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
@@ -1577,6 +1578,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
     "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
+    # Diagnostic: log (rate-limited) the non-causal MLA window compaction and
+    # the DFlash context slot statistics. Read from os.environ at the two
+    # sites; registered here so environment validation knows the name.
+    "VLLM_DSPARK_WINDOW_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_WINDOW_DEBUG", "0"))
     ),
     "VLLM_DCP_SHARD_DRAFT": lambda: bool(int(os.getenv("VLLM_DCP_SHARD_DRAFT", "1"))),
     "VLLM_KIMI_FUSED_TOPK16": lambda: bool(
