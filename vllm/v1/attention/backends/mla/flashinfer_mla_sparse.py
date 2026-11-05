@@ -192,6 +192,10 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
         return FlashInferMLASparseSM120Impl
 
+    @staticmethod
+    def get_builder_cls() -> type["FlashInferMLASparseMetadataBuilder"]:
+        return FlashInferMLASparseSM120MetadataBuilder
+
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major == 12
@@ -280,6 +284,28 @@ class FlashInferMLASparseMetadataBuilder(
             supports_spec_as_decode=True,
             supports_dcp_with_varlen=True,
         )
+
+
+class FlashInferMLASparseSM120MetadataBuilder(FlashInferMLASparseMetadataBuilder):
+    """SM120 builder: cap the decode threshold at the kernel envelope.
+
+    The SM120 sparse-MLA decode instantiations accept at most 64 batch
+    tokens, but the shared head-count table raises the threshold to 1024
+    for unlisted head counts, so short prefills get classified as
+    decodes and the kernel rejects them. Capping at 64 routes longer
+    queries to the prefill path; spec-decode verify batches stay decode.
+    """
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        if self.reorder_batch_threshold is not None:
+            self.reorder_batch_threshold = min(self.reorder_batch_threshold, 64)
 
 
 class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilder):
