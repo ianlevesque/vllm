@@ -70,7 +70,13 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
             supports_dcp_with_varlen=not kv_cache_spec.dcp_sharded,
         )
         # DCP local sequence lengths are not advanced between draft steps.
-        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
+        # A windowed non-causal draft derives its block table/seq_lens in
+        # build() (window compaction into persistent buffers); the no-op
+        # update below cannot refresh it, so force an eager metadata
+        # rebuild per draft step when the window is active.
+        self.supports_draft_decode_metadata_update = (
+            self.dcp_world_size == 1 and not self._non_causal_mla_window
+        )
         self._reserve_attn_logits_workspace()
 
     def update_draft_decode_metadata(self, _metadata: MLACommonMetadata) -> None:
