@@ -56,7 +56,19 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # A non-DCP-sharded spec (e.g. the DSpark draft's KV group) is not
+        # partitioned by DCP, so varlen spec-decode queries need no DCP
+        # varlen support; without this the base threshold init forces
+        # reorder_batch_threshold=1 at DCP>1 and FULL cudagraph capture of
+        # the multi-token verify batch asserts. Sharded specs keep the
+        # conservative default.
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            supports_dcp_with_varlen=not kv_cache_spec.dcp_sharded,
+        )
         # DCP local sequence lengths are not advanced between draft steps.
         self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
         self._reserve_attn_logits_workspace()
