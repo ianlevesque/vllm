@@ -2255,6 +2255,10 @@ def build_mla_chunked_context_metadata(
     )
 
 
+_WINDOW_DEBUG = __import__("os").environ.get("VLLM_DSPARK_WINDOW_DEBUG", "0") == "1"
+_WINDOW_DEBUG_COUNT = [0]
+
+
 def _compact_non_causal_mla_window(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2640,6 +2644,21 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 compact_table=compact_table,
                 compact_lens=compact_lens,
             )
+            if _WINDOW_DEBUG and _WINDOW_DEBUG_COUNT[0] < 60:
+                _sl = int(seq_lens[0].item())
+                if _sl > self._non_causal_mla_window:
+                    _WINDOW_DEBUG_COUNT[0] += 1
+                    _shift = max(_sl - self._non_causal_mla_window, 0) // self.page_size
+                    logger.warning(
+                        "WINDOWDBG build seq_len=%d compact_len=%d shift=%d "
+                        "in_table[0,:48]=%s compact[0,:36]=%s compact_zeros36=%d",
+                        _sl,
+                        int(compact_lens[0].item()),
+                        _shift,
+                        block_table_tensor[0, :48].tolist(),
+                        compact_table[0, :36].tolist(),
+                        int((compact_table[0, :36] == 0).sum().item()),
+                    )
             block_table_tensor = compact_table
             seq_lens = compact_lens
             max_seq_len = min(

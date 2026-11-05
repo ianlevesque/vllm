@@ -453,6 +453,29 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
+        if (
+            __import__("os").environ.get("VLLM_DSPARK_WINDOW_DEBUG", "0") == "1"
+            and num_target_tokens > 100
+            and getattr(self, "_window_dbg_count", 0) < 80
+        ):
+            self._window_dbg_count = getattr(self, "_window_dbg_count", 0) + 1
+            _ctx_slots = self._context_slot_mappings[0, :num_target_tokens]
+            _ctx_pos = self.context_positions[:num_target_tokens]
+            _pad = int((_ctx_slots < 0).sum().item())
+            logger.warning(
+                "WINDOWDBG prepare step=%d num_target=%d ctx_pos=[%d..%d] "
+                "ctx_slots pad=%d/%d min=%d max=%d seq_lens=%s",
+                self._window_dbg_count,
+                num_target_tokens,
+                int(_ctx_pos.min().item()),
+                int(_ctx_pos.max().item()),
+                _pad,
+                num_target_tokens,
+                int(_ctx_slots.min().item()),
+                int(_ctx_slots.max().item()),
+                self.input_buffers.seq_lens[:num_reqs].tolist(),
+            )
+
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(
                 dp_sync_state, num_reqs, self.num_query_per_req
