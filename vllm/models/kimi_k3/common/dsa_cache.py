@@ -1,16 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3.1 DSA indexer cache helpers (fleet port of PR #65685).
+"""Kimi-K3.1 DSA indexer cache, shared by the NVIDIA and ROCm stacks.
 
-The upstream packed-cache classes (KimiK3IndexerCache/Backend and
-packed_dsa_block_size) target a newer-main KV-cache API that this
-lineage does not have; the fleet port uses the stock
-DeepseekV32IndexerCache with its standard MLAAttentionSpec instead.
-Only the fp4-selection and entry-size helpers are needed here.
+Fleet port of PR #65685 piece A: the indexer cache runs at the model
+block size on the packed KV layout. The backend declares
+writes_kv_cache_from_block_table, the runner splits packed blocks into
+64-token kernel blocks, and the metadata builder derives writer slots
+from the kernel-mapped block table (persistent buffer, capture-safe).
+packed_dsa_block_size (piece C) is deliberately not ported: the fleet
+keeps its qualified 1024/4096 block geometry.
 """
 
-from vllm.config import VllmConfig
+from dataclasses import replace
+
+import torch
+
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.sparse_attn_indexer import MXFP4_BLOCK_SIZE
-from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+)
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerBackend,
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerMetadataBuilder,
+    dsa_indexer_uses_fp4,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 
 def kimi_k3_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
@@ -46,3 +64,103 @@ def indexer_cache_entry_bytes(head_dim: int, use_fp4_cache: bool) -> int:
     if use_fp4_cache:
         return head_dim // 2 + head_dim // MXFP4_BLOCK_SIZE
     return head_dim + 4
+
+
+class KimiK3IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    """Writes the indexer keys at slots derived from the block table, as the
+    compressed indexers are written: in a packed block row the block table
+    addresses 64-token kernel pages, which manager slots do not."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.use_pcp:
+            raise NotImplementedError("Kimi-K3.1 packed DSA caches with PCP")
+        # The K3.1 key format, validated as KimiK3DSAIndexer selects it.
+        self.indexer_uses_fp4 = kimi_k3_indexer_uses_fp4(self.vllm_config)
+        if self.indexer_uses_fp4 and current_platform.is_rocm():
+            self._needs_global_row_bounds = self.dcp_world_size > 1
+            # The FP4 prefill op always splits a chunk's query rows over the
+            # DCP ranks, so the chunk planner gets the same per-rank budget.
+            self._rowshard_dcp_prefill = self._needs_global_row_bounds
+        self.slot_mapping_buffer = torch.zeros(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> DeepseekV32IndexerMetadata:
+        slot_mapping = get_compressed_slot_mapping(
+            common_attn_metadata.num_actual_tokens,
+            common_attn_metadata.slot_mapping,
+            common_attn_metadata.query_start_loc,
+            common_attn_metadata.seq_lens,
+            common_attn_metadata.block_table_tensor,
+            self.kv_cache_spec.block_size,
+            compress_ratio=1,
+            out=self.slot_mapping_buffer,
+            dcp_world_size=self.dcp_world_size,
+            cp_interleave=self.cp_kv_cache_interleave_size,
+        )
+        metadata = super().build(
+            common_prefix_len,
+            replace(common_attn_metadata, slot_mapping=slot_mapping),
+            fast_build,
+        )
+        if self.indexer_uses_fp4 and current_platform.is_rocm() and metadata.prefill:
+            from vllm.models.kimi_k3.amd.ops.fp4_indexer_prefill import (
+                prepare_prefill_metadata,
+            )
+
+            metadata.prefill = prepare_prefill_metadata(
+                metadata.prefill,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        return metadata
+
+
+class KimiK3IndexerBackend(DeepseekV32IndexerBackend):
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
+        if kv_cache_spec is not None:
+            fp4 = kv_cache_spec.head_size == 68
+        else:
+            fp4 = (
+                get_current_vllm_config().attention_config.resolve_indexer_kv_dtype(
+                    "fp8"
+                )
+                == "mxfp4"
+            )
+        return (
+            [64]
+            if fp4
+            else DeepseekV32IndexerBackend.get_supported_kernel_block_sizes(
+                kv_cache_spec
+            )
+        )
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # Pack the indexer pages beside the MLA pages inside each block.
+        # At num_kv_heads=1 BLHNC and BLNHC are physically identical; the
+        # fleet resolves BLNHC for the shared group, so accept both.
+        return (KVCacheLayout.BLHNC, KVCacheLayout.BLNHC)
+
+    @classmethod
+    def writes_kv_cache_from_block_table(cls) -> bool:
+        return True
+
+    @staticmethod
+    def get_builder_cls() -> type[KimiK3IndexerMetadataBuilder]:
+        return KimiK3IndexerMetadataBuilder
+
+
+class KimiK3IndexerCache(DeepseekV32IndexerCache):
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return KimiK3IndexerBackend
