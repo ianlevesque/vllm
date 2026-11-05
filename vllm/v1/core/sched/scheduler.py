@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -61,6 +62,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
+    iter_layer_specs,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
@@ -411,6 +413,9 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.mamba_block_size = self._resolve_mamba_block_size(
+            kv_cache_config, self.cache_config.block_size
+        )
         # TODO: Support models with multiple Mamba specs that require different
         # prefill checkpoint alignments instead of selecting the first one.
         self.mamba_prefill_checkpoint_alignment = next(
@@ -529,6 +534,25 @@ class Scheduler(SchedulerInterface):
         # Reaching max_tokens finishes the request, so no step verifies the drafts.
         return min_num_output_tokens >= request.max_tokens
 
+    @staticmethod
+    def _resolve_mamba_block_size(kv_cache_config: KVCacheConfig, default: int) -> int:
+        """Token span of one recurrent-state checkpoint block.
+
+        The recurrent checkpoint cadence comes from the resolved Mamba specs,
+        not from `cache_config.block_size` (`default`), which is the minimum
+        over the prefix-cacheable groups: an explicit --mamba-block-size can be
+        coarser than the attention page (local-inference-lab #457), and a
+        draft group with a smaller block pulls that minimum below it. Group
+        specs are read as `KVCacheConfig.has_mamba_layers` reads them.
+        """
+        mamba_block_sizes = {
+            spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+            if isinstance(spec, MambaSpec)
+        }
+        return math.lcm(*mamba_block_sizes) if mamba_block_sizes else default
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -555,7 +579,9 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        # The Mamba groups' block size (see __init__); stubs that predate it
+        # carry it in `cache_config.block_size`.
+        block_size = getattr(self, "mamba_block_size", self.cache_config.block_size)
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.

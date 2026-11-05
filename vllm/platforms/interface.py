@@ -957,6 +957,7 @@ class Platform:
         """
         from math import lcm
 
+        from vllm.config.cache import CacheConfig
         from vllm.config.vllm import set_current_vllm_config
         from vllm.model_executor.layers.mamba.abstract import (
             get_mamba_prefill_checkpoint_alignment,
@@ -976,6 +977,21 @@ class Platform:
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+
+        # A --mamba-block-size the user set, as opposed to the default the
+        # model config hook derives from the block size at config time
+        # (MambaModelConfig: the --block-size value, or the default block
+        # size without one). Only the former is a cadence to keep; the latter
+        # follows the block size chosen below.
+        configured_mamba_block_size = None
+        if cache_config.mamba_cache_mode == "align":
+            derived_default = (
+                cache_config.block_size
+                if cache_config.user_specified_block_size
+                else CacheConfig.DEFAULT_BLOCK_SIZE
+            )
+            if cache_config.mamba_block_size != derived_default:
+                configured_mamba_block_size = cache_config.mamba_block_size
 
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
@@ -1151,7 +1167,28 @@ class Platform:
             )
 
         if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = cache_config.block_size
+            # An explicitly configured Mamba block is the recurrent-state
+            # checkpoint cadence. It does not determine the physical page
+            # size: Mamba pages are padded to the attention page below. This
+            # permits a hybrid model to align recurrent checkpoints with a
+            # coarser attention or DCP boundary while retaining smaller
+            # physical attention pages. (local-inference-lab #457)
+            if (
+                configured_mamba_block_size is not None
+                and configured_mamba_block_size % cache_config.block_size == 0
+            ):
+                cache_config.mamba_block_size = configured_mamba_block_size
+            else:
+                if configured_mamba_block_size is not None:
+                    logger.warning(
+                        "Ignoring --mamba-block-size %d: in align mode the "
+                        "recurrent checkpoint cadence must be a multiple of "
+                        "the attention block size (%d tokens). Using %d.",
+                        configured_mamba_block_size,
+                        cache_config.block_size,
+                        cache_config.block_size,
+                    )
+                cache_config.mamba_block_size = cache_config.block_size
 
         if packed_block_size is not None:
             return
