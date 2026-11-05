@@ -25,6 +25,15 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 
+# The SM120 sparse-MLA decode instantiations accept at most 64 batch
+# tokens per call. This impl has no dense-MHA prefill path
+# (supports_dense_mha_prefill = False), so prefill tokens also reach the
+# decode kernel; chunking the row dimension keeps every call inside the
+# kernel envelope. Each query row is independent (causality lives in the
+# indexer-produced top-k indices), so chunking is exact.
+_SM120_DECODE_MAX_TOKENS = 64
+
+
 def _kv_scale_format_for_model(model_type: str | None) -> str:
     if model_type is not None and model_type.startswith("glm"):
         return "arbitrary_fp32"
@@ -230,6 +239,36 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         )
 
     def _run_mqa_kernel(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        topk_indices_physical: torch.Tensor,
+        seq_lens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if q.shape[0] > _SM120_DECODE_MAX_TOKENS:
+            outs: list[torch.Tensor] = []
+            lses: list[torch.Tensor | None] = []
+            for start in range(0, q.shape[0], _SM120_DECODE_MAX_TOKENS):
+                end = min(start + _SM120_DECODE_MAX_TOKENS, q.shape[0])
+                out_chunk, lse_chunk = self._run_mqa_kernel_chunk(
+                    q[start:end],
+                    kv_cache,
+                    topk_indices_physical[start:end],
+                    seq_lens[start:end] if seq_lens is not None else None,
+                )
+                outs.append(out_chunk)
+                lses.append(lse_chunk)
+            lse = (
+                torch.cat([x for x in lses if x is not None])
+                if lses[0] is not None
+                else None
+            )
+            return torch.cat(outs), lse
+        return self._run_mqa_kernel_chunk(
+            q, kv_cache, topk_indices_physical, seq_lens
+        )
+
+    def _run_mqa_kernel_chunk(
         self,
         q: torch.Tensor,
         kv_cache: torch.Tensor,
