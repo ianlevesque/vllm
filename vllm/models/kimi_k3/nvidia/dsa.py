@@ -12,7 +12,6 @@ and ``weights_proj`` into the merged ``wkv_index``.
 """
 
 import math
-from dataclasses import replace
 from typing import Any, cast
 
 import torch
@@ -202,21 +201,17 @@ class KimiK3DSAIndexer(nn.Module):
         # FP8 keys by default; MXFP4 keys with MXFP4 queries (DeepGEMM's FP4
         # MQA logits) only on an explicit indexer_kv_dtype='mxfp4'.
         self.use_fp4_cache = kimi_k3_indexer_uses_fp4(vllm_config)
-        # Fleet port: the stock DeepseekV32IndexerCache derives its spec
-        # block size from cache_config, and this lineage's indexer kernels
-        # require 64-token kernel blocks. The model's 1024-token attention
-        # blocks cannot be split into them (unlike the upstream packed
-        # cache), so the indexer cache gets its own 64-token spec; the
-        # hybrid KV manager already mixes per-group block sizes
-        # (1024 attention / 4096 mamba here).
-        indexer_cache_config = cast(CacheConfig, cache_config)
-        if indexer_cache_config.block_size != 64:
-            indexer_cache_config = replace(indexer_cache_config, block_size=64)
+        # The indexer cache keeps the model block size: the runner splits
+        # packed blocks into the indexer's 64-token kernel blocks via a
+        # strided view and remaps the insert slot_mapping to kernel pages
+        # (see AttentionGroup._with_kernel_block_table). A 64-token spec
+        # here would drain the shared block pool 16x faster per token than
+        # the MLA group.
         self.k_cache = DeepseekV32IndexerCache(
             head_dim=indexer_cache_entry_bytes(self.index_head_dim, self.use_fp4_cache),
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
-            cache_config=indexer_cache_config,
+            cache_config=cast(CacheConfig, cache_config),
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.max_total_seq_len = v32_indexer.get_max_prefill_buffer_size(vllm_config)

@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    SparseCacheRole,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
@@ -370,11 +371,36 @@ class AttentionGroup:
     ) -> CommonAttentionMetadata:
         if self.kernel_block_size is None:
             return common_attn_metadata
+        block_table_tensor = self.map_to_kernel_block_table(
+            common_attn_metadata.block_table_tensor, ubatch_idx
+        )
+        if getattr(self.kv_cache_spec, "cache_role", None) == SparseCacheRole.INDEXER:
+            # Indexer caches are written only through their metadata
+            # slot_mapping, so express those slots in kernel pages to match
+            # the kernel-block view bound to the layer: a manager slot
+            # (block * block_size + offset) lands on kernel page
+            # block * kernel_block_stride + offset // kernel_block_size.
+            assert self.kernel_block_stride is not None, (
+                "indexer slot remap requires the bind-time kernel block stride"
+            )
+            slot = common_attn_metadata.slot_mapping
+            if slot is not None:
+                manager_block = self.kv_cache_spec.block_size
+                kernel_slot = torch.where(
+                    slot >= 0,
+                    (slot // manager_block)
+                    * (self.kernel_block_stride * self.kernel_block_size)
+                    + (slot % manager_block),
+                    slot,
+                )
+                return replace(
+                    common_attn_metadata,
+                    block_table_tensor=block_table_tensor,
+                    slot_mapping=kernel_slot,
+                )
         return replace(
             common_attn_metadata,
-            block_table_tensor=self.map_to_kernel_block_table(
-                common_attn_metadata.block_table_tensor, ubatch_idx
-            ),
+            block_table_tensor=block_table_tensor,
         )
 
     def map_to_kernel_block_table(
@@ -403,9 +429,12 @@ class AttentionGroup:
             return kv_cache
         # Token and pooled caches are written through manager-block slot
         # mappings, so only compressed caches (written from their block table)
-        # can be mapped.
+        # can be mapped. Indexer caches are the exception: their only writer
+        # consumes the metadata slot_mapping, which _with_kernel_block_table
+        # remaps into kernel pages, so the strided view stays exact.
+        is_indexer = getattr(spec, "cache_role", None) == SparseCacheRole.INDEXER
         if (
-            spec.tokens_per_state <= 1
+            (spec.tokens_per_state <= 1 and not is_indexer)
             or kv_cache.shape[1] != 1
             or kv_cache.stride(0) % (kernel_rows * kv_cache.stride(-2))
         ):
