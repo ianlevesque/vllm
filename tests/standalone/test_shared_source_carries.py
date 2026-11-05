@@ -403,6 +403,84 @@ def test_sm120_kernel_contract_preserves_heads_and_zeroes_empty_dcp_rows(
 
 
 @pytest.mark.parametrize(
+    "heads,tokens,launches",
+    [
+        # 24 gathered heads (Kimi K3.1 at TP16/DCP4): FlashInfer has no prefill
+        # kernel for them, and its decode kernel takes at most 64 rows.
+        (24, 6, [6]),
+        (24, 64, [64]),
+        (24, 65, [64, 1]),
+        (24, 200, [64, 64, 64, 8]),
+        (12, 130, [64, 64, 2]),
+        # Head counts with a prefill kernel keep one launch per call; four and
+        # six local heads are padded to eight before the launch.
+        (4, 200, [200]),
+        (6, 65, [65]),
+        (8, 4096, [4096]),
+        (16, 200, [200]),
+        (32, 8192, [8192]),
+        (64, 65, [65]),
+        (128, 65, [65]),
+    ],
+)
+@pytest.mark.parametrize("need_lse", [False, True])
+def test_sm120_rows_without_a_prefill_kernel_are_cut_to_the_decode_envelope(
+    monkeypatch, heads, tokens, launches, need_lse
+):
+    seen = []
+
+    def kernel(**kw):
+        query, out = kw["query"], kw["out"]
+        seen.append(query.shape[0])
+        # Every operand of a launch must be the same rows, in order.
+        row_ids = query[:, 0, 0, 0].to(torch.int32)
+        assert torch.equal(kw["block_tables"][:, 0, 0], row_ids)
+        if kw["seq_lens"] is not None:
+            assert torch.equal(kw["seq_lens"], row_ids % 7)
+        out.copy_(query[..., :512])
+        return (out, query[..., 0].clone()) if need_lse else out
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils.flashinfer",
+        NS(flashinfer_trtllm_batch_decode_with_kv_cache_mla=kernel),
+    )
+    method = load(SM120, "FlashInferMLASparseSM120Impl._run_mqa_kernel")
+    owner = NS(
+        kv_lora_rank=512,
+        _workspace_buffer=torch.zeros(1, dtype=torch.uint8),
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=64,
+        scale=0.5,
+        kv_scale_format="pow2_fp32",
+        need_to_return_lse_for_decode=need_lse,
+    )
+    owner._run_mqa_kernel = lambda *args: method(owner, *args)
+    rows = torch.arange(tokens, dtype=torch.float32)
+    query = rows.view(-1, 1, 1).expand(tokens, heads, 576).contiguous()
+    indices = rows.to(torch.int32).view(-1, 1).expand(tokens, 4).contiguous()
+    # A DCP shard that owns none of a row's selected tokens has length zero.
+    lengths = (rows.to(torch.int32) % 7) if need_lse else None
+
+    output, lse = method(
+        owner, query, torch.zeros(2, 64, 656, dtype=torch.uint8), indices, lengths
+    )
+
+    assert seen == launches
+    assert output.shape == (tokens, heads, 512)
+    expected = rows.view(-1, 1, 1).expand(tokens, heads, 512).clone()
+    if need_lse:
+        empty = lengths == 0
+        expected[empty] = 0.0
+        assert lse.shape == (tokens, heads)
+        assert torch.isneginf(lse[empty]).all()
+        assert torch.equal(lse[~empty], expected[~empty][..., 0])
+    else:
+        assert lse is None
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize(
     "index_topk,accepted", [(2044, True), (2048, True), (0, False), (-1, False)]
 )
 def test_sm120_backend_accepts_glm_effective_sparse_width(

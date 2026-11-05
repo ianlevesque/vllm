@@ -249,6 +249,34 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         # DCP queries already contain the gathered heads, which must survive
         # until the common DCP reducer scatters them back to their owners.
         kernel_heads = max(8, input_heads)
+        # FlashInfer's split-K decode kernel serves any head count but at most
+        # 64 rows per launch (`_DECODE_MAX_TOKENS`; the resolver skips the
+        # decode variant above it), and its prefill kernels serve any row
+        # count but only 8/16 (SG), 32/64/128 (MG) and 64/128 (swapAB) heads
+        # (`visit_prefill_heads`, unchanged through v0.7.4). This impl has no
+        # dense-MHA prefill path (supports_dense_mha_prefill = False), so
+        # prefill rows arrive here too, and a launch of more than 64 rows with
+        # any other head count has no kernel: FlashInfer raises "no decode
+        # kernel for this shape". Kimi K3.1 at TP16/DCP4 gathers 6 x 4 = 24
+        # heads. Such a launch is cut into decode-sized ones; query rows are
+        # independent (causality lives in the indexer's top-k indices), so
+        # this is exact. Literals: this method is also loaded on its own.
+        if num_actual_toks > 64 and kernel_heads not in (8, 16, 32, 64, 128):
+            outs: list[torch.Tensor] = []
+            lses: list[torch.Tensor | None] = []
+            for start in range(0, num_actual_toks, 64):
+                rows = slice(start, start + 64)
+                out_rows, lse_rows = self._run_mqa_kernel(
+                    q[rows],
+                    kv_cache,
+                    topk_indices_physical[rows],
+                    None if seq_lens is None else seq_lens[rows],
+                )
+                outs.append(out_rows)
+                lses.append(lse_rows)
+            if lses[0] is None:
+                return torch.cat(outs), None
+            return torch.cat(outs), torch.cat([x for x in lses if x is not None])
         if kernel_heads != input_heads:
             q = torch.nn.functional.pad(q, (0, 0, 0, kernel_heads - input_heads))
 
