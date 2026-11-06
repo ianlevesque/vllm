@@ -614,6 +614,19 @@ class K3DSparkForCausalLM(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.layer_name for layer in self.model.layers]
 
+    def get_draft_attn_causal(self) -> list[bool]:
+        """Per-layer attention causality, aligned with
+        get_draft_kv_cache_layer_names. The DSpark layers declare
+        non_causal_multi_token_decode, so the speculator must build draft
+        metadata with causal=False; without this the checkpoint's
+        dflash_config.causal=True wins, the non-causal window compaction
+        in the MLA metadata builder never runs, and the draft reads the
+        absolute block table past its sliding window."""
+        return [
+            not layer.self_attn.non_causal_multi_token_decode
+            for layer in self.model.layers
+        ]
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
