@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -93,6 +94,8 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        # Set in load_model: greedy drafting through per-rank vocab shards.
+        self._sharded_greedy_markov: bool = False
 
         # Set when the sequential sampling can be batch-sharded across TP.
         self._sharded_sequential_comm: PyNcclCommunicator | None = None
@@ -115,6 +118,33 @@ class DSparkSpeculator(DFlashSpeculator):
             and self.acceptance_estimator is None
             and not hasattr(self.model, "apply_output_logit_transform")
         )
+
+        # Decided here, not in load_draft_model: the draft logits cache and the
+        # acceptance estimator are only created by super().load_model above.
+        model = self.model
+        lm_head = getattr(model, "lm_head", None)
+        self._sharded_greedy_markov = (
+            envs.VLLM_DSPARK_SHARDED_GREEDY_MARKOV
+            and tp_size > 1
+            and self.draft_logits is None  # greedy drafting: only the argmax matters
+            and self._draft_topk is None
+            and not self.use_confidence_head
+            and self.acceptance_estimator is None
+            and self._sharded_sequential_comm is None
+            and model.draft_id_to_target_id is None
+            and hasattr(model, "local_markov_bias")
+            # Paths this loop does not reproduce: a model's own sampling
+            # kernels, recurrent Markov heads and output logit transforms.
+            and not hasattr(model, "sample_sequential")
+            and not getattr(model, "has_recurrent_markov_head", False)
+            and not hasattr(model, "apply_output_logit_transform")
+            # The shard maximum is taken over the whole LM-head shard.
+            and lm_head is not None
+            and getattr(lm_head, "tp_size", None) == tp_size
+            and lm_head.shard_indices.num_org_vocab_padding == 0
+        )
+        if self._sharded_greedy_markov:
+            logger.info("DSpark greedy drafting uses vocab-sharded Markov sampling.")
 
     def _try_enable_sharded_sequential_sampling(self) -> None:
         tp_size = get_tp_group().world_size
@@ -256,6 +286,41 @@ class DSparkSpeculator(DFlashSpeculator):
             return self.model.markov_step(prev, draft_hidden, state)
         return self.model.markov_embed(prev), None
 
+    def _sample_sequential_sharded_greedy(
+        self, num_reqs: int, head_hidden: torch.Tensor
+    ) -> None:
+        """Greedy sequential Markov drafting over per-rank vocab shards.
+
+        The stock path gathers [k, V] base logits and then, per position, runs
+        a replicated r x V Markov projection and a full-vocab argmax on every
+        rank. Greedy drafting only needs the argmax: each rank scores its own
+        shard and one 16-byte (value, token) pair per rank is gathered per
+        position. Ties resolve to the lowest token id, as torch.argmax does.
+        """
+        tp_group = get_tp_group()
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        base = self.model.compute_local_draft_logits(sample_hidden)
+        base = base.view(num_reqs, n_spec, base.shape[-1])
+        start = self.model.local_vocab_start
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        for i in range(n_spec):
+            bias = self.model.local_markov_bias(self.model.markov_embed(prev))
+            value, index = (base[:, i] + bias).max(dim=-1)
+            value = value.float()
+            pad = torch.zeros_like(value)
+            # 16 bytes per row keeps the RoCE all-gather on its direct layout.
+            packed = torch.stack([value, (index + start).float(), pad, pad], dim=-1)
+            gathered = tp_group.all_gather(packed, dim=-1).view(
+                num_reqs, tp_group.world_size, 4
+            )
+            best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+            token = gathered[:, :, 1].gather(1, best).squeeze(1)
+            token = token.to(self.draft_tokens.dtype)
+            self.draft_tokens[:num_reqs, i] = token
+            prev = token.to(prev.dtype)
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
@@ -267,6 +332,9 @@ class DSparkSpeculator(DFlashSpeculator):
         if sample_sequential is not None and sample_sequential(
             self, num_reqs, head_hidden
         ):
+            return
+        if self._sharded_greedy_markov:
+            self._sample_sequential_sharded_greedy(num_reqs, head_hidden)
             return
 
         # Sequential Markov sampling over the backbone's output hidden states.

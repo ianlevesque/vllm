@@ -654,14 +654,22 @@ KIMI_K3_PROJECTIONS_SM90: dict[tuple[int, int], ProjectionSpec] = {
 # authoritative on SM121 (not a filter of the SM103 token sets): K=7168
 # shapes were unmeasurable before the smem-budget fix and now win big
 # at M9 (shared_gate_up 2.06x, mla_g 1.84x, qkv_a 1.22x).
+#
+# 2026-11-09 M=4..6 sweep (Kimi K3.1 Pro verifies k+1 = 5..6 rows with its
+# k=4/5 DSpark draft, K3's M9 entries never matched): same tool with
+# --tokens 1..9 on GB10, image dd457a47e121, 81/81 numerics and graph replays
+# pass. Winners at M4/M5/M6: (1536, 7168) 1.48/1.61/1.61x, (768, 7168)
+# 1.82/1.67/1.66x, (1152, 1536) 1.45/1.61/1.59x, (2304, 1536) 1.07/1.08/1.06x.
+# Everything else is neutral or loses there and stays on cuBLAS. The M1/M9/M16
+# entries are unchanged (K3's qualified dispatch).
 _SM121_DSV3_TOKENS: dict[tuple[int, int], frozenset[int]] = {
-    (2304, 1536): frozenset({1, 9}),  # 1.40x / 1.11x
+    (2304, 1536): frozenset({1, 4, 5, 6, 9}),  # 1.40x / 1.11x
     (4608, 1536): frozenset({1}),  # 1.21x (M9 loses at 0.82x)
     (7168, 768): frozenset({1, 9}),  # 1.36x / 1.08x
-    (1152, 1536): frozenset({1, 9, 16}),  # 1.43x / 1.48x / 1.32x
-    (1536, 7168): frozenset({1, 9, 16}),  # 1.43x / 2.06x / 1.77x
+    (1152, 1536): frozenset({1, 4, 5, 6, 9, 16}),  # 1.43x / 1.48x / 1.32x
+    (1536, 7168): frozenset({1, 4, 5, 6, 9, 16}),  # 1.43x / 2.06x / 1.77x
     (2112, 7168): frozenset({1, 9}),  # 1.06x / 1.22x (M16 1.045x misses)
-    (768, 7168): frozenset({1, 9, 16}),  # 1.98x / 1.84x / 1.58x
+    (768, 7168): frozenset({1, 4, 5, 6, 9, 16}),  # 1.98x / 1.84x / 1.58x
     (3216, 7168): frozenset({9}),  # 1.06x (M1/M16 neutral at 1.01x/1.02x)
     (4224, 7168): frozenset({9, 16}),  # 1.07x / 1.06x (M1 neutral at 1.01x)
 }

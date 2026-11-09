@@ -10,11 +10,13 @@ import torch.nn as nn
 import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import (
@@ -366,7 +368,32 @@ class K3DSparkModel(nn.Module):
         return self.embed_tokens(input_ids)
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if envs.VLLM_DSPARK_SHARD_CONTEXT_PROJ:
+            sharded = self._sharded_context_proj(hidden_states)
+            if sharded is not None:
+                return self.context_norm(sharded)
         return self.context_norm(self.context_proj(hidden_states))
+
+    def _sharded_context_proj(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """This rank's slice of ``context_proj`` plus one TP all-gather.
+
+        The projection is replicated ([5H -> H], read in full on every rank
+        each draft step). The same dot products split by output row cost 1/TP
+        of the weight reads. Returns None when the layout does not qualify.
+        """
+        tp_group = get_tp_group()
+        weight = getattr(self.context_proj, "weight", None)
+        if (
+            tp_group.world_size == 1
+            or weight is None
+            or type(self.context_proj.quant_method) is not UnquantizedLinearMethod
+            or weight.shape[0] % tp_group.world_size != 0
+        ):
+            return None
+        width = weight.shape[0] // tp_group.world_size
+        start = tp_group.rank_in_group * width
+        local = torch.nn.functional.linear(hidden_states, weight[start : start + width])
+        return tp_group.all_gather(local, dim=-1)
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -652,6 +679,14 @@ class K3DSparkForCausalLM(nn.Module):
         dflash_config.causal=True wins, the non-causal window compaction
         in the MLA metadata builder never runs, and the draft reads the
         absolute block table past its sliding window."""
+        if envs.VLLM_DSPARK_CAUSAL_DRAFT:
+            # The checkpoint's own declaration (dflash_config.causal, true for
+            # the published K3.1 DSpark drafts). The draft context window is
+            # then applied by the speculator (drop_old_draft_context), not by
+            # the non-causal metadata compaction.
+            dflash_config = getattr(self.model.config, "dflash_config", None) or {}
+            causal = bool(dflash_config.get("causal", True))
+            return [causal] * len(self.model.layers)
         return [
             not layer.self_attn.non_causal_multi_token_decode
             for layer in self.model.layers
@@ -684,6 +719,37 @@ class K3DSparkForCausalLM(nn.Module):
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
+
+    # -- vocab-sharded greedy drafting (VLLM_DSPARK_SHARDED_GREEDY_MARKOV) ----
+    @property
+    def local_vocab_start(self) -> int:
+        """First target-vocab id of this rank's LM-head shard."""
+        assert self.lm_head is not None
+        return int(self.lm_head.shard_indices.org_vocab_start_index)
+
+    def compute_local_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab shard of the draft logits, without the TP gather."""
+        assert self.lm_head is not None
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
+    def local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab shard of the Markov transition bias.
+
+        ``markov_w2`` stays replicated; slicing its rows to the LM-head shard
+        reads 1/TP of it per draft position and yields the same dot products
+        as the full [r -> V] projection restricted to those rows.
+        """
+        assert self.lm_head is not None
+        start = self.local_vocab_start
+        weight = self.model.markov_head.markov_w2.weight
+        width = self.lm_head.weight.shape[0]
+        bias = torch.nn.functional.linear(markov_embed, weight[start : start + width])
+        processor = self.logits_processor
+        if processor.soft_cap is not None:
+            bias = torch.tanh(bias / processor.soft_cap) * processor.soft_cap
+        if processor.scale != 1.0:
+            bias = bias * processor.scale
+        return bias
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.embed(token_ids)

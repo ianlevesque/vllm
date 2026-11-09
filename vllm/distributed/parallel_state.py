@@ -1740,11 +1740,19 @@ def graph_capture(device: torch.device, stream: torch.cuda.Stream | None = None)
         and _aiter_registers_graph_buffers(tp)
         and not _aiter_registers_graph_buffers(dp)
     )
+    # The DCP group joins only when it owns a RoCE runtime (its gathers are
+    # then captured kernels of that runtime); NCCL-only DCP needs no context.
+    dcp_capture: AbstractContextManager[Any] = nullcontext()
+    if _DCP is not None and (
+        getattr(_DCP.device_communicator, "b12x_ar_comm", None) is not None
+    ):
+        dcp_capture = _DCP.graph_capture(context)
     with (
         non_expandable_allocations() if non_expandable else nullcontext(),
         tp.graph_capture(context),
         pp.graph_capture(context),
         dp.graph_capture(context),
+        dcp_capture,
     ):
         yield context
 

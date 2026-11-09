@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -135,6 +136,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        # Context tokens a causal windowed draft may attend to (0 = unbounded).
+        self._causal_draft_window: int = 0
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -362,6 +365,34 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+        all_causal = (
+            all(self._group_causal.values())
+            if isinstance(self._group_causal, dict)
+            else bool(self._group_causal)
+        )
+        if (
+            envs.VLLM_DSPARK_CAUSAL_DRAFT
+            and envs.VLLM_DSPARK_DRAFT_KV_WINDOW > 0
+            and all_causal
+        ):
+            # The windowed KV spec frees draft blocks behind the window; a
+            # causal draft never takes the non-causal metadata compaction, so
+            # the block table is shifted here before every draft step.
+            block_sizes = {
+                int(self.block_tables.block_sizes[gid])
+                for gid in self.draft_kv_cache_group_ids
+            }
+            if len(block_sizes) != 1:
+                raise ValueError(
+                    "A causal draft window needs one block size across draft KV "
+                    f"groups, got {sorted(block_sizes)}."
+                )
+            self._causal_draft_window = int(envs.VLLM_DSPARK_DRAFT_KV_WINDOW)
+            logger.info(
+                "Causal draft context window: %d tokens, block %d.",
+                self._causal_draft_window,
+                block_sizes.pop(),
+            )
 
     @torch.inference_mode()
     def _run_model(
@@ -608,6 +639,20 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
                 num_reqs,
             )
+
+        if self._causal_draft_window and not dummy_run:
+            # After prepare_dflash_inputs: its slot mappings index the full
+            # table, and it has just rewritten the draft sequence lengths.
+            last_gid = self.draft_kv_cache_group_ids[-1]
+            for gid in self.draft_kv_cache_group_ids:
+                drop_old_draft_context(
+                    self.block_tables.input_block_tables[gid],
+                    self.input_buffers.seq_lens,
+                    num_reqs,
+                    self._causal_draft_window,
+                    int(self.block_tables.block_sizes[gid]),
+                    update_seq_lens=gid == last_gid,
+                )
 
         if (
             __import__("os").environ.get("VLLM_DSPARK_WINDOW_DEBUG", "0") == "1"
@@ -1080,4 +1125,67 @@ def prepare_dflash_inputs(
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
         NUM_PAD_PROGRAMS=_NUM_PAD_PROGRAMS,
+    )
+
+
+@triton.jit
+def _drop_old_draft_context_kernel(
+    block_table_ptr,
+    block_table_stride,
+    seq_lens_ptr,
+    context_window,
+    entry_span,
+    UPDATE_SEQ_LENS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    shift = tl.maximum(seq_len - context_window, 0) // entry_span
+    if shift == 0:
+        return
+    num_dropped = shift * entry_span
+    num_kept = tl.minimum(
+        tl.cdiv(seq_len - num_dropped, entry_span), block_table_stride - shift
+    )
+    row_ptr = block_table_ptr + req_idx.to(tl.int64) * block_table_stride
+    for i in range(0, num_kept, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        mask = offset < num_kept
+        block_ids = tl.load(row_ptr + shift + offset, mask=mask)
+        # In-place shift: every lane must load before any lane stores.
+        tl.debug_barrier()
+        tl.store(row_ptr + offset, block_ids, mask=mask)
+    if UPDATE_SEQ_LENS:
+        tl.store(seq_lens_ptr + req_idx, seq_len - num_dropped)
+
+
+def drop_old_draft_context(
+    # [max_num_reqs, max_num_blocks]
+    block_table: torch.Tensor,
+    # [max_num_reqs]
+    seq_lens: torch.Tensor,
+    num_reqs: int,
+    context_window: int,
+    entry_span: int,
+    update_seq_lens: bool,
+) -> None:
+    """Hide the draft context behind the window by shifting block-table rows.
+
+    Adopted from upstream vllm-project/vllm#61261, with this fork's qualified
+    whole-block rule ``floor(max(L - W, 0) / B)`` over the draft length ``L``
+    (context plus query block): it never reads a block the sliding-window KV
+    manager may already have freed, and it retains the leading partial block.
+    Cached keys hold absolute RoPE positions, so no position is rewritten.
+    ``seq_lens`` must hold the unshifted draft lengths; it is rewritten only
+    when ``update_seq_lens`` is set, which callers do on the last of several
+    tables sharing it.
+    """
+    _drop_old_draft_context_kernel[(num_reqs,)](
+        block_table,
+        block_table.stride(0),
+        seq_lens,
+        context_window,
+        entry_span,
+        UPDATE_SEQ_LENS=update_seq_lens,
+        BLOCK_SIZE=1024,
     )

@@ -182,9 +182,13 @@ if TYPE_CHECKING:
     VLLM_KIMI_SHARD_QKV_A: bool = False
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_WINDOW_DEBUG: bool = False
+    VLLM_DSPARK_CAUSAL_DRAFT: bool = False
+    VLLM_DSPARK_SHARDED_GREEDY_MARKOV: bool = False
+    VLLM_DSPARK_SHARD_CONTEXT_PROJ: bool = False
     VLLM_DCP_SHARD_DRAFT: bool = True
     VLLM_KIMI_FUSED_TOPK16: bool = False
     VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
+    VLLM_ROCE_DCP_COLLECTIVES: bool = False
     VLLM_ROCE_HIERARCHICAL_MIN_SIZE: str = "64KB"
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
     VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
@@ -1576,6 +1580,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
     ),
     "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    # Run the K3 DSpark draft with the in-block causality its checkpoint
+    # declares (dflash_config.causal) and bound its context by shifting the
+    # draft block table in the speculator (upstream #61261's approach) instead
+    # of the non-causal metadata compaction.
+    "VLLM_DSPARK_CAUSAL_DRAFT": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CAUSAL_DRAFT", "0"))
+    ),
+    # Greedy K3 DSpark drafting scores each rank's vocab shard (base logits +
+    # Markov bias) and gathers one (value, token) pair per rank per position.
+    "VLLM_DSPARK_SHARDED_GREEDY_MARKOV": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARDED_GREEDY_MARKOV", "0"))
+    ),
+    # Each rank computes its slice of the K3 DSpark context projection and one
+    # all-gather rebuilds the row, instead of a replicated [5H -> H] GEMM.
+    "VLLM_DSPARK_SHARD_CONTEXT_PROJ": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_CONTEXT_PROJ", "0"))
+    ),
     "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
     ),
@@ -1594,6 +1615,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCE_HIERARCHICAL_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ROCE_HIERARCHICAL_ALLREDUCE", "0"))
+    ),
+    # Route the decode-context-parallel group's decode collectives (query and
+    # indexer top-k all-gathers, LSE all-to-all) through RoCEnante. Requires
+    # VLLM_ENABLE_ROCE_ALLREDUCE; pure data movement, NCCL above the gather cap.
+    "VLLM_ROCE_DCP_COLLECTIVES": lambda: bool(
+        int(os.getenv("VLLM_ROCE_DCP_COLLECTIVES", "0"))
     ),
     "VLLM_ROCE_HIERARCHICAL_MIN_SIZE": lambda: os.getenv(
         "VLLM_ROCE_HIERARCHICAL_MIN_SIZE", "64KB"
