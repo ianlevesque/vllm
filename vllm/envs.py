@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
     VLLM_DSPARK_COMPACT_ROPE: bool = False
     VLLM_KIMI_SHARD_QKV_A: bool = False
+    VLLM_KIMI_DSA_SHARD_QKV_A: bool = False
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_WINDOW_DEBUG: bool = False
     VLLM_DSPARK_CAUSAL_DRAFT: bool = False
@@ -1580,6 +1581,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
     ),
     "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    # Same sharding for the Kimi K3.1 DSA attention layers (replicated by
+    # default; the fused single-weight forward at DCP 1 requires replication).
+    "VLLM_KIMI_DSA_SHARD_QKV_A": lambda: bool(
+        int(os.getenv("VLLM_KIMI_DSA_SHARD_QKV_A", "0"))
+    ),
     # Run the K3 DSpark draft with the in-block causality its checkpoint
     # declares (dflash_config.causal) and bound its context by shifting the
     # draft block table in the speculator (upstream #61261's approach) instead

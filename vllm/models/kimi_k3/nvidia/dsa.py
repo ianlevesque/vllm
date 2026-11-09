@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -49,6 +50,7 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
 )
 from vllm.models.kimi_k3.nvidia.mla import (
     _GATE_MULTI_STREAM_TOKEN_THRESHOLD,
+    KimiShardedMergedColumnParallelLinear,
     _gate_sigmoid_mul,
 )
 from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import init_dcp_topk_merge
@@ -469,15 +471,35 @@ class KimiK3DSAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = config.max_position_embeddings
 
+        # Opt-in: shard the merged latent Q/KV projection across TP ranks as
+        # the dense K3 MLA layers do under VLLM_KIMI_SHARD_QKV_A (one all-gather
+        # rebuilds both logical outputs). Replicated, every rank reads the full
+        # (q_lora + kv) x hidden weight per layer per step. The single-weight
+        # fused forward (pack_projections, DCP 1 only) needs it replicated.
+        self.shard_qkv_a = (
+            envs.VLLM_KIMI_DSA_SHARD_QKV_A
+            and tp_size > 1
+            and self.q_lora_rank is not None
+            and self.q_lora_rank % tp_size == 0
+            and (self.kv_lora_rank + self.qk_rope_head_dim) % tp_size == 0
+        )
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                self.hidden_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkv_a_proj",
-                disable_tp=True,
-            )
+            if self.shard_qkv_a:
+                self.fused_qkv_a_proj = KimiShardedMergedColumnParallelLinear(
+                    self.hidden_size,
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
+            else:
+                self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                    self.hidden_size,
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                    disable_tp=True,
+                )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -703,6 +725,9 @@ class KimiK3DSAAttention(nn.Module):
             return
         attn = cast(Any, self.mla_attn.mla_attn)
         indexer = cast(Any, self.dsa_indexer)
+        if self.shard_qkv_a:
+            # The packed single-weight forward needs the replicated projection.
+            return
         if not (
             indexer.use_fused_k_insert
             and indexer.dcp_world_size == 1
