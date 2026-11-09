@@ -1417,14 +1417,30 @@ class Worker(WorkerBase):
         return self.profiler.annotate_context_manager(annotation)
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
-        """The RoCEnante health check of the TP communicator, if one is active.
+        """The RoCEnante health check of the TP (and DCP) communicators.
 
         Returns:
             The check callable, or None when RoCEnante is not in use.
         """
-        communicator = get_tp_group().device_communicator
-        comm = getattr(communicator, "b12x_ar_comm", None)
-        return getattr(comm, "check_health", None)
+        from vllm.distributed import parallel_state
+
+        checks = []
+        for group in (get_tp_group(), parallel_state._DCP):
+            communicator = getattr(group, "device_communicator", None)
+            comm = getattr(communicator, "b12x_ar_comm", None)
+            check = getattr(comm, "check_health", None)
+            if check is not None:
+                checks.append(check)
+        if not checks:
+            return None
+        if len(checks) == 1:
+            return checks[0]
+
+        def check_all() -> None:
+            for check in checks:
+                check()
+
+        return check_all
 
     def _b12x_roce_guarded(self, output):
         """Fail-stop RoCEnante check once the step's output is on the host.

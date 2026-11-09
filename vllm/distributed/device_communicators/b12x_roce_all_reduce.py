@@ -68,7 +68,13 @@ class B12xRoceAllReduce:
         group: ProcessGroup,
         device_group: ProcessGroup | None,
         device: torch.device,
+        *,
+        gather_only: bool = False,
     ) -> None:
+        # ``gather_only`` serves a group that needs RoCE all-gathers but keeps
+        # its reductions on NCCL (the decode-context-parallel group): no FP32
+        # hierarchy, no all-reduce launcher, so nothing new is compiled.
+        self.gather_only = gather_only
         self.disabled = True
         self.group = group
         self.device_group = device_group
@@ -156,7 +162,7 @@ class B12xRoceAllReduce:
                 _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE),
                 _parse_byte_size(envs.VLLM_ROCE_ALLGATHER_MAX_SIZE),
                 _parse_byte_size(envs.VLLM_ROCE_HIERARCHICAL_MIN_SIZE)
-                if envs.VLLM_ROCE_HIERARCHICAL_ALLREDUCE
+                if envs.VLLM_ROCE_HIERARCHICAL_ALLREDUCE and not self.gather_only
                 else 0,
             )
             if limits[2] and (
@@ -284,6 +290,8 @@ class B12xRoceAllReduce:
                 runtime.check_health()
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
+        if self.gather_only:
+            return False
         return not self.disabled and self._runtime.should_allreduce(inp)
 
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
@@ -340,8 +348,12 @@ class B12xRoceAllReduce:
             return
         # Compile and allocate scratch before capture; the runtime refuses both
         # inside a graph.  vLLM's gather shards have 16-byte rows (direct
-        # layout), so the padded-gather scratch is not requested here.
-        self._runtime.prepare((torch.bfloat16, torch.float16, torch.float32))
+        # layout), so the padded-gather scratch is not requested here.  A
+        # gather-only runtime prepares the all-gather launcher alone.
+        self._runtime.prepare(
+            () if self.gather_only
+            else (torch.bfloat16, torch.float16, torch.float32)
+        )
         with ExitStack() as contexts:
             contexts.enter_context(self._runtime.capture(stream=stream))
             for runtime in self._hierarchical_runtimes:

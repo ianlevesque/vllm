@@ -27,8 +27,10 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -80,6 +82,8 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        # Set in load_draft_model: greedy drafting through per-rank vocab shards.
+        self._sharded_greedy_markov: bool = False
 
     def load_draft_model(
         self,
@@ -111,6 +115,18 @@ class DSparkSpeculator(DFlashSpeculator):
             # The acceptance estimator is not needed when a trained confidence head
             # is available.
             self.use_acceptance_estimator = False
+        self._sharded_greedy_markov = (
+            envs.VLLM_DSPARK_SHARDED_GREEDY_MARKOV
+            and self.draft_logits is None  # greedy drafting: only the argmax matters
+            and self._draft_topk is None
+            and not self.use_confidence_head
+            and getattr(self, "acceptance_estimator", None) is None
+            and model.draft_id_to_target_id is None
+            and get_tp_group().world_size > 1
+            and hasattr(model, "local_markov_bias")
+        )
+        if self._sharded_greedy_markov:
+            logger.info("DSpark greedy drafting uses vocab-sharded Markov sampling.")
         return model
 
     def _sample_logits(
@@ -153,9 +169,47 @@ class DSparkSpeculator(DFlashSpeculator):
             use_fp64=self.use_fp64_gumbel,
         )
 
+    def _sample_sequential_sharded_greedy(
+        self, num_reqs: int, head_hidden: torch.Tensor
+    ) -> None:
+        """Greedy sequential Markov drafting over per-rank vocab shards.
+
+        The stock path gathers [k, V] base logits and then, per position, runs
+        a replicated r x V Markov projection and a full-vocab argmax on every
+        rank. Greedy drafting only needs the argmax: each rank scores its own
+        shard and one 16-byte (value, token) pair per rank is gathered per
+        position. Ties resolve to the lowest token id, as torch.argmax does.
+        """
+        tp_group = get_tp_group()
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        base = self.model.compute_local_draft_logits(sample_hidden)
+        base = base.view(num_reqs, n_spec, base.shape[-1])
+        start = self.model.local_vocab_start
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        for i in range(n_spec):
+            bias = self.model.local_markov_bias(self.model.markov_embed(prev))
+            value, index = (base[:, i] + bias).max(dim=-1)
+            value = value.float()
+            pad = torch.zeros_like(value)
+            # 16 bytes per row keeps the RoCE all-gather on its direct layout.
+            packed = torch.stack([value, (index + start).float(), pad, pad], dim=-1)
+            gathered = tp_group.all_gather(packed, dim=-1).view(
+                num_reqs, tp_group.world_size, 4
+            )
+            best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+            token = gathered[:, :, 1].gather(1, best).squeeze(1)
+            token = token.to(self.draft_tokens.dtype)
+            self.draft_tokens[:num_reqs, i] = token
+            prev = token.to(prev.dtype)
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
+            return
+        if self._sharded_greedy_markov:
+            self._sample_sequential_sharded_greedy(num_reqs, head_hidden)
             return
 
         # Sequential Markov sampling over the backbone's output hidden states.

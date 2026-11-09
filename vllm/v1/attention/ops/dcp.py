@@ -997,13 +997,15 @@ def dcp_a2a_lse_reduce(
         query_start_loc=query_start_loc,
     )
 
-    work = dist.all_to_all_single(
-        recv_buffer.view(-1),
-        send_buffer.view(-1),
-        group=cp_group.device_group,
-        async_op=True,
-    )
-    work.wait()
+    roce_all_to_all = getattr(cp_group.device_communicator, "roce_all_to_all", None)
+    if roce_all_to_all is None or not roce_all_to_all(send_buffer, recv_buffer):
+        work = dist.all_to_all_single(
+            recv_buffer.view(-1),
+            send_buffer.view(-1),
+            group=cp_group.device_group,
+            async_op=True,
+        )
+        work.wait()
 
     return _dcp_a2a_unpack_combine(
         recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e

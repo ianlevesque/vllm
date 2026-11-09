@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import math
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -86,6 +88,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and envs.VLLM_ENABLE_ROCE_ALLREDUCE
             and not envs.VLLM_BATCH_INVARIANT
         )
+        # The decode-context-parallel group moves only data (all-gathers and
+        # an all-to-all), so its RoCE runtime is gather-only.
+        self.use_roce_dcp = (
+            unique_name.split(":")[0] == "dcp"
+            and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+            and envs.VLLM_ROCE_DCP_COLLECTIVES
+            and not envs.VLLM_BATCH_INVARIANT
+        )
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
@@ -125,13 +135,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
         self.b12x_ar_comm = None
-        if self.use_roce_allreduce and self.world_size > 1:
+        if (self.use_roce_allreduce or self.use_roce_dcp) and self.world_size > 1:
             from .b12x_roce_all_reduce import B12xRoceAllReduce
 
             self.b12x_ar_comm = B12xRoceAllReduce(
                 group=self.cpu_group,
                 device_group=self.device_group,
                 device=self.device,
+                gather_only=self.use_roce_dcp,
             )
 
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
@@ -481,6 +492,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return None
         return ca_comm.custom_reduce_scatter(input_.contiguous())
 
+    def roce_all_to_all(self, send: torch.Tensor, recv: torch.Tensor) -> bool:
+        """Equal-chunk all-to-all as one RoCE all-gather of the send buffer.
+
+        ``send`` holds ``world_size`` equal chunks, chunk ``j`` addressed to
+        rank ``j``; ``recv`` receives chunk ``j`` from rank ``j`` (the
+        ``all_to_all_single`` contract). Every rank gathers every send buffer
+        and keeps the chunks addressed to it, so the payload is bit-identical
+        to the NCCL exchange at ``world_size`` times the received bytes, which
+        is still small for decode-sized DCP buffers.
+
+        Returns:
+            False when the buffer is not eligible (not a DCP RoCE group, or
+            above the gather cap), in which case nothing was sent and the
+            caller keeps its NCCL path. Eligibility depends on shape, dtype
+            and contiguity only, so every rank takes the same branch.
+        """
+        b12x_ar_comm = self.b12x_ar_comm
+        if not self.use_roce_dcp or b12x_ar_comm is None or b12x_ar_comm.disabled:
+            return False
+        if not (send.is_contiguous() and recv.is_contiguous()):
+            return False
+        rows = send.reshape(self.world_size, -1)
+        if not b12x_ar_comm.should_all_gather(rows, 0):
+            return False
+        # gathered[r * world + j] is the chunk rank r addressed to rank j.
+        gathered = b12x_ar_comm.all_gather(rows, 0)
+        recv.view(self.world_size, -1).copy_(
+            gathered.view(self.world_size, self.world_size, -1)[:, self.rank_in_group]
+        )
+        return True
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
         # enabled (mirrors reduce_scatter); otherwise fall back to the
@@ -495,6 +537,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and b12x_ar_comm.should_all_gather(input_, dim)
         ):
             return b12x_ar_comm.all_gather(input_, dim)
+        if (
+            self.use_roce_dcp
+            and b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and 0 < dim < input_.dim() - 1
+        ):
+            # Concatenating along a middle dim is concatenating the
+            # row-flattened tensor along its last dim (rank-major columns), so
+            # DCP's head-dim gathers stay on RDMA with no copy. Eligibility
+            # depends on shape, dtype and contiguity only: rank-invariant.
+            flat = input_.contiguous().reshape(math.prod(input_.shape[:dim]), -1)
+            if b12x_ar_comm.should_all_gather(flat, 1):
+                gathered_shape = list(input_.shape)
+                gathered_shape[dim] *= self.world_size
+                return b12x_ar_comm.all_gather(flat, 1).reshape(gathered_shape)
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
