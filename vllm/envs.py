@@ -191,6 +191,15 @@ if TYPE_CHECKING:
     VLLM_ROCE_HIERARCHICAL_ALLREDUCE: bool = False
     VLLM_ROCE_DCP_COLLECTIVES: bool = False
     VLLM_ROCE_HIERARCHICAL_MIN_SIZE: str = "64KB"
+    VLLM_ROCE_FUSED_COLLECTIVES: bool = False
+    VLLM_KIMI_K3_ROCE_FRONT_GATHER: bool = False
+    VLLM_KIMI_K3_ROCE_TAIL_FUSION: bool = False
+    VLLM_KIMI_K3_SM121_ATTN_RES: bool = False
+    VLLM_KIMI_K3_SM121_GEMM_AR: bool = False
+    VLLM_KIMI_K3_ROCE_TAIL_GEMM: bool = False
+    VLLM_ROCE_TWO_SHOT_MIN_SIZE: str = "12KB"
+    VLLM_KIMI_SM121_EXT_DIR: str | None = None
+    VLLM_KIMI_SM121_EXT_VERBOSE: bool = False
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
     VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
@@ -1630,6 +1639,64 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCE_HIERARCHICAL_MIN_SIZE": lambda: os.getenv(
         "VLLM_ROCE_HIERARCHICAL_MIN_SIZE", "64KB"
+    ),
+    # SM12x RoCE fused collectives (vllm.models.kimi_k3.nvidia.ops.sm121): a
+    # BF16 [rows, N] all-reduce of at least VLLM_ROCE_TWO_SHOT_MIN_SIZE bytes
+    # runs as reduce-scatter + all-gather in one launch, so a rank sends each
+    # peer 2 * N / world columns instead of N; it supersedes the FP32 4x4
+    # hierarchy for those payloads. Needs a b12x RoCE proxy with windowed ops;
+    # any rank that cannot take part disables it on every rank.
+    "VLLM_ROCE_FUSED_COLLECTIVES": lambda: bool(
+        int(os.getenv("VLLM_ROCE_FUSED_COLLECTIVES", "0"))
+    ),
+    # Kimi-K3 MoE front on RoCE: the TP-sharded router logits and the routed
+    # latent down-projection shard are all-gathered in one round instead of
+    # two. Needs VLLM_ROCE_FUSED_COLLECTIVES; pure data movement.
+    "VLLM_KIMI_K3_ROCE_FRONT_GATHER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_ROCE_FRONT_GATHER", "0"))
+    ),
+    # Kimi-K3 latent-MoE tail fusion on RoCE (the SM12x counterpart of the
+    # SM100 tail fusion): the routed up-projection is TP-sharded by OUTPUT
+    # column (same bytes per rank as the row shard), one launch reduce-scatters
+    # the latent and shared partials and gathers + RMSNorms the latent, each
+    # rank projects its own hidden columns with the shared shard folded into the
+    # GEMM epilogue, and one gather assembles the result. Changes the weight
+    # layout at load; batches the kernel does not cover reduce through the
+    # shared partial instead. Needs VLLM_ROCE_FUSED_COLLECTIVES.
+    "VLLM_KIMI_K3_ROCE_TAIL_FUSION": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_ROCE_TAIL_FUSION", "0"))
+    ),
+    # Kimi-K3 AttnRes on SM12x: the cluster kernel in
+    # vllm.models.kimi_k3.nvidia.ops.sm121 (the SM100 native kernel needs TMEM)
+    # for decode-sized batches with at least three saved blocks, where it
+    # measures faster than the Triton kernel on GB10.
+    "VLLM_KIMI_K3_SM121_ATTN_RES": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_SM121_ATTN_RES", "0"))
+    ),
+    # Kimi-K3 GEMM-AR on SM12x: decode-batch row-parallel projections (the
+    # attention output projections) run as one launch that computes the GEMM
+    # and its RoCE two-shot all-reduce. Needs VLLM_ROCE_FUSED_COLLECTIVES.
+    "VLLM_KIMI_K3_SM121_GEMM_AR": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_SM121_GEMM_AR", "0"))
+    ),
+    # Kimi-K3 latent-MoE tail on RoCE: compute the column-shard up-projection,
+    # its shared-expert add and the final all-gather in one launch instead of a
+    # cuBLAS GEMM followed by a gather. Needs VLLM_KIMI_K3_ROCE_TAIL_FUSION.
+    "VLLM_KIMI_K3_ROCE_TAIL_GEMM": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_ROCE_TAIL_GEMM", "0"))
+    ),
+    # Measured on 16 Sparks: two-shot beats the flat all-reduce from 14 KB up
+    # (25 us against 31 us for [1, 7168]) and loses at 7 KB (24 against 21).
+    "VLLM_ROCE_TWO_SHOT_MIN_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_TWO_SHOT_MIN_SIZE", "12KB"
+    ),
+    # Build directory of the SM12x fused-kernel extension
+    # (vllm.models.kimi_k3.nvidia.ops.sm121._ext, one JIT build per source
+    # digest) and its verbose build log. Read from os.environ by the loader;
+    # registered here so environment validation knows the names.
+    "VLLM_KIMI_SM121_EXT_DIR": lambda: os.getenv("VLLM_KIMI_SM121_EXT_DIR"),
+    "VLLM_KIMI_SM121_EXT_VERBOSE": lambda: bool(
+        int(os.getenv("VLLM_KIMI_SM121_EXT_VERBOSE", "0"))
     ),
     "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
         "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"

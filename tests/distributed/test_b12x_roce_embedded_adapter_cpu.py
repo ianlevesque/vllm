@@ -230,6 +230,9 @@ def _install(monkeypatch, runtime, *, world=8, rank=0, hierarchical_min="0"):
         VLLM_ROCE_ALLGATHER_MAX_SIZE="2MB",
         VLLM_ROCE_HIERARCHICAL_ALLREDUCE=hierarchical_min != "0",
         VLLM_ROCE_HIERARCHICAL_MIN_SIZE=hierarchical_min,
+        # The SM12x fused collectives need integrator hooks the embedded
+        # runtime does not have; these tests cover the plain collectives.
+        VLLM_ROCE_FUSED_COLLECTIVES=False,
     )
     monkeypatch.setattr(adapter_module, "dist", dist)
     monkeypatch.setattr(adapter_module, "envs", envs)

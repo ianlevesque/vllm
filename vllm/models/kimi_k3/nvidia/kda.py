@@ -273,6 +273,34 @@ def is_flashinfer_fused_kda_spec_decode_supported(
     )
 
 
+def is_sm121_fused_kda_decode_supported(
+    head_dim: int,
+    conv_width: int,
+    num_spec: int,
+    input_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
+    recurrent_state_dtype: torch.dtype,
+    lower_bound: float | None,
+    use_recoverssm: bool,
+) -> bool:
+    """The fresh SM12x kernel (ops/sm121/kda_decode): any local head count,
+    plain and speculative rows, where the SM100 fused kernels cannot run."""
+    if not current_platform.is_device_capability_family(120):
+        return False
+    from vllm.models.kimi_k3.nvidia.ops.sm121.kda_decode import is_supported
+
+    return is_supported(
+        head_dim,
+        conv_width,
+        num_spec,
+        input_dtype,
+        conv_state_dtype,
+        recurrent_state_dtype,
+        lower_bound,
+        use_recoverssm,
+    )
+
+
 def resolve_kda_spec_decode_backend(
     backend: str,
     num_heads: int,
@@ -285,8 +313,29 @@ def resolve_kda_spec_decode_backend(
     lower_bound: float | None,
     use_recoverssm: bool,
 ) -> str:
-    if backend not in ("auto", "native", "flashinfer"):
+    if backend not in ("auto", "native", "flashinfer", "sm121"):
         raise ValueError(f"Unsupported KDA speculative decode backend: {backend}")
+    if backend == "sm121":
+        # Explicit opt-in only: on GB10 the speculative step is bound by its
+        # per-row state checkpoint stores, and the Triton chain is faster.
+        if not is_sm121_fused_kda_decode_supported(
+            head_dim,
+            conv_width,
+            num_spec,
+            input_dtype,
+            conv_state_dtype,
+            recurrent_state_dtype,
+            lower_bound,
+            use_recoverssm,
+        ):
+            raise RuntimeError(
+                "The SM12x fused KDA decode kernel requires CUDA SM12x, bfloat16 "
+                "inputs and convolution state, float32 recurrent state, D=128, "
+                "W=4, a bounded gate, at most 7 speculative tokens, and "
+                "RecoverSSM disabled."
+            )
+        logger.info_once("Using the SM12x fused KDA speculative decode kernel.")
+        return "sm121"
     supported = is_flashinfer_fused_kda_spec_decode_supported(
         num_heads,
         head_dim,
@@ -791,9 +840,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     align=self.cache_config.mamba_cache_mode == "align",
                 )
         decode_conv1d_weight = None
-        if (
-            self.kda_decode_backend != "triton"
-            or self.kda_spec_decode_backend == "flashinfer"
+        if self.kda_decode_backend != "triton" or self.kda_spec_decode_backend in (
+            "flashinfer",
+            "sm121",
         ):
             decode_conv1d_weight = torch.empty(
                 3,
@@ -903,9 +952,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         self.gemm_rs_ar = None
         if run_gemm_rs_ar:
-            from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
-                get_gemm_rs_ar,
-            )
+            from vllm.models.kimi_k3.nvidia.ops.sm121.gemm_ar import get_gemm_rs_ar
 
             gemm_rs_ar = get_gemm_rs_ar()
             if gemm_rs_ar.can_run(self.o_proj):
@@ -1159,6 +1206,65 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 output=core_attn_out[:, :num_actual_tokens],
             )
             return
+
+        if (
+            self.kda_spec_decode_backend == "sm121"
+            and self.decode_norm_weight is not None
+            and m.num_prefills == 0
+            and (m.num_decodes == 0 if has_spec_decode else m.num_decodes > 0)
+        ):
+            from vllm.models.kimi_k3.nvidia.ops.sm121.kda_decode import (
+                MAX_ROWS_PER_SEQUENCE,
+                fits,
+                kda_fused_decode,
+            )
+
+            if has_spec_decode:
+                assert spec_state_indices_tensor is not None
+                assert spec_query_start_loc is not None
+                num_seqs = m.num_spec_decodes
+                indices = spec_state_indices_tensor[:num_seqs]
+                seqlens = spec_query_start_loc[: num_seqs + 1]
+                accepted = num_accepted_tokens
+                rows_ok = indices.size(-1) <= MAX_ROWS_PER_SEQUENCE
+            else:
+                assert non_spec_state_indices_tensor is not None
+                num_seqs = num_actual_tokens
+                indices = non_spec_state_indices_tensor[:num_actual_tokens]
+                seqlens = None
+                accepted = None
+                rows_ok = True
+            if (
+                rows_ok
+                and fits(num_seqs, self.local_num_heads)
+                and indices.dtype == torch.int32
+                and (seqlens is None or seqlens.dtype == torch.int32)
+                and (accepted is None or accepted.dtype == torch.int32)
+            ):
+                assert self.gate_lower_bound is not None
+                kda_fused_decode(
+                    x=mixed_qkv,
+                    conv_weight=self.conv1d.weight.view(
+                        self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+                    ),
+                    conv_state=conv_state,
+                    raw_gate=g1,
+                    raw_beta=beta,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    state=recurrent_state,
+                    state_indices=indices.contiguous(),
+                    output_gate=g2[:num_actual_tokens],
+                    norm_weight=self.decode_norm_weight,
+                    lower_bound=self.gate_lower_bound,
+                    norm_eps=self.o_norm.eps,
+                    output=core_attn_out[:, :num_actual_tokens],
+                    num_accepted_tokens=(
+                        None if accepted is None else accepted[:num_seqs].contiguous()
+                    ),
+                    query_start_loc=None if seqlens is None else seqlens.contiguous(),
+                )
+                return
 
         if (
             self.kda_decode_backend != "triton"

@@ -9,6 +9,7 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
@@ -50,6 +51,18 @@ class LatentTailTier(IntEnum):
     # at 1/tp of the up-projection FLOPs; it gives up tier 1's aux-stream
     # overlap, since the reduce now has to follow the accumulate.
     COLUMN_PARALLEL = 2
+
+    # ``_roce_tail``. The SM12x / RoCE counterpart of tier 0 for an
+    # up-projection that is TP-sharded by output column
+    # (VLLM_KIMI_K3_ROCE_TAIL_FUSION): one launch reduce-scatters the latent and
+    # shared partials and gathers + RMSNorms the latent, the rank projects its
+    # own hidden columns with the shared shard as the GEMM's beta-add, and one
+    # gather assembles the result. Decode-sized batches on multi-node TP.
+    ROCE_TAIL_FUSION = 3
+
+    # ``_shard_weight_tail``. Same output-column shard, any batch the RoCE
+    # kernel does not cover: tier 2 with the weight already narrowed at load.
+    COLUMN_SHARD = 4
 
 
 class LatentMoERunner(MoERunner):
@@ -192,6 +205,19 @@ class LatentMoERunner(MoERunner):
         shared_output: torch.Tensor,
     ) -> LatentTailTier:
         num_tokens = fused_output.shape[0]
+        transform = self.routed_output_transform
+        if transform is not None and getattr(transform, "output_is_tp_shard", False):
+            # Rank-invariant: availability is voted across ranks and the
+            # eligibility depends on shapes and contiguity only.
+            fused = self._roce_fused_collectives()
+            norm = transform.norm
+            if (
+                fused is not None
+                and fused.can_moe_tail_collective(fused_output, shared_output)
+                and (norm is None or norm.weight.dtype == torch.bfloat16)
+            ):
+                return LatentTailTier.ROCE_TAIL_FUSION
+            return LatentTailTier.COLUMN_SHARD
         # tier 0
         if self.enable_k3_latent_moe_tail_fusion and (
             0 < num_tokens <= self._k3_latent_moe_tail_op.contract.max_num_tokens
@@ -299,6 +325,73 @@ class LatentMoERunner(MoERunner):
             shared_output, trunc_size, output_is_reduced=False
         )
 
+    @staticmethod
+    def _roce_fused_collectives():
+        from vllm.models.kimi_k3.nvidia.model import tp_roce_fused_collectives
+
+        return tp_roce_fused_collectives()
+
+    def _roce_tail(
+        self,
+        fused_output: torch.Tensor,
+        shared_output: torch.Tensor,
+        trunc_size: int | None,
+    ) -> torch.Tensor:
+        """Tier 3: the latent-MoE tail fused onto RoCE collectives."""
+        transform = self.routed_output_transform
+        assert transform is not None
+        fused = self._roce_fused_collectives()
+        assert fused is not None
+        norm = transform.norm
+        latent, hidden_shard = fused.moe_tail_collective(
+            fused_output,
+            shared_output,
+            None if norm is None else norm.weight,
+            0.0 if norm is None else norm.variance_epsilon,
+        )
+        weight = transform.up_proj.weight
+        if envs.VLLM_KIMI_K3_ROCE_TAIL_GEMM and fused.can_gemm_add_all_gather(
+            latent, weight, hidden_shard
+        ):
+            # One launch: this rank's hidden columns = its reduced shared
+            # shard + latent @ up_proj_shard.T, rounded straight into the send
+            # slot of the gather that assembles the result.
+            result = fused.gemm_add_all_gather(latent, weight, hidden_shard)
+        else:
+            # hidden_shard (the reduced shared-expert columns of this rank) +=
+            # latent @ up_proj_shard.T, in the GEMM's beta-add epilogue.
+            hidden_shard.addmm_(latent, weight.t())
+            result = tensor_model_parallel_all_gather(hidden_shard, dim=-1)
+        logical = transform.up_proj.logical_output_size
+        if result.shape[-1] != logical:
+            result = result[..., :logical].contiguous()
+        # Already fully reduced; this only strips padding.
+        return self._maybe_reduce_final_output(
+            result, trunc_size, output_is_reduced=True
+        )
+
+    def _shard_weight_tail(
+        self,
+        fused_output: torch.Tensor,
+        shared_output: torch.Tensor,
+        trunc_size: int | None,
+    ) -> torch.Tensor:
+        """Tier 4: tier 2 for an up-projection weight sharded at load."""
+        transform = self.routed_output_transform
+        assert transform is not None
+        if transform.norm is not None:
+            latent = self.allreduce_norm_latent_out(fused_output, transform.norm)
+        else:
+            latent = tensor_model_parallel_all_reduce(fused_output)
+        weight = transform.up_proj.weight
+        shard_size = weight.shape[0]
+        shard_start = get_tensor_model_parallel_rank() * shard_size
+        hidden_shard = shared_output.narrow(-1, shard_start, shard_size)
+        hidden_shard.addmm_(latent, weight.t())
+        return self._maybe_reduce_final_output(
+            shared_output, trunc_size, output_is_reduced=False
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -373,6 +466,10 @@ class LatentMoERunner(MoERunner):
             latent_tail = self._small_batch_tail
         elif tier is LatentTailTier.ALLREDUCE_OVERLAP:
             latent_tail = self._overlap_allreduce_tail
+        elif tier is LatentTailTier.ROCE_TAIL_FUSION:
+            latent_tail = self._roce_tail
+        elif tier is LatentTailTier.COLUMN_SHARD:
+            latent_tail = self._shard_weight_tail
         else:
             latent_tail = self._shard_up_proj_tail
 

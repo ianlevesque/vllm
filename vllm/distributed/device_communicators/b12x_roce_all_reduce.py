@@ -226,6 +226,11 @@ class B12xRoceAllReduce:
         self._announced_hierarchy = False
         self._announced = False
         self._announced_gather = False
+        # SM12x fused collectives on this runtime (two-shot all-reduce and the
+        # latent-MoE tail); None unless every rank could build them.
+        self.fused = None
+        self._two_shot_min_size = 0
+        self._announced_two_shot = False
 
         if device_group is None:
             logger.warning("RoCEnante requires a CUDA process group.")
@@ -268,6 +273,8 @@ class B12xRoceAllReduce:
             # Initialization failure is fatal and coordinated across TP ranks;
             # never leave some ranks using a hierarchy and others using flat.
             self._initialize_hierarchy(max_size, hierarchical_min)
+        if envs.VLLM_ROCE_FUSED_COLLECTIVES and not gather_only:
+            self._initialize_fused()
         if self.rank == 0:
             logger.info(
                 "Using RoCEnante (b12x one-shot RoCE collectives): world=%d, hcas=%s, "
@@ -425,6 +432,60 @@ class B12xRoceAllReduce:
                 self._hierarchical_max_size,
             )
 
+    def _initialize_fused(self) -> None:
+        """Build the SM12x fused collectives, on every rank or on none.
+
+        Dispatch must be rank-invariant, so each rank reports whether it built
+        the kernels (extension build, windowed proxy ops) and one failure
+        disables the feature everywhere; the plain collectives keep serving.
+        """
+        error = None
+        fused = None
+        try:
+            from vllm.models.kimi_k3.nvidia.ops.sm121.roce_fused import (
+                RoceFusedCollectives,
+            )
+
+            fused = RoceFusedCollectives(self._runtime, self.device)
+            # Everything a dispatch depends on besides shapes: the two-shot
+            # threshold and the shared memory the fused GEMM sizes x against.
+            limits = (
+                _parse_byte_size(envs.VLLM_ROCE_TWO_SHOT_MIN_SIZE),
+                fused.gemm_shared_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported through the vote
+            error = f"{type(exc).__name__}: {exc}"
+            limits = (0, 0)
+        votes: list[tuple[str | None, tuple[int, int]]] = [
+            (None, (0, 0))
+        ] * self.world_size
+        dist.all_gather_object(votes, (error, limits), group=self.group)
+        failures = [f"rank {i}: {e}" for i, (e, _) in enumerate(votes) if e]
+        if not failures and len({m for _, m in votes}) != 1:
+            failures = [f"fused-collective limits differ across ranks: {votes}"]
+        minimum = limits[0]
+        if failures:
+            logger.warning(
+                "RoCEnante fused collectives disabled on every rank: %s",
+                "; ".join(failures)[:2000],
+            )
+            return
+        self.fused = fused
+        self._two_shot_min_size = minimum
+        if self.rank == 0:
+            logger.info(
+                "RoCEnante fused collectives ready: two-shot all-reduce for BF16 "
+                "[rows, N] payloads of at least %d bytes.",
+                minimum,
+            )
+
+    def _should_two_shot(self, inp: torch.Tensor) -> bool:
+        return (
+            self.fused is not None
+            and inp.numel() * inp.element_size() >= self._two_shot_min_size
+            and self.fused.can_two_shot_all_reduce(inp)
+        )
+
     def _should_hierarchical(self, inp: torch.Tensor) -> bool:
         return (
             bool(self._hierarchical_runtimes)
@@ -465,6 +526,17 @@ class B12xRoceAllReduce:
                 str(inp.dtype).replace("torch.", ""),
                 envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE,
             )
+        if self._should_two_shot(inp):
+            if not self._announced_two_shot:
+                self._announced_two_shot = True
+                log = logger.info if self.rank == 0 else logger.debug
+                log(
+                    "RoCEnante two-shot all-reduce is live: first BF16 reduction "
+                    "%s, %d bytes.",
+                    tuple(inp.shape),
+                    inp.numel() * inp.element_size(),
+                )
+            return self.fused.two_shot_all_reduce(inp)
         if self._should_hierarchical(inp):
             if not self._announced_hierarchy:
                 self._announced_hierarchy = True
@@ -493,6 +565,12 @@ class B12xRoceAllReduce:
                 str(inp.dtype).replace("torch.", ""),
                 dim,
             )
+        if (
+            self.fused is not None
+            and dim in (-1, inp.dim() - 1)
+            and self.fused.can_all_gather(inp)
+        ):
+            return self.fused.all_gather(inp)
         return self._runtime.all_gather(inp, dim=dim)
 
     def supports_fused_add_rms_norm(self) -> bool:
@@ -518,6 +596,8 @@ class B12xRoceAllReduce:
             yield
 
     def close(self) -> None:
+        # The fused kernels hold only addresses of the runtime closed below.
+        self.fused = None
         for runtime in self._hierarchical_runtimes:
             runtime.close()
         self._hierarchical_runtimes.clear()

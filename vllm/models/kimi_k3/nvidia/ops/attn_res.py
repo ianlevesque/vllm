@@ -10,9 +10,48 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+# The SM12x cluster kernel (ops/sm121/attn_res) runs one 7-block cluster per
+# row with a ~5 us floor (cluster launch, two cluster barriers).  Measured on
+# GB10 against the Triton kernel: 6.8 us against 11.0 us at 6 rows and eight
+# saved blocks, 5.5 against 4.7 at one block, and 18.9 against 14.0 at 32 rows
+# (3.3 ms against 2.9 ms at 4100 rows), so it serves decode batches with at
+# least three saved blocks and the Triton kernel serves everything else.
+_SM121_MIN_BLOCKS = 3
+_SM121_MAX_ROWS = 8
+_SM121_SCRATCH: dict[int, object] = {}
+
+
+def prepare_sm121_attn_res(device: torch.device) -> bool:
+    """Build the SM12x AttnRes kernel and its scratch; call at model init.
+
+    The kernel's scratch must exist before any CUDA graph capture, and every
+    AttnRes launch of a device shares it, which is safe because they run in
+    order on one stream (the auxiliary AttnRes stream is not supported).
+
+    Returns:
+        Whether the SM12x kernel will be used on this device.
+
+    """
+    if not (
+        envs.VLLM_KIMI_K3_SM121_ATTN_RES
+        and not envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM
+        and device.type == "cuda"
+        and current_platform.is_device_capability_family(120)
+    ):
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _SM121_SCRATCH:
+        from vllm.models.kimi_k3.nvidia.ops.sm121._ext import load_extension
+        from vllm.models.kimi_k3.nvidia.ops.sm121._scratch import AttnResScratch
+
+        load_extension()
+        _SM121_SCRATCH[index] = AttnResScratch(torch.device("cuda", index))
+    return True
 
 
 # Consumed by kimi_k3_triton_warmup.py during kernel_warmup().
@@ -218,6 +257,41 @@ def attn_res(
             eps,
             output_norm_eps,
         )
+    sm121_scratch = (
+        _SM121_SCRATCH.get(prefix.device.index)
+        if _SM121_SCRATCH
+        and num_blocks >= _SM121_MIN_BLOCKS
+        and prefix.shape[0] <= _SM121_MAX_ROWS
+        else None
+    )
+    if sm121_scratch is not None:
+        from vllm.models.kimi_k3.nvidia.ops.sm121 import attn_res as sm121
+
+        if sm121.is_supported(
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            num_blocks,
+            block_write_idx,
+            output,
+        ):
+            return sm121.attn_res(
+                prefix,
+                delta,
+                blocks,
+                norm_weight,
+                qk_weight,
+                output_norm_weight,
+                num_blocks,
+                block_write_idx,
+                eps,
+                output_norm_eps,
+                output,
+                scratch=sm121_scratch,
+            )
     if output is None:
         output = prefix.new_empty(prefix.shape)
     # Tuned on GB300: source tiling helps decode, while one-source tiles scale
