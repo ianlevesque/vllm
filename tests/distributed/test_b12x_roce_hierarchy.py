@@ -66,6 +66,8 @@ def adapter():
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
     value = namespace["B12xRoceAllReduce"].__new__(namespace["B12xRoceAllReduce"])
     value.disabled = False
+    value.gather_only = False
+    value.fused = None
     value.rank, value.world_size = 0, 16
     value.group, value.device = "tp16", "cuda:0"
     value._runtime = Mock()

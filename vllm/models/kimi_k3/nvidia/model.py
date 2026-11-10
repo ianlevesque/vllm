@@ -181,6 +181,16 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     # Both feature flags may be enabled; the worker's static SP topology binds
     # its singleton to exactly one mode.
     all_reduce = not use_sequence_parallel
+    if (
+        all_reduce
+        and envs.VLLM_KIMI_K3_SM121_GEMM_AR
+        and current_platform.is_device_capability_family(120)
+    ):
+        # No NVLink multicast on a Spark: the SM12x kernel reduces over RoCE
+        # and is used wherever the adapter built its fused collectives.
+        from vllm.models.kimi_k3.nvidia.ops.sm121.gemm_ar import init_sm121_gemm_ar
+
+        return init_sm121_gemm_ar(vllm_config.model_config.hf_text_config.hidden_size)
     mode = "GEMM-AR" if all_reduce else "GEMM-RS"
     enabled = envs.VLLM_KIMI_K3_GEMM_AR if all_reduce else envs.VLLM_ENABLE_GEMM_RS
     if not enabled:
@@ -280,9 +290,7 @@ class KimiMLP(nn.Module):
             not use_sequence_parallel and reduce_results
         )
         if use_gemm_rs_ar and run_gemm_rs_ar:
-            from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
-                get_gemm_rs_ar,
-            )
+            from vllm.models.kimi_k3.nvidia.ops.sm121.gemm_ar import get_gemm_rs_ar
 
             gemm_rs_ar = get_gemm_rs_ar()
             if gemm_rs_ar.can_run(self.down_proj):
@@ -319,6 +327,18 @@ class KimiMLP(nn.Module):
         if self.shard_sequence_parallel:
             x = sp_reduce_scatter(x)
         return x
+
+
+def tp_roce_fused_collectives():
+    """The TP group's SM12x RoCE fused collectives, or None.
+
+    Built by the RoCEnante adapter on every rank or on none
+    (``VLLM_ROCE_FUSED_COLLECTIVES``), so a dispatch on this is rank-invariant.
+    Looked up per call: a transport sleep/wake cycle rebuilds the adapter.
+    """
+    from vllm.models.kimi_k3.nvidia.ops.sm121.gemm_ar import tp_fused_collectives
+
+    return tp_fused_collectives()
 
 
 def shard_auxiliary_projections(use_sequence_parallel: bool) -> bool:
@@ -453,7 +473,7 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
-        up_proj: ReplicatedLinear | RowParallelLinear,
+        up_proj: ReplicatedLinear | RowParallelLinear | KimiPaddedColumnParallelLinear,
     ) -> None:
         super().__init__()
         self.norm = norm
@@ -478,6 +498,15 @@ class KimiRoutedOutputTransform(nn.Module):
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
         hidden_states, _ = self.up_proj(hidden_states)
+        if self.output_is_tp_shard:
+            # Each rank projected its own hidden columns of a reduced latent:
+            # gathering the shards is the complete (already reduced) result.
+            assert isinstance(self.up_proj, KimiPaddedColumnParallelLinear)
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
+            if hidden_states.shape[-1] != self.up_proj.logical_output_size:
+                hidden_states = hidden_states[
+                    ..., : self.up_proj.logical_output_size
+                ].contiguous()
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
@@ -488,6 +517,11 @@ class KimiRoutedOutputTransform(nn.Module):
             isinstance(self.up_proj, RowParallelLinear)
             and not self.up_proj.reduce_results
         )
+
+    @property
+    def output_is_tp_shard(self) -> bool:
+        """The up-projection is TP-sharded by output column (RoCE tail fusion)."""
+        return isinstance(self.up_proj, KimiPaddedColumnParallelLinear)
 
 
 class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
@@ -871,7 +905,10 @@ class KimiMoE(nn.Module):
         )
         self.routed_expert_norm: RMSNorm | None
         self.routed_expert_up_proj: (
-            ReplicatedLinear | KimiPaddedRowParallelLinear | None
+            ReplicatedLinear
+            | KimiPaddedRowParallelLinear
+            | KimiPaddedColumnParallelLinear
+            | None
         )
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
@@ -899,7 +936,21 @@ class KimiMoE(nn.Module):
             # fuse the latent and shared reductions into a single all-reduce
             # (concat the two partials, reduce once), then run the up-proj and
             # shared add locally with no further collective.
-            if self.shard_auxiliary_projections:
+            if (
+                self.shard_auxiliary_projections
+                and envs.VLLM_KIMI_K3_ROCE_TAIL_FUSION
+                and hidden_size % self.tp_size == 0
+            ):
+                # Output-column shard for the RoCE tail fusion: rank r holds
+                # rows [r * hidden / tp, +hidden / tp) of the weight and
+                # produces those hidden columns from the full reduced latent.
+                self.routed_expert_up_proj = KimiPaddedColumnParallelLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    f"{prefix}.routed_expert_up_proj",
+                    gather_output=False,
+                )
+            elif self.shard_auxiliary_projections:
                 self.routed_expert_up_proj = KimiPaddedRowParallelLinear(
                     self.moe_hidden_size, hidden_size, f"{prefix}.routed_expert_up_proj"
                 )
@@ -1053,6 +1104,38 @@ class KimiMoE(nn.Module):
             router_output, topk_ids = _router(hidden_states)
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
+        if (
+            envs.VLLM_KIMI_K3_ROCE_FRONT_GATHER
+            and self.shard_auxiliary_projections
+            and not self.use_mega_moe
+        ):
+            # Both projections are TP-sharded and each ends in a last-dim
+            # all-gather: send the FP32 logit shard and the BF16 latent shard
+            # in one round.
+            fused = tp_roce_fused_collectives()
+            if fused is not None:
+                assert isinstance(self.gate, KimiColumnParallelGate)
+                assert isinstance(down_proj, KimiPaddedColumnParallelLinear)
+                logits_shard = self.gate.forward_local(hidden_states)
+                latent_shard, _ = down_proj.forward_local(hidden_states)
+                if fused.can_all_gather(logits_shard, latent_shard):
+                    logits, latent = fused.all_gather(logits_shard, latent_shard)
+                    if logits.shape[-1] != self.gate.logical_output_size:
+                        logits = logits[
+                            ..., : self.gate.logical_output_size
+                        ].contiguous()
+                    if latent.shape[-1] != down_proj.logical_output_size:
+                        latent = latent[
+                            ..., : down_proj.logical_output_size
+                        ].contiguous()
+                    return latent, logits, None
+                logits = tensor_model_parallel_all_gather(logits_shard, dim=-1)
+                latent = tensor_model_parallel_all_gather(latent_shard, dim=-1)
+                return (
+                    latent[..., : down_proj.logical_output_size].contiguous(),
+                    logits[..., : self.gate.logical_output_size].contiguous(),
+                    None,
+                )
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
                 lambda: _router(hidden_states),
@@ -1439,6 +1522,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.reuse_attn_res_output = (
             self.use_attn_res and current_platform.is_device_capability_family(120)
         )
+        if self.use_attn_res:
+            # Opt-in SM12x AttnRes kernel: its scratch has to exist before any
+            # CUDA graph is captured.
+            from vllm.models.kimi_k3.nvidia.ops.attn_res import (
+                prepare_sm121_attn_res,
+            )
+
+            prepare_sm121_attn_res(torch.device(current_platform.current_device()))
         parallel_config = vllm_config.parallel_config
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         self.use_sequence_parallel = (

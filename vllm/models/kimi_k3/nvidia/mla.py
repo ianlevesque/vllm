@@ -397,9 +397,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
         self.gemm_rs_ar = None
         if run_gemm_rs_ar:
-            from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
-                get_gemm_rs_ar,
-            )
+            from vllm.models.kimi_k3.nvidia.ops.sm121.gemm_ar import get_gemm_rs_ar
 
             gemm_rs_ar = get_gemm_rs_ar()
             if gemm_rs_ar.can_run(self.o_proj):
