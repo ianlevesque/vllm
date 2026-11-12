@@ -44,17 +44,100 @@ logger = init_logger(__name__)
 
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
+# Devices whose workspace address a captured CUDA graph already replays.
+_flashinfer_dsv4_workspace_captured: set[torch.device] = set()
+# FlashInfer's SM120 sparse decode keeps one BF16 partial output and one FP32
+# LSE per (decode row, scratch head, 64-candidate chunk), then a final LSE.
+_SM120_DECODE_CHUNK = 64
+_SM120_VALUE_DIM = 512
 
 
 def get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
     workspace = _flashinfer_dsv4_workspace_by_device.get(device)
     if workspace is None:
+        import vllm.envs as envs
+
+        fixed = envs.VLLM_DSV4_FLASHINFER_WORKSPACE_MB * 1024 * 1024
         workspace = torch.zeros(
-            _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
+            max(fixed, _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE),
             dtype=torch.uint8,
             device=device,
         )
         _flashinfer_dsv4_workspace_by_device[device] = workspace
+    return workspace
+
+
+def sm120_sparse_decode_workspace_bytes(
+    rows: int, heads: int, topk: int, extra_topk: int
+) -> int:
+    """Scratch FlashInfer carves from the caller's workspace for one SM120
+    sparse-MLA decode launch (its `resolve_execution`, decode variant)."""
+    scratch_heads = heads if heads == 8 else -(-heads // 16) * 16
+    chunks = -(-topk // _SM120_DECODE_CHUNK) + -(-extra_topk // _SM120_DECODE_CHUNK)
+    slots = rows * scratch_heads * chunks
+    # Partial outputs, split LSE and final LSE, each region 16-byte aligned.
+    return slots * (_SM120_VALUE_DIM * 2 + 4) + rows * scratch_heads * 4 + 3 * 16
+
+
+def get_flashinfer_dsv4_decode_workspace(
+    device: torch.device,
+    *,
+    rows: int,
+    heads: int,
+    topk: int,
+    extra_topk: int,
+    capture_rows: int = 0,
+) -> torch.Tensor:
+    """The shared workspace, large enough for an SM120 sparse decode launch.
+
+    FlashInfer 0.7.2+ keeps the split-K partials in the caller's workspace and
+    refuses to allocate inside CUDA graph capture, where older releases pinned
+    their own scratch. The partials scale with decode rows, heads and candidate
+    chunks, so a long-context compressed layer needs gigabytes at the largest
+    captured batch (1M tokens, 32 heads, 512 rows: about 2.2 GiB), not 128 MiB.
+    Grow the buffer on the first eager launch, already sized for
+    `capture_rows`, so every later capture replays one stable address.
+    """
+    workspace = get_flashinfer_dsv4_workspace(device)
+    capturing = torch.cuda.is_current_stream_capturing()
+    need = sm120_sparse_decode_workspace_bytes(
+        max(rows, capture_rows), heads, topk, extra_topk
+    )
+    if need <= workspace.numel():
+        if capturing:
+            _flashinfer_dsv4_workspace_captured.add(device)
+        return workspace
+    import vllm.envs as envs
+
+    fixed = envs.VLLM_DSV4_FLASHINFER_WORKSPACE_MB > 0
+    if fixed or capturing or device in _flashinfer_dsv4_workspace_captured:
+        if capturing or not fixed:
+            # A replayed graph holds the old address: growing now would corrupt it.
+            raise RuntimeError(
+                "DeepSeek V4 FlashInfer sparse-MLA workspace is too small for a "
+                f"captured decode launch: {need} bytes needed for rows={rows}, "
+                f"heads={heads}, topk={topk}+{extra_topk}; have {workspace.numel()}. "
+                "Set VLLM_DSV4_FLASHINFER_WORKSPACE_MB to at least "
+                f"{-(-need // (1024 * 1024))}."
+            )
+        # A fixed size is the operator's choice; eager launches may fall back
+        # to FlashInfer's temporary scratch.
+        return workspace
+    # 1/16 headroom, rounded up to whole MiB.
+    size = -(-(need + need // 16) // (1024 * 1024)) * 1024 * 1024
+    logger.info(
+        "Growing the DeepSeek V4 FlashInfer sparse-MLA workspace on %s from "
+        "%d MiB to %d MiB (rows=%d, heads=%d, topk=%d+%d)",
+        device,
+        workspace.numel() // (1024 * 1024),
+        size // (1024 * 1024),
+        max(rows, capture_rows),
+        heads,
+        topk,
+        extra_topk,
+    )
+    workspace = torch.zeros(size, dtype=torch.uint8, device=device)
+    _flashinfer_dsv4_workspace_by_device[device] = workspace
     return workspace
 
 
@@ -666,6 +749,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "flashinfer-ai/flashinfer#4380."
             )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+        # Largest decode batch a CUDA graph replays; sizes the split-K scratch.
+        self._decode_capture_rows = int(
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        )
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
             return
@@ -851,7 +938,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,
-            workspace_buffer=self._get_workspace(q.device),
+            workspace_buffer=get_flashinfer_dsv4_decode_workspace(
+                q.device,
+                rows=q.shape[0],
+                heads=q.shape[1],
+                topk=swa_indices.shape[-1],
+                extra_topk=(
+                    0 if extra_sparse_indices is None else extra_sparse_indices.shape[-1]
+                ),
+                capture_rows=self._decode_capture_rows,
+            ),
             sparse_indices=swa_indices,
             compressed_kv_cache=extra_cache,
             out=output,

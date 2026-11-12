@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    get_flashinfer_dsv4_decode_workspace,
     get_flashinfer_dsv4_workspace,
     packed_block_span,
     pad_to_supported_q_heads,
@@ -617,6 +618,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(
             self._o_proj_block_size
         )
+        # Largest decode batch a CUDA graph replays; sizes the split-K scratch.
+        self._decode_capture_rows = int(
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        )
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
             return
@@ -803,7 +808,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,
-            workspace_buffer=self._get_workspace(q.device),
+            workspace_buffer=get_flashinfer_dsv4_decode_workspace(
+                q.device,
+                rows=q.shape[0],
+                heads=q.shape[1],
+                topk=swa_indices.shape[-1],
+                extra_topk=(
+                    0 if extra_sparse_indices is None else extra_sparse_indices.shape[-1]
+                ),
+                capture_rows=self._decode_capture_rows,
+            ),
             sparse_indices=swa_indices,
             compressed_kv_cache=extra_cache,
             out=output,

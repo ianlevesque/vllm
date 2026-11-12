@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_DSV4_FLASHINFER_WORKSPACE_MB: int = 0
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 512
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1961,6 +1962,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+    ),
+    # Fixed size (MiB) of the DeepSeek V4/V4.1 FlashInfer sparse-MLA workspace.
+    # 0 sizes it automatically: 128 MiB, grown before CUDA graph capture to
+    # the SM120 split-K scratch of the largest captured decode batch.
+    "VLLM_DSV4_FLASHINFER_WORKSPACE_MB": lambda: int(
+        os.getenv("VLLM_DSV4_FLASHINFER_WORKSPACE_MB", "0")
     ),
     # Transmit MoE all-to-all combine (expert-output) payloads in FP8 instead
     # of BF16, halving NVLink traffic on the combine leg. Only takes effect
