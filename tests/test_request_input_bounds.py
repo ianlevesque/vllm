@@ -423,8 +423,8 @@ ENCODING_MODULES = [deepseek_v32_encoding, deepseek_v4_encoding]
 
 @pytest.mark.parametrize(
     "encoding_module",
-    ENCODING_MODULES,
-    ids=["deepseek_v32", "deepseek_v4"],
+    [*ENCODING_MODULES, deepseek_v41_encoding],
+    ids=["deepseek_v32", "deepseek_v4", "deepseek_v41"],
 )
 def test_encode_messages_scans_last_user_once_per_conversation(
     monkeypatch: pytest.MonkeyPatch,

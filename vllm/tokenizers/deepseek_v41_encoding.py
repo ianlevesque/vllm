@@ -334,6 +334,7 @@ def render_message(
     image_order: Optional[List[int]] = None,
     add_generation_prompt: bool = True,
     continue_final_message: bool = False,
+    last_user_idx: Optional[int] = None,
 ) -> str:
     """
     Render a single message at the given index into its V4.1 encoded string form.
@@ -344,7 +345,9 @@ def render_message(
     )
 
     msg = messages[index]
-    last_user_idx = find_last_user_index(messages)
+    last_user_idx = (
+        find_last_user_index(messages) if last_user_idx is None else last_user_idx
+    )
 
     role = msg.get("role")
     content = msg.get("content")
@@ -622,6 +625,8 @@ def encode_messages(
         num_to_render = len(messages)
         context_len = len(context)
 
+    last_user_idx = find_last_user_index(full_messages)
+
     for idx in range(num_to_render):
         prompt += render_message(
             idx + context_len,
@@ -632,6 +637,7 @@ def encode_messages(
             image_order=image_order,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=continue_final_message,
+            last_user_idx=last_user_idx,
         )
 
     return prompt
