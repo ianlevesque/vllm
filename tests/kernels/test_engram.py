@@ -989,6 +989,8 @@ def test_engram_disk_offload_graph_modes(mode, breakable, ok, monkeypatch):
             cpu_offload=False,
             dp_shared_memory=False,
             use_thp=False,
+            peer_group_size=0,
+            peer_group_store=None,
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode[mode]),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
@@ -997,7 +999,11 @@ def test_engram_disk_offload_graph_modes(mode, breakable, ok, monkeypatch):
     monkeypatch.setattr(engram_ops, "is_breakable_cudagraph_enabled", lambda: breakable)
     monkeypatch.setattr(engram_ops, "ParallelEngramEmbedding", lambda *a, **k: k)
     layout = SimpleNamespace(
-        num_embeddings=[100], head_dim=64, primes=[[[47, 53]]], layer_ids=[3]
+        num_embeddings=[100],
+        head_dim=64,
+        primes=[[[47, 53]]],
+        layer_ids=[3],
+        packed_fp4=False,
     )
     create = Engram._create_embedding
     if ok:
