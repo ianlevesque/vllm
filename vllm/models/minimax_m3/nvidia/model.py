@@ -1669,6 +1669,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     #     `self_attn.index_{q,k}_{proj,norm}`. The expert regexes are scoped to
     #     `.experts.<int>.` and run before the stacked `.gate_proj`/`.up_proj`
     #     rules, which therefore only see dense and shared-expert projections.
+    #     They also keep `e_score_correction_bias` under `mlp.gate.` and carry
+    #     ModelOpt `*_quantizer` placeholders beside the routed experts.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_regex={
             re.compile(r"\.mlp\.experts\.(\d+)\.gate_proj\."): (
@@ -1680,6 +1682,23 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             re.compile(r"\.mlp\.experts\.(\d+)\.down_proj\."): (
                 r".block_sparse_moe.experts.\1.w2."
             ),
+            # transformers-style exports keep the router's score-correction
+            # bias inside the gate module (`mlp.gate.e_score_correction_bias`);
+            # this backbone owns it on the MoE block
+            # (`block_sparse_moe.e_score_correction_bias`). Without this rule
+            # the strict loader rejects the key; the per-model loader it
+            # replaced skipped the key silently, leaving the bias unloaded.
+            re.compile(
+                r"\.(?:mlp|block_sparse_moe)\.gate\.e_score_correction_bias$"
+            ): ".block_sparse_moe.e_score_correction_bias",
+            # ModelOpt leaves one-element `{input,weight}_quantizer`
+            # placeholders per routed expert projection
+            # (`experts.<proj>.<E>.*_quantizer`, not `experts.<E>.<proj>.*`).
+            # They carry no weights and name no module here.
+            re.compile(
+                r"\.experts\.(?:gate|up|down)_proj\.\d+\."
+                r"(?:input|weight)_quantizer$"
+            ): None,
         },
         orig_to_new_substr={
             "mtp.": None,
