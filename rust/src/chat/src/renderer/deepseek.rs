@@ -121,7 +121,9 @@ pub(super) fn render_request_with_media_order(
             return Err(Error::AllToolsDeferred);
         }
     }
+    // Visit each user-content block once, at its first entry.
     let last_user_like_message_index = (0..request.messages.len())
+        .filter(|&index| !is_following_user_content(&request.messages, index))
         .rev()
         .find(|&index| starts_user_turn(&request.messages, index, index, dialect));
     let last_user_render_index = find_last_user_render_index(
