@@ -48,10 +48,51 @@ _B12X_QUERY_HEAD_TILE = 8
 _MAX_I32 = torch.iinfo(torch.int32).max
 
 
+class _EmbeddedDenseMLA:
+    """The scratch-plan dense-MLA contract on FlashInfer's embedded b12x.
+
+    Standalone b12x through 1.2.x exposed `plan`/`bind`/`compile`/`run` over a
+    caller-owned scratch plan. The embedded package (1.5+, shipped inside
+    FlashInfer) made the public names session-prepared plans, but kept the
+    identical scratch-plan machinery underneath. This backend sizes one
+    capture-static plan per layer and binds it every step, so it drives those
+    entry points directly rather than a preparation session.
+    """
+
+    def __init__(self, dense_mla: Any) -> None:
+        from b12x.attention.dense_mla import _kernel, _scratch
+
+        self.Caps = dense_mla.Caps
+        self.plan = _scratch.plan_dense_mla_scratch
+        self.compile = _kernel.compile_dense_mla
+        self._run = _kernel.run_dense_mla
+
+    @staticmethod
+    def bind(plan: Any, **kwargs: Any) -> Any:
+        return plan.bind(**kwargs)
+
+    def run(self, *, binding: Any) -> Any:
+        try:
+            return self._run(binding=binding)
+        except RuntimeError as error:
+            # The embedded kernel no longer compiles on a launch miss. Keep the
+            # standalone behaviour outside capture; a miss during capture stays
+            # fatal, exactly as before.
+            if (
+                "not prepared" not in str(error)
+                or torch.cuda.is_current_stream_capturing()
+            ):
+                raise
+        self.compile(binding=binding)
+        return self._run(binding=binding)
+
+
 def _load_dense_mla() -> Any:
     from b12x.attention import dense_mla
 
-    return dense_mla
+    if hasattr(dense_mla, "compile"):
+        return dense_mla
+    return _EmbeddedDenseMLA(dense_mla)
 
 
 def _page_table_width(max_cache_tokens: int, page_size: int) -> int:
