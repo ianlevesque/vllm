@@ -65,10 +65,15 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
-        # SM12x kernels only instantiate 64-token sparse-MLA blocks (128
-        # trips the block_kv assert, #59203).
         if current_platform.is_device_capability_family(120):
-            return [64]
+            # Block sizes count original tokens. The 64-state limit of #59203
+            # is the indexer's, and DeepseekV4IndexerCache allocates its own
+            # 64-state pages on SM12x; FlashInfer's SM12x sparse-MLA kernels
+            # take the latent page size at runtime. Listing only 64 would
+            # split every packed 128-token block into kernel blocks, which
+            # pads the block stride to the lcm of the CSA1/CSA2 kernel pages
+            # (5.8x the KV memory per token) and cannot be bound.
+            return [64, 128]
         return [128]
 
     @staticmethod
