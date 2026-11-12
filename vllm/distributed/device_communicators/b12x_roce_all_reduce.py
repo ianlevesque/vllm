@@ -23,12 +23,20 @@ Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
   never leaves the worker.  Peers starve on the stalled rank and raise too.
 - The runtime orders collectives across streams with an event and requires a
   single stream inside a CUDA graph capture, which is how vLLM captures.
+
+Two runtimes satisfy this contract and both report ``API_VERSION`` 1:
+standalone b12x through 1.2.x, used as is, and the b12x that FlashInfer embeds
+(1.5+), whose collectives take a prepared plan and are driven through
+``_EmbeddedRoce``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import timedelta
+from types import SimpleNamespace
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -56,6 +64,135 @@ def _parse_byte_size(value: str) -> int:
         if normalized.endswith(suffix):
             return int(normalized[: -len(suffix)]) * multiplier
     return int(normalized)
+
+
+class _EmbeddedRoce:
+    """The standalone (1.2.x) runtime surface on FlashInfer's embedded b12x.
+
+    Standalone b12x planned inside ``all_reduce``/``all_gather`` and exposed
+    ``prepare``. The embedded package (1.5+) turned those public calls into
+    runs of a plan published by a preparation session, but kept the launch
+    path underneath: ``_prepare_resources`` is the old ``prepare``, and
+    ``_run_prepared_all_reduce``/``_run_prepared_all_gather`` are the old
+    bodies with the compiled launchers passed in. A launcher is specific to a
+    dtype and the runtime's geometry, never to a size or shape, so this driver
+    resolves one per dtype and calls those entry points directly. It does not
+    run a preparation session: a session job ends by evicting every b12x
+    program that no session plan retains, the ``B12X_MLA`` kernels among them.
+
+    The launchers are held here for the life of the runtime, because captured
+    graphs replay them while the library's cache may drop its own reference.
+    Nothing is compiled or allocated while the current stream is capturing: a
+    dtype, or the gather, that was not prepared before the capture is declined
+    and that collective goes to NCCL. Every rank prepares the same dtypes at
+    the same points, so the decision stays rank-invariant.
+    """
+
+    ENTRY_POINTS = (
+        "_prepare_resources",
+        "_launcher_key",
+        "_gather_launcher_key",
+        "_run_prepared_all_reduce",
+        "_run_prepared_all_gather",
+    )
+
+    def __init__(self, runtime: Any) -> None:
+        self._runtime = runtime
+        self._reduce_launcher, self._gather_launcher = self._launcher_factories()
+        # The fields the runtime's launch path reads from a prepared plan.
+        self._state = SimpleNamespace(
+            runtime=runtime, reduce_launchers={}, gather_launcher=None
+        )
+
+    @staticmethod
+    def _launcher_factories() -> tuple[Any, Any]:
+        from b12x.comm.roce import _allgather_cute, _oneshot_cute
+
+        return _oneshot_cute.get_launcher, _allgather_cute.get_launcher
+
+    @classmethod
+    def missing(cls, roce: Any) -> str | None:
+        """Name what an embedded ``b12x.comm.roce`` lacks for this driver."""
+        runtime = roce.AllReduce
+        missing = [name for name in cls.ENTRY_POINTS if not hasattr(runtime, name)]
+        try:
+            cls._launcher_factories()
+        except (ImportError, AttributeError) as exc:
+            missing.append(f"launcher modules ({exc})")
+        return ", ".join(missing) or None
+
+    def __getattr__(self, name: str) -> Any:
+        # capture, check_health, close, hca_names, stats and limits are unchanged.
+        if name == "_runtime":
+            raise AttributeError(name)
+        return getattr(self._runtime, name)
+
+    def prepare(
+        self,
+        dtypes: Sequence[torch.dtype] = (torch.bfloat16,),
+        *,
+        padded_gather: bool = False,
+    ) -> None:
+        """Resolve the reduce and gather launchers and allocate scratch."""
+        state, runtime = self._state, self._runtime
+        missing = tuple(d for d in dtypes if d not in state.reduce_launchers)
+        first = state.gather_launcher is None
+        if not (first or missing or padded_gather):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "RoCE launchers must be prepared before CUDA graph capture"
+            )
+        if first or padded_gather:
+            runtime._prepare_resources(missing, padded_gather=padded_gather)
+        if first:
+            state.gather_launcher = self._gather_launcher(
+                *runtime._gather_launcher_key()
+            )
+        for dtype in missing:
+            state.reduce_launchers[dtype] = self._reduce_launcher(
+                *runtime._launcher_key(dtype)
+            )
+
+    def should_allreduce(self, inp: torch.Tensor) -> bool:
+        return self._runtime.should_allreduce(inp) and (
+            inp.dtype in self._state.reduce_launchers
+            or not torch.cuda.is_current_stream_capturing()
+        )
+
+    def all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        if inp.dtype not in self._state.reduce_launchers:
+            # Standalone b12x compiled on the first eager use as well.
+            self.prepare((inp.dtype,))
+        return self._runtime._run_prepared_all_reduce(
+            inp, prepared=self._state, out=out, stream=stream
+        )
+
+    def should_all_gather(self, inp: torch.Tensor, dim: int = -1) -> bool:
+        return self._runtime.should_all_gather(inp, dim) and (
+            self._state.gather_launcher is not None
+            or not torch.cuda.is_current_stream_capturing()
+        )
+
+    def all_gather(
+        self,
+        inp: torch.Tensor,
+        *,
+        dim: int = -1,
+        out: torch.Tensor | None = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        if self._state.gather_launcher is None:
+            self.prepare(())
+        return self._runtime._run_prepared_all_gather(
+            inp, prepared=self._state, dim=dim, out=out, stream=stream
+        )
 
 
 class B12xRoceAllReduce:
@@ -109,11 +246,13 @@ class B12xRoceAllReduce:
             # Exchange setup over the CPU (gloo) group: using the torch NCCL
             # group would create a torch NCCL communicator that vLLM otherwise
             # never needs, costing ~3.4 GB of unified memory per rank on Spark.
-            self._runtime = roce.AllReduce.from_exchange_group(
-                exchange_group=group,
-                device=device,
-                max_size=max_size,
-                max_gather_bytes=max_gather,
+            self._runtime = self._bind_runtime(
+                roce.AllReduce.from_exchange_group(
+                    exchange_group=group,
+                    device=device,
+                    max_size=max_size,
+                    max_gather_bytes=max_gather,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - the runtime already coordinated ranks
             logger.warning("RoCEnante initialization failed: %s", exc)
@@ -151,6 +290,10 @@ class B12xRoceAllReduce:
             return f"b12x.comm.roce API version {api}, adapter needs {needed}", None
         if not roce.is_supported(self.device):
             return "needs an integrated GPU with an active RDMA device", None
+        if self._takes_plan(roce.AllReduce):
+            missing = _EmbeddedRoce.missing(roce)
+            if missing:
+                return f"embedded b12x.comm.roce lacks {missing}", None
         try:
             limits = (
                 _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE),
@@ -169,6 +312,18 @@ class B12xRoceAllReduce:
         except Exception as exc:  # noqa: BLE001 - reported through the vote
             return f"invalid RoCEnante size limit: {exc}", None
         return None, limits
+
+    @staticmethod
+    def _takes_plan(runtime) -> bool:
+        """Whether a runtime class or instance is the embedded, plan-taking one."""
+        # Local import: the hierarchy tests execute this class body on its own.
+        from inspect import signature
+
+        return "plan" in signature(runtime.all_reduce).parameters
+
+    def _bind_runtime(self, runtime):
+        """Return a standalone runtime as is, an embedded one behind its driver."""
+        return _EmbeddedRoce(runtime) if self._takes_plan(runtime) else runtime
 
     def _exchange_vote(
         self, reason: str | None, limits: tuple[int, int, int] | None
@@ -236,11 +391,13 @@ class B12xRoceAllReduce:
         for group in member_groups:
             error = None
             try:
-                runtime = roce.AllReduce(
-                    exchange_group=group,
-                    device=self.device,
-                    max_size=max_size,
-                    max_gather_bytes=max_size,
+                runtime = self._bind_runtime(
+                    roce.AllReduce(
+                        exchange_group=group,
+                        device=self.device,
+                        max_size=max_size,
+                        max_gather_bytes=max_size,
+                    )
                 )
                 self._hierarchical_runtimes.append(runtime)
                 runtime.prepare((torch.float32,))
