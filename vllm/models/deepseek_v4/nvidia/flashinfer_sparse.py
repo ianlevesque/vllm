@@ -46,10 +46,22 @@ _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 # Devices whose workspace address a captured CUDA graph already replays.
 _flashinfer_dsv4_workspace_captured: set[torch.device] = set()
-# FlashInfer's SM120 sparse decode keeps one BF16 partial output and one FP32
-# LSE per (decode row, scratch head, 64-candidate chunk), then a final LSE.
+# FlashInfer's SM120 split-K decode kernel keeps one BF16 partial output and one
+# FP32 LSE per (decode row, scratch head, 64-candidate chunk), then a final LSE.
+# It serves at most 64 rows; larger batches run the prefill kernels, which need
+# no split scratch.
 _SM120_DECODE_CHUNK = 64
 _SM120_VALUE_DIM = 512
+_SM120_DECODE_MAX_ROWS = 64
+
+
+def _sm120_split_decode_max_rows() -> int:
+    """FlashInfer's own row ceiling for the split-K decode kernel."""
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import _policy
+    except ImportError:
+        return _SM120_DECODE_MAX_ROWS
+    return int(getattr(_policy, "_DECODE_MAX_TOKENS", _SM120_DECODE_MAX_ROWS))
 
 
 def get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
@@ -92,16 +104,19 @@ def get_flashinfer_dsv4_decode_workspace(
 
     FlashInfer 0.7.2+ keeps the split-K partials in the caller's workspace and
     refuses to allocate inside CUDA graph capture, where older releases pinned
-    their own scratch. The partials scale with decode rows, heads and candidate
-    chunks, so a long-context compressed layer needs gigabytes at the largest
-    captured batch (1M tokens, 32 heads, 512 rows: about 2.2 GiB), not 128 MiB.
-    Grow the buffer on the first eager launch, already sized for
-    `capture_rows`, so every later capture replays one stable address.
+    their own scratch. The partials scale with decode rows (up to the kernel's
+    64-row ceiling), heads and candidate chunks: a 1M-token compressed layer
+    needs 261 MiB at 32 heads and 131 MiB at 16, not the fixed 128 MiB.
+    Grow the buffer on the first eager launch, already sized for the largest
+    captured batch, so every later capture replays one stable address.
     """
     workspace = get_flashinfer_dsv4_workspace(device)
     capturing = torch.cuda.is_current_stream_capturing()
     need = sm120_sparse_decode_workspace_bytes(
-        max(rows, capture_rows), heads, topk, extra_topk
+        min(max(rows, capture_rows), _sm120_split_decode_max_rows()),
+        heads,
+        topk,
+        extra_topk,
     )
     if need <= workspace.numel():
         if capturing:
@@ -131,7 +146,7 @@ def get_flashinfer_dsv4_decode_workspace(
         device,
         workspace.numel() // (1024 * 1024),
         size // (1024 * 1024),
-        max(rows, capture_rows),
+        min(max(rows, capture_rows), _sm120_split_decode_max_rows()),
         heads,
         topk,
         extra_topk,
