@@ -1673,10 +1673,16 @@ class ParallelEngramEmbedding(nn.Module):
 def map_engram_disk_tables(layers: Iterable[nn.Module]) -> None:
     """Point disk-offloaded Engram tables at the checkpoint files. Runs after
     load_weights, when a hub checkpoint is guaranteed to be on local disk."""
-    vllm_config = get_current_vllm_config()
-    engram_config = vllm_config.engram_config
-    if engram_config is None or not engram_config.disk_offload:
+    tables = [
+        engram.embed_tokens
+        for layer in layers
+        if (engram := getattr(layer, "engram", None)) is not None
+        and engram.embed_tokens.disk_table is not None
+    ]
+    if not tables:
+        # Nothing is disk-offloaded: do not depend on a config context here.
         return
+    vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
     checkpoint_dir = local_checkpoint_dir(
         model_config.model_weights or model_config.model,
@@ -1688,10 +1694,8 @@ def map_engram_disk_tables(layers: Iterable[nn.Module]) -> None:
             "Engram disk_offload reads the tables from the checkpoint files, "
             f"but no local checkpoint was found for {model_config.model}."
         )
-    for layer in layers:
-        engram = getattr(layer, "engram", None)
-        if engram is not None:
-            engram.embed_tokens.map_checkpoint(checkpoint_dir)
+    for table in tables:
+        table.map_checkpoint(checkpoint_dir)
 
 
 @triton.jit(do_not_specialize=["num_kv_tokens"])

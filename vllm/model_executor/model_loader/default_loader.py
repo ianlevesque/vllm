@@ -335,8 +335,11 @@ class DefaultModelLoader(BaseModelLoader):
                     local_expert_ids=self.local_expert_ids,
                     indexed_tensor_files=indexed_tensor_files,
                     is_unused_weight=source.is_unused_weight,
+                    # Disk-offloaded tables are never read at load time: keep
+                    # them on the lazy CPU safetensors path as well.
                     load_engram_on_cpu=bool(
-                        engram_config and engram_config.cpu_offload
+                        engram_config
+                        and (engram_config.cpu_offload or engram_config.disk_offload)
                     ),
                 )
             else:
