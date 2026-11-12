@@ -208,6 +208,7 @@ def test_default_loader_passes_custom_index_and_current_unused_weight_filter(tmp
     method = load(
         "vllm/model_executor/model_loader/default_loader.py",
         "DefaultModelLoader._get_weights_iterator",
+        get_current_vllm_config_or_none=lambda: None,
         json=json,
         filter_safetensors_files_by_weight_name=lambda files, _: files,
         instanttensor_weights_iterator=iterator,
@@ -433,6 +434,7 @@ def test_qwen_mtp_prefilter_preserves_values_without_reading_target_payload(
     method = load(
         DEFAULT_LOADER,
         "DefaultModelLoader._get_weights_iterator",
+        get_current_vllm_config_or_none=lambda: None,
         json=json,
         filter_safetensors_files_by_weight_name=load(
             WEIGHTS,
@@ -440,7 +442,10 @@ def test_qwen_mtp_prefilter_preserves_values_without_reading_target_payload(
             safe_open=safe_open,
             logger=Mock(),
         ),
-        instanttensor_weights_iterator=iterator,
+        # The loader calls the public wrapper; this exercises its inner iterator.
+        instanttensor_weights_iterator=lambda files, progress, local_expert_ids=None, **kw: (
+            iterator(files, progress, **kw)
+        ),
     )
     owner = NS(
         load_config=NS(

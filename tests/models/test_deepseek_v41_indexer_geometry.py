@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from vllm.config import (
+    AttentionConfig,
     CompilationConfig,
     KernelConfig,
     ParallelConfig,
@@ -22,7 +23,7 @@ from vllm.model_executor.layers import sparse_attn_indexer
 from vllm.models.deepseek_v41 import attention
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
 )
@@ -130,10 +131,10 @@ def _construct_layers(monkeypatch, capability):
             prefill_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
-        attention_config=SimpleNamespace(
+        # The real config: the indexer reads a growing set of its resolvers.
+        attention_config=AttentionConfig(
             indexer_sparse_logits=False,
-            hisparse_config=None,
-            resolve_indexer_kv_dtype=lambda default: "fp8",
+            sparse_mla_prefill_workspace_factor=5,
         ),
         kernel_config=KernelConfig(enable_jit_warmup=False),
         quant_config=None,
@@ -157,7 +158,7 @@ def _construct_layers(monkeypatch, capability):
 
 
 @pytest.mark.parametrize("capability", [120, 121])
-def test_indexer_groups_and_sharing_on_sm12x(monkeypatch, capability):
+def test_indexer_groups_and_sharing_on_sm12x(dist_init, monkeypatch, capability):
     config, layers = _construct_layers(monkeypatch, capability)
     owners = (2, 8, 14, 20)
     index_caches = {i: layers[i].indexer.k_cache for i in owners}
@@ -230,7 +231,7 @@ def test_indexer_groups_and_sharing_on_sm12x(monkeypatch, capability):
 
 
 @pytest.mark.parametrize("capability", [90, 100])
-def test_indexer_geometry_preserved_off_sm12x(monkeypatch, capability):
+def test_indexer_geometry_preserved_off_sm12x(dist_init, monkeypatch, capability):
     config, layers = _construct_layers(monkeypatch, capability)
     for i in (2, 8, 14, 20):
         cache = layers[i].indexer.k_cache

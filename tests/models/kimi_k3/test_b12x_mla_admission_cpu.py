@@ -11,7 +11,7 @@ import ast
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Generic, NamedTuple, TypeVar
@@ -75,6 +75,7 @@ def _selector(model_type, dcp, *, local_heads=6, pcp=1):
         abstractmethod=abstractmethod,
         dataclass=dataclass,
         Enum=Enum,
+        StrEnum=StrEnum,
         Generic=Generic,
         T=TypeVar("T"),
         NamedTuple=NamedTuple,

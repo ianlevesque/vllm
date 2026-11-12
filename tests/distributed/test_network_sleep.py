@@ -8,6 +8,7 @@ import importlib.util
 import os
 import sys
 import weakref
+from collections import deque
 from concurrent.futures import Future
 from contextlib import nullcontext
 from datetime import timedelta
@@ -15,6 +16,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from vllm.v1.engine import CheckpointState
 
 ROOT = Path(__file__).parents[2]
 
@@ -264,8 +267,18 @@ def core_method(name):
         "PauseMode": str,
         "envs": SimpleNamespace(VLLM_SLEEP_RELEASE_TRANSPORT=True),
         "logger": SimpleNamespace(info=lambda *args: None),
+        "CheckpointState": CheckpointState,
     }
     exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), scope)
+    method = scope[name]
+
+    def call(engine, *args, **kwargs):
+        # A serving engine: upstream's checkpoint lifecycle is at rest.
+        if not hasattr(engine, "_checkpoint_state"):
+            engine._checkpoint_state = CheckpointState.RUNNING
+        return method(engine, *args, **kwargs)
+
+    scope[name] = call
     return scope[name]
 
 
@@ -275,7 +288,11 @@ def test_network_sleep_waits_for_scheduler_drain_and_keeps_cache(context):
     executor = SimpleNamespace(collective_rpc=lambda method: events.append(method))
 
     def pause_scheduler(**kwargs):
-        assert kwargs == {"mode": "wait", "clear_cache": False}
+        assert kwargs == {
+            "mode": "wait",
+            "clear_cache": False,
+            "reset_connector": True,
+        }
         return pause
 
     engine = SimpleNamespace(model_executor=executor, pause_scheduler=pause_scheduler)
@@ -888,6 +905,10 @@ def test_actual_dp_busy_loop_pauses_before_control_close_and_never_uses_closed_g
         PauseMode=Literal["abort", "keep", "wait"],
         PauseState=SimpleNamespace(PAUSED_ALL=2, PAUSED_NEW=1),
         envs=SimpleNamespace(VLLM_SLEEP_RELEASE_TRANSPORT=True),
+        CheckpointState=CheckpointState,
+        get_watch_dog=lambda: SimpleNamespace(
+            disable=lambda: nullcontext(), feed=lambda: None
+        ),
         queue=queue,
         DEBUG=10,
         ParallelConfig=SimpleNamespace(sync_dp_state=sync),
@@ -907,6 +928,10 @@ def test_actual_dp_busy_loop_pauses_before_control_close_and_never_uses_closed_g
         scope,
     )
     engine = scope["Engine"]()
+    engine._checkpoint_state = CheckpointState.RUNNING
+    engine._deferred_inputs = deque()
+    engine.vllm_config = SimpleNamespace(parallel_config=scope["ParallelConfig"])
+    engine.enable_fault_tolerance = False
     engine.model_executor = SimpleNamespace(
         is_sleeping=False, collective_rpc=lambda m: events.append(m)
     )

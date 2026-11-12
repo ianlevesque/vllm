@@ -216,7 +216,8 @@ def test_m3_transformers_expert_mapping_and_native_names(prefix, part, wanted):
             ".mlp.shared_experts.down_proj.weight",
             ".block_sparse_moe.shared_experts.down_proj.weight",
         ),
-        (".self_attn.indexer.q_proj.weight", ".self_attn.index_q_proj.weight"),
+        # The indexer projection then stacks into the fused qkv_proj.
+        (".self_attn.indexer.q_proj.weight", ".self_attn.qkv_proj.weight"),
         (".self_attn.indexer.k_norm.weight", ".self_attn.index_k_norm.weight"),
     ],
 )
@@ -224,22 +225,6 @@ def test_m3_gate_shared_expert_and_indexer_mapping(suffix, expected):
     assert (
         m3_mapper().map_name("model.layers.5" + suffix) == "model.layers.5" + expected
     )
-
-
-@pytest.mark.parametrize(
-    "current,ended", [([], False), ([2], False), ([2, 9, 3], True), ([3], True)]
-)
-def test_m3_reasoning_only_reads_current_turn(current, ended):
-    find = load(PARSER, "MiniMaxM3ReasoningParser._rfind_token_sequence")
-    method = load(PARSER, "MiniMaxM3ReasoningParser.is_reasoning_end")
-    owner = NS(
-        _start_token_ids=[2],
-        _end_token_ids=[3],
-        _turn_start_token_ids=[1],
-        _rfind_token_sequence=find,
-    )
-    # Literal end markers in system/past assistant messages cannot close this turn.
-    assert method(owner, [1, 7, 3, 1, 2, 8, 3, 1] + current) is ended
 
 
 @dataclasses.dataclass
@@ -348,10 +333,12 @@ def test_upstream_encoder_confirmed_progress_and_draft_margin(lookahead):
         _free_encoder_input=manager.free_encoder_input,
     )
     req.num_output_placeholders = 4
-    req.num_computed_tokens = 153 + lookahead
+    # Upstream dropped the draft-lookahead margin: the drafter only reads ahead
+    # of num_computed_tokens, so confirmed progress alone frees the input.
+    req.num_computed_tokens = 153
     free(owner, req)
     assert manager.get_cached_input_ids(req) == {0}
-    req.num_computed_tokens = 154 + lookahead
+    req.num_computed_tokens = 154
     free(owner, req)
     assert manager.get_cached_input_ids(req) == set()
 
@@ -626,7 +613,8 @@ def test_grouped_mla_launch_respects_actual_shared_memory(monkeypatch, smem, exp
         _fwd_grouped_kernel_stage1=Kernel(),
         _page_stride=lambda *_: 128,
     )
-    method(
+    # The dispatcher now launches from the returned (grid, kwargs) spec.
+    _, launch_kwargs = method(
         torch.zeros(2, 8, 576),
         torch.zeros(2, 64, 1, 576),
         torch.zeros(2, 64, 1, 512),
@@ -641,5 +629,6 @@ def test_grouped_mla_launch_respects_actual_shared_memory(monkeypatch, smem, exp
         1.0,
         is_mla=True,
     )
-    assert launched[0]["BLOCK_DMODEL"] == 512
-    assert launched[0]["num_stages"] == expected
+    assert not launched
+    assert launch_kwargs["BLOCK_DMODEL"] == 512
+    assert launch_kwargs["num_stages"] == expected

@@ -121,6 +121,7 @@ def test_idle_dp_dispatch_preserves_query_width_and_request_budget(
     scheduler = SimpleNamespace(
         num_scheduled_tokens={str(i): 1 for i in range(num_reqs)},
         total_num_scheduled_tokens=num_reqs,
+        skip_drafts=False,
     )
     with pytest.raises(Captured):
         scope[fn.name](runner, scheduler, dummy_run=True)
@@ -150,6 +151,7 @@ def test_idle_dp_dispatch_preserves_query_width_and_request_budget(
     target_sync = scope["DPSyncState"](
         num_tokens_across_dp=torch.full((4,), padded, dtype=torch.int32),
         uniform_token_count=query_len,
+        max_query_len=query_len,
         eager=False,
         num_reqs=max(num_reqs, 5),
     )

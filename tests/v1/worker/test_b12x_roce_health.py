@@ -27,6 +27,10 @@ class _AsyncOutput(AsyncModelRunnerOutput):
         self._trace.append("get_output")
         return self._result
 
+    def get_kv_connector_output(self):
+        self._trace.append("get_kv_connector_output")
+        return self._result.kv_connector_output
+
 
 def _worker_with_communicator(monkeypatch, comm) -> Worker:
     worker = Worker.__new__(Worker)  # no GPU, no init: only the helpers are used
@@ -38,7 +42,6 @@ def _worker_with_communicator(monkeypatch, comm) -> Worker:
 def _sync_output() -> ModelRunnerOutput:
     return ModelRunnerOutput(
         req_ids=["r0"],
-        req_id_to_index={"r0": 0},
         sampled_token_ids=[[1]],
         logprobs=None,
         prompt_logprobs_dict={},

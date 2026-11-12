@@ -79,6 +79,7 @@ def test_make_dummy_preserves_dp_uniform_decode(
     target_sync = DPSyncState(
         num_tokens_across_dp=torch.full((4,), padded_tokens, dtype=torch.int32),
         uniform_token_count=query_len,
+        max_query_len=query_len,
         eager=False,
         num_reqs=agreed_reqs,
     )
@@ -132,7 +133,9 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     )
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA top-k.")
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Requires CUDA/ROCm top-k."
+)
 @pytest.mark.parametrize("is_padding", [True, False])
 def test_make_dummy_padding_controls_moe_routing(monkeypatch, is_padding: bool):
     """Dummy tokens marked as padding are dropped by the MoE router (top-k id
@@ -180,6 +183,7 @@ def test_dummy_context_preserves_token_padding():
     block_tables = BlockTables.__new__(BlockTables)
     block_tables.input_block_tables = [torch.zeros((num_reqs, 1), dtype=torch.int32)]
     block_tables.kernel_block_sizes = [16]
+    block_tables.block_sizes = [16]
     block_tables.blocks_per_kv_block = [1]
     set_dummy_context(
         batch, block_tables, context_len=3, num_kv_blocks=2, max_model_len=16
@@ -236,14 +240,17 @@ def test_prepare_dcp_local_seq_lens_uses_shared_buffer(monkeypatch):
     assert batch.dcp_local_seq_lens.tolist() == [1, 2, 0, 0]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="triton kernel needs CUDA")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="triton kernel needs CUDA or XPU",
+)
 @pytest.mark.parametrize("dcp_size", [2, 4])
 @pytest.mark.parametrize("cp_interleave", [1, 16])
 def test_prepare_dcp_local_seq_lens_matches_reference(
     dcp_size: int, cp_interleave: int
 ):
     """Every rank's local lengths must equal the reference torch formula."""
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
     seq_lens_np = np.array([7, 16, 33, 64, 512, 1023], dtype=np.int32)
     buffers = InputBuffers(max_num_reqs=8, max_num_tokens=32, device=device)
     batch = InputBatch.make_dummy(6, 12, buffers)

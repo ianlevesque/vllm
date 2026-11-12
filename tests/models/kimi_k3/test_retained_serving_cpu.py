@@ -388,8 +388,9 @@ def test_dspark_replication_override_keeps_target_parallel_config(shard):
         ["_get_dspark_parallel_config"],
         replace=replace,
         envs=SimpleNamespace(VLLM_DCP_SHARD_DRAFT=shard),
+        dspark_draft_supports_eplb=lambda _config: False,
     )._get_dspark_parallel_config
-    draft = f(config, 1)
+    draft = f(config, 1, SimpleNamespace())
     assert draft.decode_context_parallel_size == (4 if shard else 1)
     assert draft.tensor_parallel_size == 1
     assert config.decode_context_parallel_size == 4

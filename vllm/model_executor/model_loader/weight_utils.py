@@ -7,8 +7,11 @@ import concurrent.futures
 import fnmatch
 import glob
 import hashlib
+import inspect
 import json
 import os
+import random
+import sys
 import tempfile
 import threading
 import time
@@ -34,7 +37,11 @@ from vllm.config.load import (
     DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     LoadConfig,
 )
-from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_world_group,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
@@ -43,9 +50,11 @@ from vllm.model_executor.layers.quantization import (
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
 )
+from vllm.model_executor.utils import copy_weight_
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import hf_api, hf_fs
+from vllm.utils.cpu_resource_utils import get_available_memory
 from vllm.utils.import_utils import PlaceholderModule
 
 try:
@@ -154,6 +163,16 @@ def _natural_sort_key(filepath: str) -> list:
     ]
 
 
+def _shuffle_files(files: list[str]) -> list[str]:
+    """Return *files* shuffled with a rank-dependent seed."""
+    rank = get_world_group().rank
+    # Sort first so the permutation does not depend on the input order
+    shuffled = sorted(files, key=_natural_sort_key)
+    random.Random(rank).shuffle(shuffled)
+    logger.info("Shuffled %d safetensors files with seed %d", len(shuffled), rank)
+    return shuffled
+
+
 def maybe_download_from_modelscope(
     model: str,
     revision: str | None = None,
@@ -199,6 +218,8 @@ def get_quant_config(
     from vllm.config.quantization import (
         _ONLINE_SHORTHANDS,
         QuantizationConfigArgs,
+        QuantSpec,
+        merge_quantization_config,
         resolve_quantization_config,
     )
     from vllm.model_executor.layers.quantization.modelopt import (
@@ -319,6 +340,16 @@ def get_quant_config(
     # is not set yet.
     if quant_cls is OnlineQuantizationConfig and online_args is not None:
         assert isinstance(online_args, QuantizationConfigArgs)
+        # Activation-only overrides apply to pre-quantized checkpoints; without
+        # a weight key, standalone online quantization would silently no-op.
+        specs = [(kind, getattr(online_args, kind)) for kind in ("linear", "moe")]
+        specs += [(f"targets[{p}]", t) for p, t in (online_args.targets or {}).items()]
+        for name, spec in specs:
+            if isinstance(spec, QuantSpec) and "weight" not in spec.fields_set:
+                raise ValueError(
+                    f"quantization_config.{name} = {spec} does not set a weight "
+                    "quantization key, which online quantization requires."
+                )
         return OnlineQuantizationConfig(args=online_args)
 
     model_name_or_path = (
@@ -358,8 +389,10 @@ def get_quant_config(
             assert fp8_args is not None
             return OnlineQuantizationConfig(args=fp8_args)
         if model_config.quantization in _ONLINE_SHORTHANDS:
-            args = online_args or _ONLINE_SHORTHANDS[model_config.quantization]
-            assert isinstance(args, QuantizationConfigArgs)
+            assert not isinstance(online_args, dict)
+            args = merge_quantization_config(
+                _ONLINE_SHORTHANDS[model_config.quantization], online_args
+            )
             return OnlineQuantizationConfig(args=args)
         return maybe_compose_online_quantization(quant_cls())
 
@@ -370,8 +403,10 @@ def get_quant_config(
     ]
     if len(quant_config_files) == 0:
         if model_config.quantization in _ONLINE_SHORTHANDS:
-            args = online_args or _ONLINE_SHORTHANDS[model_config.quantization]
-            assert isinstance(args, QuantizationConfigArgs)
+            assert not isinstance(online_args, dict)
+            args = merge_quantization_config(
+                _ONLINE_SHORTHANDS[model_config.quantization], online_args
+            )
             return OnlineQuantizationConfig(args=args)
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
@@ -394,39 +429,6 @@ def get_quant_config(
                 )
 
     return make_checkpoint_config(config)
-
-
-def get_sparse_attention_config(
-    model_config: ModelConfig,
-    load_config: LoadConfig,
-    sparse_attention_config_filename: str = "sparse_attention_config.json",
-) -> dict[str, Any]:
-    model_name_or_path = model_config.model
-    is_local = os.path.isdir(model_name_or_path)
-    if not is_local:
-        # Download the config files.
-        with get_lock(model_name_or_path, load_config.download_dir):
-            hf_folder = hf_api().snapshot_download(
-                model_name_or_path,
-                revision=model_config.revision,
-                allow_patterns="*.json",
-                cache_dir=load_config.download_dir,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                tqdm_class=DisabledTqdm,
-            )
-    else:
-        hf_folder = model_name_or_path
-
-    config_file = os.path.join(hf_folder, sparse_attention_config_filename)
-    if not os.path.exists(config_file):
-        return {}
-
-    # Load the sparse attention config.
-    with open(config_file) as f:
-        config = json.load(f)
-    logger.info("Loaded sparse attention config from %s", config_file)
-
-    return config
 
 
 @instrument(span_name="Download weights - HF")
@@ -638,7 +640,7 @@ def _normalize_module_prefixes(
 
 
 def _mapped_weight_name(weights_mapper: "WeightsMapper | None", key: str) -> str | None:
-    """Apply ``WeightsMapper.map_name`` when present; else identity."""
+    """Apply `WeightsMapper.map_name` when present; else identity."""
     if weights_mapper is None:
         return key
     return weights_mapper.map_name(key)
@@ -659,9 +661,9 @@ def _shared_hf_root_module_prefixes(
 ) -> tuple[str, ...]:
     """Module prefixes that are also an HF root for non-LM weights.
 
-    E.g. Molmo/Phi-4-MM/Muse mark LM as ``model`` while vision HF keys stay
-    under ``model.vision_*`` / ``model.embed_tokens_extend.*``. Detected via
-    ``WeightsMapper.orig_to_new_prefix`` (no hard-coded name list).
+    E.g. Molmo/Phi-4-MM/Muse mark LM as `model` while vision HF keys stay
+    under `model.vision_*` / `model.embed_tokens_extend.*`. Detected via
+    `WeightsMapper.orig_to_new_prefix` (no hard-coded name list).
     """
     if weights_mapper is None:
         return ()
@@ -691,15 +693,15 @@ def resolve_mm_encoder_only_lm_prefixes(
     *,
     weights_mapper: "WeightsMapper | None" = None,
 ) -> tuple[str, ...] | None:
-    """Resolve vLLM LM *module* prefixes for ``--mm-encoder-only`` shard skip.
+    """Resolve vLLM LM *module* prefixes for `--mm-encoder-only` shard skip.
 
-    Prefixes come from ``_language_model_names``. Classification of HF index
-    keys is done later via optional ``weights_mapper`` (see
-    ``filter_mm_encoder_only_safetensors_files``), so this helper does **not**
+    Prefixes come from `_language_model_names`. Classification of HF index
+    keys is done later via optional `weights_mapper` (see
+    `filter_mm_encoder_only_safetensors_files`), so this helper does **not**
     hard-code Qwen/HF nest lists.
 
-    Returns ``None`` (leave the safetensors file list unchanged) when
-    ``_language_model_names`` is empty/missing, or when a module prefix is a
+    Returns `None` (leave the safetensors file list unchanged) when
+    `_language_model_names` is empty/missing, or when a module prefix is a
     shared HF checkpoint root for both LM and non-LM weights — fail-closed so
     Molmo / Phi-4-MM / Muse cannot under-load the encoder.
     """
@@ -730,16 +732,16 @@ def filter_mm_encoder_only_safetensors_files(
 ) -> list[str]:
     """Drop safetensors shards that only contain language-model weights.
 
-    Used with ``--mm-encoder-only`` so Encoder-only EPD instances avoid reading
+    Used with `--mm-encoder-only` so Encoder-only EPD instances avoid reading
     pure LM shards from disk/DRAM.
 
-    Each HF index key is classified by mapping through ``weights_mapper`` (when
-    provided) and testing the *vLLM* name against ``language_model_prefixes``.
+    Each HF index key is classified by mapping through `weights_mapper` (when
+    provided) and testing the *vLLM* name against `language_model_prefixes`.
     Without a mapper, HF names are compared directly (identity checkpoint
-    layout, e.g. Kimi ``language_model.*``).
+    layout, e.g. Kimi `language_model.*`).
 
     A shard is kept if it contains any non-LM key. Without an index file,
-    returns ``hf_weights_files`` unchanged.
+    returns `hf_weights_files` unchanged.
     """
     prefixes = tuple(language_model_prefixes)
     if not prefixes:
@@ -890,38 +892,69 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def _local_snapshot_dirs(model_name_or_path: str, cache_dir: str | None) -> list[Path]:
+    """Snapshot directories of a cached repo, found from the cache layout alone.
+
+    Offline, snapshot_download() resolves a revision only through refs/<revision>,
+    which a cache seeded at a pinned commit does not have.
+    """
+    snapshots = (
+        Path(cache_dir or huggingface_hub.constants.HF_HUB_CACHE)
+        / f"models--{model_name_or_path.replace('/', '--')}"
+        / "snapshots"
+    )
+    if not snapshots.is_dir():
+        return []
+    return [path for path in snapshots.iterdir() if path.is_dir()]
+
+
 def drop_checkpoint_cache(
     model_name_or_path: str,
     revision: str | None = None,
     cache_dir: str | None = None,
 ) -> None:
-    checkpoint_dir: Path | None = None
+    if sys.platform != "linux":
+        return
+    checkpoint_dirs: list[Path] = []
     if os.path.isdir(model_name_or_path):
-        checkpoint_dir = Path(model_name_or_path)
+        checkpoint_dirs = [Path(model_name_or_path)]
     else:
         with suppress(OSError, ValueError):
-            checkpoint_dir = Path(
-                hf_api().snapshot_download(
-                    model_name_or_path,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    local_files_only=True,
+            checkpoint_dirs = [
+                Path(
+                    hf_api().snapshot_download(
+                        model_name_or_path,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        local_files_only=True,
+                    )
                 )
-            )
-    if checkpoint_dir is None:
+            ]
+        if not checkpoint_dirs:
+            checkpoint_dirs = _local_snapshot_dirs(model_name_or_path, cache_dir)
+    if not checkpoint_dirs:
         logger.info_once(
             "No local checkpoint found for %s; skipping page-cache eviction",
             model_name_or_path,
         )
         return
-    for path in checkpoint_dir.glob("*.safetensors"):
-        try:
-            with path.open("rb") as file:
-                os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        except OSError as exc:
-            logger.warning(
-                "Could not release checkpoint page cache for %s: %s", path, exc
-            )
+    for checkpoint_dir in checkpoint_dirs:
+        dropped_bytes = 0
+        for path in checkpoint_dir.glob("*.safetensors"):
+            try:
+                with path.open("rb") as file:
+                    os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError as exc:
+                logger.warning(
+                    "Could not release checkpoint page cache for %s: %s", path, exc
+                )
+            else:
+                dropped_bytes += path.stat().st_size
+        logger.info(
+            "Released %.2f GiB of checkpoint page cache in %s",
+            dropped_bytes / 1024**3,
+            checkpoint_dir,
+        )
 
 
 def _get_checkpoints_size_bytes(files: list[str]) -> int:
@@ -929,27 +962,6 @@ def _get_checkpoints_size_bytes(files: list[str]) -> int:
     if not files:
         return 0
     return sum(os.path.getsize(f) for f in files)
-
-
-def _get_available_ram_bytes() -> int:
-    """Return available RAM, honoring cgroup limits."""
-    import psutil
-
-    host_available = psutil.virtual_memory().available
-
-    from vllm.utils.cpu_resource_utils import (
-        get_cgroup_memory_limit,
-        get_cgroup_memory_usage,
-    )
-
-    cgroup_limit = get_cgroup_memory_limit()
-    if cgroup_limit is None:
-        return host_available
-    cgroup_usage = get_cgroup_memory_usage()
-    cgroup_available = (
-        cgroup_limit if cgroup_usage is None else max(0, cgroup_limit - cgroup_usage)
-    )
-    return min(host_available, cgroup_available)
 
 
 def _get_fs_type(files: list[str]) -> str:
@@ -1085,6 +1097,7 @@ def safetensors_weights_iterator(
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    shuffle_safetensors_files: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -1101,7 +1114,7 @@ def safetensors_weights_iterator(
     fs_type = _get_fs_type(sorted_files)
     is_net_fs = fs_type in ("nfs", "nfs4", "lustre")
     total_bytes = _get_checkpoints_size_bytes(sorted_files)
-    avail_bytes = _get_available_ram_bytes()
+    avail_bytes = get_available_memory()
     ram_threshold_pct = 90
     fits_in_ram = total_bytes <= (ram_threshold_pct / 100.0) * avail_bytes
     fs_name = fs_type.upper() if fs_type else "unknown"
@@ -1162,6 +1175,9 @@ def safetensors_weights_iterator(
             block_size=safetensors_prefetch_block_size,
         )
 
+    if shuffle_safetensors_files:
+        sorted_files = _shuffle_files(sorted_files)
+
     leftover_state_dict: dict[str, torch.Tensor] = {}
     for st_file in tqdm(
         sorted_files,
@@ -1218,12 +1234,16 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     max_workers: int = 4,
+    shuffle_safetensors_files: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
 
     def _load_file(st_file: str):
         result = load_file(st_file, device="cpu")
         return result
+
+    if shuffle_safetensors_files:
+        hf_weights_files = _shuffle_files(hf_weights_files)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Note to use generator here so we do not store all the loaded files in memory
@@ -1258,10 +1278,13 @@ def runai_safetensors_weights_iterator(
             else "cpu"
         )
 
+        # runai-model-streamer<0.17.0 has no `owned` and reuses its buffers
+        owned = "owned" in inspect.signature(streamer.stream_files).parameters
         streamer.stream_files(
             hf_weights_files,
             device=device,
             is_distributed=is_distributed,
+            **({"owned": True} if owned else {}),
         )
         total_tensors = sum(
             len(tensors_meta)
@@ -1278,7 +1301,7 @@ def runai_safetensors_weights_iterator(
         )
 
         for name, tensor in tensor_iter:
-            yield name, tensor.clone()
+            yield name, tensor if owned else tensor.clone()
 
 
 def fastsafetensors_weights_iterator(
@@ -1350,15 +1373,27 @@ def fastsafetensors_weights_iterator(
             pl.close()
 
 
+_ENGRAM_WEIGHT_RE = re.compile(
+    r"(?:^|\.)(?:engram\.embed\.(?:weight|scale)|"
+    r"ple\.ple_embedding\.ngram_embedding\.shard_[0-9]+\.weight)$"
+)
+
+
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
-    *,
     local_expert_ids: set[int] | None = None,
+    *,
     indexed_tensor_files: dict[str, str] | None = None,
     is_unused_weight: Callable[[str], bool] | None = None,
+    load_engram_on_cpu: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Load with InstantTensor and an optional dedicated bulk communicator."""
+    """Load with InstantTensor and an optional dedicated bulk communicator.
+
+    `load_engram_on_cpu` keeps Engram tables off the device (they can exceed
+    device memory before TP sharding): every rank selects them by name, so
+    they leave the GPU ranges and load through CPU safetensors instead.
+    """
     from vllm.model_executor.model_loader.instanttensor_utils import (
         instanttensor_loading_group,
     )
@@ -1391,6 +1426,7 @@ def instanttensor_weights_iterator(
             is_unused_weight=is_unused_weight,
             process_group=None,
             ep_filter_names=ep_filter_names,
+            load_engram_on_cpu=load_engram_on_cpu,
         )
         return
     with instanttensor_loading_group(world_group) as process_group:
@@ -1400,6 +1436,7 @@ def instanttensor_weights_iterator(
             indexed_tensor_files=indexed_tensor_files,
             is_unused_weight=is_unused_weight,
             process_group=process_group,
+            load_engram_on_cpu=load_engram_on_cpu,
         )
 
 
@@ -1411,6 +1448,7 @@ def _instanttensor_weights_iterator(
     is_unused_weight: Callable[[str], bool] | None = None,
     process_group: Any = None,
     ep_filter_names: list[str] | None = None,
+    load_engram_on_cpu: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over weights in model safetensor files with InstantTensor.
 
@@ -1446,6 +1484,7 @@ def _instanttensor_weights_iterator(
         indexed_tensor_files is not None
         or is_unused_weight is not None
         or max_gpu_tensor_size is not None
+        or load_engram_on_cpu
     )
     open_kwargs: dict[str, Any] = {}
     if restrict_before_io:
@@ -1474,6 +1513,11 @@ def _instanttensor_weights_iterator(
             indexed_tensor_files=indexed_tensor_files,
             is_unused_weight=is_unused_weight,
             max_tensor_size=max_gpu_tensor_size,
+            load_on_cpu=(
+                (lambda name: _ENGRAM_WEIGHT_RE.search(name) is not None)
+                if load_engram_on_cpu
+                else None
+            ),
         )
 
     if not restrict_before_io or instant_open.ordered_tensor_metadatas:
@@ -1502,12 +1546,12 @@ def _instanttensor_weights_iterator(
                 pbar.close()
 
     if cpu_fallback_weights:
-        assert max_gpu_tensor_size is not None
         logger.info_once(
-            "Loading %d tensors larger than the %d-byte InstantTensor buffer "
-            "through CPU safetensors",
+            "Loading %d tensors through CPU safetensors (InstantTensor buffer "
+            "limit: %s bytes; Engram on CPU: %s)",
             len(cpu_fallback_weights),
             max_gpu_tensor_size,
+            load_engram_on_cpu,
         )
         fallback_by_file: dict[str, list[str]] = defaultdict(list)
         for name, filename in cpu_fallback_weights:
@@ -1524,8 +1568,10 @@ def _restrict_instanttensor_to_selected_ranges(
     indexed_tensor_files: dict[str, str] | None,
     is_unused_weight: Callable[[str], bool] | None,
     max_tensor_size: int | None = None,
+    load_on_cpu: Callable[[str], bool] | None = None,
 ) -> list[tuple[str, str]]:
-    """Select GPU ranges and return oversized tensors for CPU loading."""
+    """Select GPU ranges and return oversized or CPU-designated tensors for
+    CPU loading."""
     required_attrs = (
         "filename",
         "ordered_tensor_metadatas",
@@ -1599,10 +1645,9 @@ def _restrict_instanttensor_to_selected_ranges(
             tensor_size = int(file_offsets[item_index + 1][1]) - int(
                 file_offsets[item_index][1]
             )
-            use_cpu_fallback = (
-                selected_here
-                and max_tensor_size is not None
-                and tensor_size > max_tensor_size
+            use_cpu_fallback = selected_here and (
+                (max_tensor_size is not None and tensor_size > max_tensor_size)
+                or (load_on_cpu is not None and load_on_cpu(name))
             )
             keep.append(selected_here and not use_cpu_fallback)
             if use_cpu_fallback:
@@ -1731,6 +1776,45 @@ def multi_thread_pt_weights_iterator(
             del state
 
 
+def finalize_model_weights(
+    model: torch.nn.Module, target_device: torch.device | None = None
+) -> None:
+    """Run every module's own post-load hook after a full load or reload, each
+    after all of its submodules. Every load and update path finishes here.
+
+    Quantization methods and the submodules of quantized layers are skipped:
+    their quant method processes them, in the loader's per-layer pass.
+    """
+    from vllm.model_executor.layers.attention import is_deferred_attention_layer
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.model_loader.utils import device_loading_context
+
+    seen: set[torch.nn.Module] = set()
+
+    def children_first(module: torch.nn.Module) -> Iterable[torch.nn.Module]:
+        quantized = isinstance(
+            getattr(module, "quant_method", None), QuantizeMethodBase
+        )
+        # a module shared by several parents runs once, before all of them
+        for child in [] if quantized else module.children():
+            if child not in seen:
+                seen.add(child)
+                yield from children_first(child)
+        yield module
+
+    for module in children_first(model):
+        if isinstance(module, QuantizeMethodBase):
+            continue
+        hook = getattr(module, "process_weights_after_loading", None)
+        if callable(hook):
+            # only attention hooks need offloaded weights on the device
+            device = target_device if is_deferred_attention_layer(module) else None
+            with device_loading_context(module, device):
+                hook()
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
@@ -1738,14 +1822,14 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,
             # reshape to match before copying
-            param.data.copy_(loaded_weight.view(param.shape))
+            copy_weight_(param.data, loaded_weight.view(param.shape))
         else:
             assert param.size() == loaded_weight.size(), (
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})"
             )
 
-            param.data.copy_(loaded_weight)
+            copy_weight_(param.data, loaded_weight)
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.
@@ -1768,6 +1852,33 @@ def row_parallel_weight_loader(
 
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
+
+
+def load_attention_sink(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    """Load this rank's heads of a global sink; padded heads are set to -inf."""
+    tp_size = get_tensor_model_parallel_world_size()
+    heads = loaded_weight.numel()
+    if heads % tp_size:
+        raise ValueError(
+            f"Attention sink heads ({heads}) must be divisible by tp_size ({tp_size})"
+        )
+    local_heads = heads // tp_size
+    start = get_tensor_model_parallel_rank() * local_heads
+    default_weight_loader(
+        param[:local_heads], loaded_weight.narrow(0, start, local_heads)
+    )
+    param.data[local_heads:].fill_(-float("inf"))
+
+
+def make_attention_sink(
+    num_heads: int, dtype: torch.dtype | None = None
+) -> torch.nn.Parameter:
+    """Create a sink with -inf padding and register its TP weight loader."""
+    sink = torch.nn.Parameter(
+        torch.full((num_heads,), -float("inf"), dtype=dtype), requires_grad=False
+    )
+    sink.weight_loader = load_attention_sink
+    return sink
 
 
 def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
