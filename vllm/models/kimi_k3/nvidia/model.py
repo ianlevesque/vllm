@@ -558,8 +558,8 @@ class KimiK3TopKRouter(FusedTopKBiasRouter):
             and router_logits.is_cuda
             and router_logits.is_contiguous()
         ):
-            from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (  # noqa: E501
-                _get_padding_mask,
+            from vllm.model_executor.layers.fused_moe.router.base_router import (
+                get_moe_padding_mask,
             )
             from vllm.models.kimi_k3.nvidia.ops.topk16 import (
                 kimi_topk16_sigmoid,
@@ -568,7 +568,7 @@ class KimiK3TopKRouter(FusedTopKBiasRouter):
             return kimi_topk16_sigmoid(
                 router_logits,
                 self.e_score_correction_bias.data,
-                _get_padding_mask(num_tokens),
+                get_moe_padding_mask(num_tokens),
                 renormalize=self.renormalize,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
