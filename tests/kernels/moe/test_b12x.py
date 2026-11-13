@@ -1355,3 +1355,144 @@ def test_b12x_block_quant_relu2_moe_graph(codec, tokens, workspace_init):
             )
             assert cosine >= 0.999 and relative_l2 <= 0.01
         graph.reset()
+
+
+@pytest.mark.parametrize(
+    "activation,w13_rows,expected",
+    [
+        (MoEActivation.SITU, 768, 384),  # ragged gated partition (TP8)
+        (MoEActivation.SILU, 768, 384),
+        (MoEActivation.SILU, 512, 256),  # block-aligned gated partition
+        (MoEActivation.RELU2_NO_MUL, 384, 384),  # ragged ungated partition
+    ],
+)
+def test_b12x_block_quant_intermediate_follows_w13_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    activation: MoEActivation,
+    w13_rows: int,
+    expected: int,
+) -> None:
+    """Geometry handed to B12X for block codecs, checked without a GPU.
+
+    w2 holds ceil(intermediate / 256) blocks, so a 384-wide partition has
+    two; the planned intermediate must come from the w13 rows instead.
+    """
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantDesc
+
+    geometries: list[dict[str, int]] = []
+
+    def geometry(**kwargs):
+        geometries.append({name: int(value) for name, value in kwargs.items()})
+        return SimpleNamespace(**kwargs)
+
+    extension = SimpleNamespace(
+        PackedSource=lambda **kwargs: SimpleNamespace(**kwargs),
+        ActivationSpec=lambda **kwargs: SimpleNamespace(**kwargs),
+        MoEGeometry=geometry,
+        BlockQuantWeights=lambda **kwargs: SimpleNamespace(**kwargs),
+        plan_weights=lambda **kwargs: SimpleNamespace(**kwargs),
+        prepare_weights=lambda **kwargs: SimpleNamespace(
+            _impl=SimpleNamespace(plan=kwargs["plan"])
+        ),
+    )
+    monkeypatch.setattr(b12x, "_require_b12x_fused_moe", lambda: extension)
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    codec, block_bytes = "iq2_xxs", 66
+    experts = B12xExperts(
+        make_dummy_moe_config(num_experts=2, hidden_dim=512, intermediate_size=64),
+        FusedMoEQuantConfig(
+            _a1=FusedMoEQuantDesc(),
+            _a2=FusedMoEQuantDesc(),
+            _w1=FusedMoEQuantDesc(dtype=codec),
+            _w2=FusedMoEQuantDesc(dtype=codec),
+        ),
+    )
+    experts._prepare_experts(
+        w1=torch.zeros(2, w13_rows, 2, block_bytes, dtype=torch.uint8),
+        w2=torch.zeros(2, 512, -(-expected // 256), block_bytes, dtype=torch.uint8),
+        activation=activation,
+        params_dtype=torch.bfloat16,
+    )
+    assert geometries == [
+        {"num_experts": 2, "hidden_size": 512, "intermediate_size": expected}
+    ]
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
+@torch.inference_mode()
+def test_b12x_block_quant_ragged_intermediate_prepare(codec, workspace_init):
+    """Ragged per-partition intermediate (384 = 256 + 128) preparation.
+
+    The block-quant loader delivers w13 with 2*384 gated rows while w2
+    spans ceil(384/256) = 2 blocks.  Preparation must derive the logical
+    intermediate (384) from the w13 rows; deriving it from the w2 block
+    count overstates it as 512 and B12X rejects the weights.
+    """
+    from tests.model_executor.kernels.test_b12x_linear import _block_weights
+
+    with set_current_vllm_config(VllmConfig()):
+        torch.manual_seed(384)
+        e, h, i, topk = 4, 512, 384, 2
+        raw1 = _block_weights(e * 2 * i, h, codec)
+        raw2 = _block_weights(e * h, 2 * 256, codec)
+        w1 = raw1.view(e, 2 * i, *raw1.shape[1:]).cuda()
+        w2 = raw2.view(e, h, *raw2.shape[1:]).cuda()
+        x = torch.randn(2, h, device="cuda", dtype=torch.bfloat16) * 0.125
+        scores = torch.randn(2, e, device="cuda", dtype=torch.bfloat16)
+        from vllm.model_executor.layers.fused_moe.config import (
+            FusedMoEQuantDesc,
+        )
+
+        quant = FusedMoEQuantConfig(
+            _a1=FusedMoEQuantDesc(),
+            _a2=FusedMoEQuantDesc(),
+            _w1=FusedMoEQuantDesc(dtype=codec),
+            _w2=FusedMoEQuantDesc(dtype=codec),
+        )
+        activation = MoEActivation.SITU
+        moe_config = make_dummy_moe_config(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=h,
+            intermediate_size=i,
+            in_dtype=x.dtype,
+            activation=activation,
+        )
+        experts = B12xExperts(moe_config, quant)
+        layer = SimpleNamespace(
+            activation=activation,
+            apply_router_weight_on_input=False,
+            w13_weight=w1,
+            w2_weight=w2,
+            w13_weight_scale=quant.w1_scale,
+            w2_weight_scale=quant.w2_scale,
+        )
+        experts.process_weights_after_loading(layer)
+        prepared = experts._prepared_experts
+        assert prepared is not None
+        assert int(prepared.intermediate_size) == i
+
+        kernel = mk.FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=moe_config,
+                quant_config=quant,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            experts,
+        )
+        weights, ids, _ = fused_topk(x, scores, topk, renormalize=False)
+        output = kernel.apply(
+            hidden_states=x,
+            w1=w1,
+            w2=w2,
+            topk_weights=weights,
+            topk_ids=ids,
+            activation=activation,
+            global_num_experts=e,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+        assert output.shape == x.shape
+        assert torch.isfinite(output).all()
