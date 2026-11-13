@@ -32,7 +32,11 @@ from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_
 from vllm.models.kimi_k3.common.dsa_cache import SelfAddressedMLASpec
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
-from vllm.v1.kv_cache_interface import is_quantized_kv_cache
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    SlidingWindowSpec,
+    is_quantized_kv_cache,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -91,10 +95,26 @@ def _fill_compact_rope_cache(
     return cache
 
 
+def draft_kv_cache_spec(spec: KVCacheSpec) -> KVCacheSpec:
+    """The KV cache spec of a K3 DSpark draft layer.
+
+    DFlash derives the slots of every draft KV write from the block table, so
+    a full-length draft cache is self-addressed. A retained-window draft cache
+    (`VLLM_DSPARK_DRAFT_KV_WINDOW`) keeps its sliding-window spec: the window
+    is what frees draft blocks behind it and what the MLA metadata builder
+    keys its non-causal compaction on, and `SelfAddressedMLASpec` is a
+    full-attention spec that cannot carry one. Such a cache is written at
+    whole manager blocks, where the block-table slots DFlash derives and the
+    worker's slot mapping are the same numbers.
+    """
+    if isinstance(spec, SlidingWindowSpec):
+        return spec
+    return SelfAddressedMLASpec.from_spec(spec)
+
+
 class K3DSparkAttention(MultiHeadLatentAttention):
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> SelfAddressedMLASpec:
-        # DFlash derives the slots of every draft KV write from the block table.
-        return SelfAddressedMLASpec.from_spec(super().get_kv_cache_spec(vllm_config))
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        return draft_kv_cache_spec(super().get_kv_cache_spec(vllm_config))
 
 
 class K3DSparkDecoderLayer(nn.Module):
