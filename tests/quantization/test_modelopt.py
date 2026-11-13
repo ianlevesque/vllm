@@ -1764,6 +1764,30 @@ def test_modelopt_mixed_precision_dispatches_iq2_xs_experts(
     assert quant.quant_dtype is None
 
 
+def test_modelopt_block_quant_situ_gate(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+    from vllm.model_executor.layers.quantization.modelopt_block_quant import (
+        ModelOptBlockQuantMoEMethod,
+    )
+
+    # The device gate is not under test; without this the constructor stops
+    # at "require b12x on SM12x" on any host that is not an SM12x GPU.
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    config = _iq2_xs_moe_config()
+    config.activation = MoEActivation.SITU
+    config.activation_situ_beta = 4.0
+    config.activation_situ_linear_beta = 25.0
+    method = ModelOptBlockQuantMoEMethod(config, codec="iq2_xs")
+    assert method.gated is True
+    quant = method.get_fused_moe_quant_config(MagicMock())
+    assert quant.weight_quant_dtype == "iq2_xs"
+
+    config.activation_situ_beta = 2.0
+    with pytest.raises(ValueError, match=r"only SiTU beta 4\.0"):
+        ModelOptBlockQuantMoEMethod(config, codec="iq2_xs")
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
