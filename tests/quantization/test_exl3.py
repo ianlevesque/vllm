@@ -8,6 +8,7 @@ import torch
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
+    make_exl3_activation_spec,
     plan_exl3_extent,
 )
 
@@ -71,3 +72,21 @@ def test_dense_fp8_config_and_predicate():
     assert not dense_fp8_applies("vision_tower.blocks.0.attn.qkv", 1280, 3840)
     assert not dense_fp8_applies(f"{base}.input_layernorm", 3584, 1)
     assert not dense_fp8_applies("language_model.model.embed_tokens", 3584, 163840)
+
+
+def test_activation_spec_uses_fp16_rotations_with_bf16_io():
+    captured = {}
+
+    def fake_activation_spec(**kwargs):
+        captured.update(kwargs)
+        return captured
+
+    spec = make_exl3_activation_spec(fake_activation_spec, "situ")
+
+    assert spec is captured
+    assert captured == {
+        "mode": "a16",
+        "nonlinearity": "situ",
+        "io_dtype": torch.bfloat16,
+        "rotation_dtype": torch.float16,
+    }
