@@ -61,6 +61,22 @@ class MiniMaxM3IndexerFlashInferMetadata(MiniMaxM3IndexerMetadata):
     local_blocks: int = 0
 
 
+def _index_local_blocks(text_config) -> int:
+    """Trailing local window, in blocks, forced into every token's selection.
+
+    `MiniMaxM3VLTextConfig` folds the checkpoint's legacy
+    `sparse_attention_config` dict into `index_*` fields and does not keep the
+    dict (#61813), so `index_local_blocks` is the field the model's own
+    indexer is built from. A config object that still carries only the dict
+    is read the old way.
+    """
+    local_blocks = getattr(text_config, "index_local_blocks", None)
+    if local_blocks is None:
+        legacy = getattr(text_config, "sparse_attention_config", None) or {}
+        local_blocks = legacy.get("sparse_local_block", 0)
+    return int(local_blocks)
+
+
 class MiniMaxM3IndexerFlashInferMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
     """Whole-batch metadata; the impl runs under the eager cudagraph break,
     so nothing here needs a stable address."""
@@ -75,8 +91,7 @@ class MiniMaxM3IndexerFlashInferMetadataBuilder(MiniMaxM3IndexerMetadataBuilder)
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         hf_config = vllm_config.model_config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
-        sparse_cfg = text_config.sparse_attention_config
-        self.local_blocks = sparse_cfg.get("sparse_local_block", 0)
+        self.local_blocks = _index_local_blocks(text_config)
 
     def build(
         self,
