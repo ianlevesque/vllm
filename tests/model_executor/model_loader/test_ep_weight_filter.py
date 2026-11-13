@@ -305,9 +305,32 @@ class TestShouldSkipWeight:
             "model.layers.0.mlp.experts.200.gate_proj.weight_packed", self.local_ids
         )
 
-    def test_remote_expert_scale_not_skipped(self):
+    @pytest.mark.parametrize(
+        "leaf",
+        [
+            "gate_proj.weight_scale",
+            "gate_proj.weight_scale_inv",
+            "gate_proj.qscale_weight",
+            "w13_weight_scale",
+        ],
+    )
+    def test_remote_expert_block_scale_skipped(self, leaf):
+        # RoutedExperts discards a non-local expert's block weight scales
+        # along with its weights; on a large NVFP4 checkpoint they are tens
+        # of GiB per rank of stream that is read and thrown away.
+        name = f"model.layers.0.mlp.experts.200.{leaf}"
+        assert should_skip_weight(name, self.local_ids)
+        assert not should_skip_weight(name.replace(".200.", ".10."), self.local_ids)
+
+    @pytest.mark.parametrize(
+        "leaf",
+        ["gate_proj.input_scale", "gate_proj.weight_scale_2", "w13_input_global_scale"],
+    )
+    def test_remote_expert_scalar_scale_not_skipped(self, leaf):
+        # Scalar activation/global scales are aggregated across ALL experts
+        # by some NVFP4 backends (a global max), so every rank needs them.
         assert not should_skip_weight(
-            "model.layers.0.mlp.experts.200.gate_proj.weight_scale", self.local_ids
+            f"model.layers.0.mlp.experts.200.{leaf}", self.local_ids
         )
 
     def test_boundary_expert(self):
