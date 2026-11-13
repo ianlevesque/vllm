@@ -73,6 +73,30 @@ def test_dense_fp8_config_and_predicate():
     assert not dense_fp8_applies(f"{base}.input_layernorm", 3584, 1)
     assert not dense_fp8_applies("language_model.model.embed_tokens", 3584, 163840)
 
+    mlp_cfg = Exl3Config.from_config(
+        {"dense_fp8": {"scheme": "per_tensor_e4m3", "scope": "mlp_only"}}
+    )
+    assert mlp_cfg.dense_fp8 is True
+    assert mlp_cfg.dense_fp8_scope == "mlp_only"
+    with pytest.raises(ValueError, match="scope"):
+        Exl3Config.from_config(
+            {"dense_fp8": {"scheme": "per_tensor_e4m3", "scope": "bogus"}}
+        )
+    assert not dense_fp8_applies(
+        f"{base}.self_attn.q_proj", 3584, 3584, "mlp_only"
+    )
+    assert not dense_fp8_applies(
+        f"{base}.self_attn.f_a_proj", 3584, 3584, "mlp_only"
+    )
+    assert dense_fp8_applies(
+        f"{base}.block_sparse_moe.shared_experts.gate_up_proj",
+        3584,
+        6144,
+        "mlp_only",
+    )
+    with pytest.raises(ValueError, match="scope"):
+        dense_fp8_applies(f"{base}.mlp.up_proj", 3584, 3584, "bogus")
+
 
 def test_activation_spec_uses_fp16_rotations_with_bf16_io():
     captured = {}

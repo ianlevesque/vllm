@@ -101,18 +101,31 @@ def plan_exl3_extent(
 DENSE_FP8_SCHEME = "per_tensor_e4m3"
 DENSE_FP8_MIN_ELEMENTS = 65536
 _DENSE_FP8_EXCLUDE = ("block_sparse_moe.gate", "embed_tokens", "routed_expert_")
+DENSE_FP8_SCOPE_ALL = "all"
+DENSE_FP8_SCOPE_MLP_ONLY = "mlp_only"
+DENSE_FP8_SCOPES = (DENSE_FP8_SCOPE_ALL, DENSE_FP8_SCOPE_MLP_ONLY)
 
 
-def dense_fp8_applies(prefix: str, input_size: int, output_size: int) -> bool:
+def dense_fp8_applies(
+    prefix: str,
+    input_size: int,
+    output_size: int,
+    scope: str = DENSE_FP8_SCOPE_ALL,
+) -> bool:
     """True iff ``prefix`` names a dense-FP8-quantized Linear weight.
 
     Mirrors ``quantizable`` in tools/quantize_exl3_dense_fp8.py: the
     transform quantizes exactly the checkpoint tensors this predicate
-    selects, so keep the two in lockstep.
+    selects, so keep the two in lockstep.  Scope ``mlp_only`` keeps
+    self_attn (MLA + KDA) projections BF16.
     """
+    if scope not in DENSE_FP8_SCOPES:
+        raise ValueError(f"unsupported EXL3 dense_fp8 scope {scope!r}")
     if not prefix.startswith("language_model.model."):
         return False
     if input_size * output_size < DENSE_FP8_MIN_ELEMENTS:
+        return False
+    if scope == DENSE_FP8_SCOPE_MLP_ONLY and ".self_attn." in prefix:
         return False
     return not any(part in prefix for part in _DENSE_FP8_EXCLUDE)
 
@@ -124,10 +137,12 @@ class Exl3Config(QuantizationConfig):
         self,
         manifest: str = EXL3_MANIFEST_FILENAME,
         dense_fp8: bool = False,
+        dense_fp8_scope: str = DENSE_FP8_SCOPE_ALL,
     ) -> None:
         super().__init__()
         self.manifest = manifest
         self.dense_fp8 = dense_fp8
+        self.dense_fp8_scope = dense_fp8_scope
         self._fp8_config = (
             Fp8Config(
                 is_checkpoint_fp8_serialized=True,
@@ -140,7 +155,8 @@ class Exl3Config(QuantizationConfig):
     def __repr__(self) -> str:
         return (
             f"Exl3Config(manifest={self.manifest!r}, "
-            f"dense_fp8={self.dense_fp8!r})"
+            f"dense_fp8={self.dense_fp8!r}, "
+            f"dense_fp8_scope={self.dense_fp8_scope!r})"
         )
 
     @classmethod
@@ -186,7 +202,13 @@ class Exl3Config(QuantizationConfig):
                 "EXL3 quantization_config.dense_fp8 must be "
                 f"{{'scheme': {DENSE_FP8_SCHEME!r}}}, got {dense_fp8!r}"
             )
-        return cls(manifest=manifest, dense_fp8=True)
+        scope = dense_fp8.get("scope", DENSE_FP8_SCOPE_ALL)
+        if scope not in DENSE_FP8_SCOPES:
+            raise ValueError(
+                "EXL3 quantization_config.dense_fp8 scope must be one of "
+                f"{DENSE_FP8_SCOPES!r}, got {scope!r}"
+            )
+        return cls(manifest=manifest, dense_fp8=True, dense_fp8_scope=scope)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -195,7 +217,7 @@ class Exl3Config(QuantizationConfig):
             return Exl3MoEMethod(layer.moe_config)
         if isinstance(layer, LinearBase):
             if self.dense_fp8 and dense_fp8_applies(
-                prefix, layer.input_size, layer.output_size
+                prefix, layer.input_size, layer.output_size, self.dense_fp8_scope
             ):
                 assert self._fp8_config is not None
                 return Fp8LinearMethod(self._fp8_config)
