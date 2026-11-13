@@ -86,7 +86,7 @@ def plan_exl3_extent(
 
 DENSE_FP8_SCHEME = "per_tensor_e4m3"
 DENSE_FP8_MIN_ELEMENTS = 65536
-_DENSE_FP8_EXCLUDE = ("block_sparse_moe.gate.", "embed_tokens")
+_DENSE_FP8_EXCLUDE = ("block_sparse_moe.gate", "embed_tokens")
 
 
 def dense_fp8_applies(prefix: str, input_size: int, output_size: int) -> bool:
