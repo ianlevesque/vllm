@@ -50,9 +50,10 @@ def _load(ns, relative, names, *, parent=None):
     exec(compile(ast.fix_missing_locations(module), str(ROOT / relative), "exec"), ns)
 
 
-def _selector(model_type, dcp, *, local_heads=6, pcp=1):
+def _selector(model_type, dcp, *, local_heads=6, pcp=1, wrapper_type=None):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=wrapper_type or model_type),
             hf_text_config=SimpleNamespace(
                 model_type=model_type,
                 kv_lora_rank=512,
@@ -83,6 +84,7 @@ def _selector(model_type, dcp, *, local_heads=6, pcp=1):
         logger=Mock(),
         get_current_vllm_config=lambda: config,
         _load_dense_mla=lambda: object(),
+        _KIMI_DENSE_MLA_TEXT_TYPES=("kimi_k2", "kimi_linear", "k3_dspark"),
         _K3_KV_LORA_RANK=512,
         _K3_QK_NOPE_HEAD_DIM=128,
         _K3_QK_ROPE_HEAD_DIM=64,
@@ -112,6 +114,7 @@ def _selector(model_type, dcp, *, local_heads=6, pcp=1):
         [
             "_max_dcp_local_cache_tokens",
             "_kernel_query_heads",
+            "_kimi_dense_mla_family",
             "B12xMLAMetadataBuilder",
             "B12xMLABackend",
             "B12xMLAImpl",
@@ -212,3 +215,65 @@ def test_nonintegral_dcp_kernel_head_tile_remains_rejected():
     platform, config, _ = _selector("kimi_linear", 2)
     with pytest.raises(ValueError, match="multiple of 8 query heads after DCP"):
         platform.get_attn_backend_cls("B12X_MLA", config)
+
+
+def test_k25_wrapper_with_a_deepseek_v3_text_backbone_is_admitted():
+    # transformers' `Kimi_K25Config` builds the K2.5/K2.7 text backbone as its
+    # `DeepseekV3Config`, so the text `model_type` reads `deepseek_v3`.
+    platform, config, _ = _selector(
+        "deepseek_v3", 8, local_heads=8, wrapper_type="kimi_k25"
+    )
+    assert (
+        platform.get_attn_backend_cls("B12X_MLA", config) == "b12x_mla.B12xMLABackend"
+    )
+
+
+def test_a_plain_deepseek_v3_model_remains_rejected():
+    platform, config, _ = _selector("deepseek_v3", 8, local_heads=8)
+    with pytest.raises(ValueError, match="compatible Kimi dense MLA models"):
+        platform.get_attn_backend_cls("B12X_MLA", config)
+
+
+def _family(model_config):
+    ns = {"_KIMI_DENSE_MLA_TEXT_TYPES": ("kimi_k2", "kimi_linear", "k3_dspark")}
+    _load(ns, B12X, ["_kimi_dense_mla_family"])
+    return ns["_kimi_dense_mla_family"](model_config)
+
+
+def test_the_registered_k25_config_class_names_the_k2_family():
+    # The real class, with the text_config a K2.7 checkpoint ships: the K2
+    # family must still be recognised, because the metadata builder keeps
+    # variable-length DCP off for it.
+    from transformers import Kimi_K25Config
+
+    wrapper = Kimi_K25Config(
+        text_config={
+            "model_type": "kimi_k2",
+            "kv_lora_rank": 512,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+        }
+    )
+    assert wrapper.model_type == "kimi_k25"
+    model_config = SimpleNamespace(hf_config=wrapper, hf_text_config=wrapper.text_config)
+    assert _family(model_config) == "kimi_k2"
+
+
+@pytest.mark.parametrize(
+    "text_type,wrapper_type,family",
+    [
+        ("kimi_k2", "kimi_k2", "kimi_k2"),
+        ("kimi_linear", "kimi_k3", "kimi_linear"),
+        ("k3_dspark", "k3_dspark", "k3_dspark"),
+        ("deepseek_v3", "kimi_k25", "kimi_k2"),
+        ("deepseek_v3", "deepseek_v3", None),
+        ("deepseek_v32", "deepseek_v32", None),
+    ],
+)
+def test_family_by_text_backbone_then_wrapper(text_type, wrapper_type, family):
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type=wrapper_type),
+        hf_text_config=SimpleNamespace(model_type=text_type),
+    )
+    assert _family(model_config) == family

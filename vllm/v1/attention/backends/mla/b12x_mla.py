@@ -295,6 +295,28 @@ class B12xMLAMetadata(MLACommonMetadata):
     dense_mla_flat_query_start_loc: torch.Tensor | None = None
 
 
+_KIMI_DENSE_MLA_TEXT_TYPES = ("kimi_k2", "kimi_linear", "k3_dspark")
+
+
+def _kimi_dense_mla_family(model_config) -> str | None:
+    """Name the Kimi dense-MLA family a model belongs to, or `None`.
+
+    The text backbone's `model_type` names it for K3 and its drafts, and for
+    a K2 checkpoint read through a config class that keeps the checkpoint's
+    own value. transformers' `Kimi_K25Config`, the registered class for
+    `kimi_k25`, builds the K2.5/K2.7 text backbone as its `DeepseekV3Config`:
+    that class reports `deepseek_v3` whatever the checkpoint's
+    `text_config.model_type` says, so there the wrapper names the family.
+    """
+    text_type = getattr(model_config.hf_text_config, "model_type", None)
+    if text_type in _KIMI_DENSE_MLA_TEXT_TYPES:
+        return text_type
+    wrapper = getattr(model_config, "hf_config", None)
+    if getattr(wrapper, "model_type", None) == "kimi_k25":
+        return "kimi_k2"
+    return None
+
+
 class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
     # The target verifies the accepted token plus the seven DSpark proposals in
     # one causal block.  B12X exposes a single-query decode primitive, so
@@ -315,8 +337,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         device: torch.device,
     ) -> None:
         supports_dcp_with_varlen = (
-            getattr(vllm_config.model_config.hf_text_config, "model_type", None)
-            != "kimi_k2"
+            _kimi_dense_mla_family(vllm_config.model_config) != "kimi_k2"
         )
         super().__init__(
             kv_cache_spec,
@@ -621,11 +642,7 @@ class B12xMLABackend(MLACommonBackend):
         if model_config is None:
             return None
         hf_text_config = model_config.hf_text_config
-        if getattr(hf_text_config, "model_type", None) not in (
-            "kimi_k2",
-            "kimi_linear",
-            "k3_dspark",
-        ):
+        if _kimi_dense_mla_family(model_config) is None:
             return "B12X_MLA supports compatible Kimi dense MLA models"
 
         dims = (
