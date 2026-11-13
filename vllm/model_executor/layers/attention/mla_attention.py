@@ -427,6 +427,21 @@ def split_kv_b_proj(
     return weight.split([qk_nope_head_dim, v_head_dim], dim=-1)
 
 
+def _generic_dcp_merge_up_projects(
+    dcp_world_size: int, impl_handles_dcp: bool, has_dcp_up_proj_weights: bool
+) -> bool:
+    """Whether the generic DCP merge writes the up-projected decode output.
+
+    Only that merge (`MLADCPManager.v_up_proj_combine`) applies V's
+    up-projection itself. `W_UV_dcp` exists whenever the A2A merge is
+    configured, including for a backend that gathers its own queries and
+    merges its own partials (`handles_dcp_query_and_output`, B12X_MLA): the
+    generic merge is skipped for it and the local heads it returns still need
+    the ordinary up-projection.
+    """
+    return dcp_world_size > 1 and not impl_handles_dcp and has_dcp_up_proj_weights
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -1311,8 +1326,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 if self.use_pcp:
                     attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-            # v_up projection, unless the DCP merge already applied it
-            if self.W_UV_dcp is None:
+            # v_up projection, unless the generic DCP merge above applied it
+            if not _generic_dcp_merge_up_projects(
+                self.impl.dcp_world_size, impl_handles_dcp, self.W_UV_dcp is not None
+            ):
                 self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
