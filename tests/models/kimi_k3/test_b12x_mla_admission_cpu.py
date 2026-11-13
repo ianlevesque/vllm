@@ -84,7 +84,8 @@ def _selector(model_type, dcp, *, local_heads=6, pcp=1, wrapper_type=None):
         logger=Mock(),
         get_current_vllm_config=lambda: config,
         _load_dense_mla=lambda: object(),
-        _KIMI_DENSE_MLA_TEXT_TYPES=("kimi_k2", "kimi_linear", "k3_dspark"),
+        _KIMI_K2_TEXT_TYPES=("kimi_k2", "deepseek_v3"),
+        _KIMI_K3_TEXT_TYPES=("kimi_linear", "k3_dspark"),
         _K3_KV_LORA_RANK=512,
         _K3_QK_NOPE_HEAD_DIM=128,
         _K3_QK_ROPE_HEAD_DIM=64,
@@ -217,33 +218,41 @@ def test_nonintegral_dcp_kernel_head_tile_remains_rejected():
         platform.get_attn_backend_cls("B12X_MLA", config)
 
 
-def test_k25_wrapper_with_a_deepseek_v3_text_backbone_is_admitted():
-    # transformers' `Kimi_K25Config` builds the K2.5/K2.7 text backbone as its
-    # `DeepseekV3Config`, so the text `model_type` reads `deepseek_v3`.
-    platform, config, _ = _selector(
-        "deepseek_v3", 8, local_heads=8, wrapper_type="kimi_k25"
-    )
+def test_a_deepseek_v3_text_backbone_is_admitted_without_its_wrapper():
+    # What the selector sees while Kimi K2.5/K2.7's language model is built:
+    # the derived config holds the text config in both places, and
+    # transformers' `DeepseekV3Config` reports `deepseek_v3`.
+    platform, config, _ = _selector("deepseek_v3", 8, local_heads=8)
     assert (
         platform.get_attn_backend_cls("B12X_MLA", config) == "b12x_mla.B12xMLABackend"
     )
 
 
-def test_a_plain_deepseek_v3_model_remains_rejected():
-    platform, config, _ = _selector("deepseek_v3", 8, local_heads=8)
+@pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v2", "qwen3"])
+def test_other_text_backbones_remain_rejected(model_type):
+    platform, config, _ = _selector(model_type, 8, local_heads=8)
     with pytest.raises(ValueError, match="compatible Kimi dense MLA models"):
         platform.get_attn_backend_cls("B12X_MLA", config)
 
 
 def _family(model_config):
-    ns = {"_KIMI_DENSE_MLA_TEXT_TYPES": ("kimi_k2", "kimi_linear", "k3_dspark")}
+    ns = {
+        "_KIMI_K2_TEXT_TYPES": ("kimi_k2", "deepseek_v3"),
+        "_KIMI_K3_TEXT_TYPES": ("kimi_linear", "k3_dspark"),
+    }
     _load(ns, B12X, ["_kimi_dense_mla_family"])
     return ns["_kimi_dense_mla_family"](model_config)
 
 
-def test_the_registered_k25_config_class_names_the_k2_family():
-    # The real class, with the text_config a K2.7 checkpoint ships: the K2
-    # family must still be recognised, because the metadata builder keeps
-    # variable-length DCP off for it.
+def test_family_survives_the_nested_language_model_config():
+    # The real classes, with the text_config a K2.7 checkpoint ships. The
+    # wrapper derives its language model's config by replacing `hf_config`
+    # with a copy of the text config, as `VllmConfig.with_hf_config` does;
+    # the K2 family must be named there and at the root alike, because the
+    # backend is selected in the first and the metadata builder (which keeps
+    # variable-length DCP off for K2) runs with the second.
+    import copy
+
     from transformers import Kimi_K25Config
 
     wrapper = Kimi_K25Config(
@@ -256,24 +265,25 @@ def test_the_registered_k25_config_class_names_the_k2_family():
         }
     )
     assert wrapper.model_type == "kimi_k25"
-    model_config = SimpleNamespace(hf_config=wrapper, hf_text_config=wrapper.text_config)
-    assert _family(model_config) == "kimi_k2"
+    assert wrapper.text_config.model_type == "deepseek_v3"
+    root = SimpleNamespace(hf_config=wrapper, hf_text_config=wrapper.text_config)
+    nested = copy.deepcopy(root)
+    nested.hf_config = copy.deepcopy(wrapper.text_config)
+    assert _family(root) == "kimi_k2"
+    assert _family(nested) == "kimi_k2"
 
 
 @pytest.mark.parametrize(
-    "text_type,wrapper_type,family",
+    "text_type,family",
     [
-        ("kimi_k2", "kimi_k2", "kimi_k2"),
-        ("kimi_linear", "kimi_k3", "kimi_linear"),
-        ("k3_dspark", "k3_dspark", "k3_dspark"),
-        ("deepseek_v3", "kimi_k25", "kimi_k2"),
-        ("deepseek_v3", "deepseek_v3", None),
-        ("deepseek_v32", "deepseek_v32", None),
+        ("kimi_k2", "kimi_k2"),
+        ("deepseek_v3", "kimi_k2"),
+        ("kimi_linear", "kimi_linear"),
+        ("k3_dspark", "k3_dspark"),
+        ("deepseek_v32", None),
+        (None, None),
     ],
 )
-def test_family_by_text_backbone_then_wrapper(text_type, wrapper_type, family):
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type=wrapper_type),
-        hf_text_config=SimpleNamespace(model_type=text_type),
-    )
+def test_family_by_text_backbone(text_type, family):
+    model_config = SimpleNamespace(hf_text_config=SimpleNamespace(model_type=text_type))
     assert _family(model_config) == family

@@ -295,25 +295,31 @@ class B12xMLAMetadata(MLACommonMetadata):
     dense_mla_flat_query_start_loc: torch.Tensor | None = None
 
 
-_KIMI_DENSE_MLA_TEXT_TYPES = ("kimi_k2", "kimi_linear", "k3_dspark")
+# Text backbones on the DeepSeek-V3 architecture: Kimi K2 itself, and what
+# transformers' own `DeepseekV3Config` reports for one.
+_KIMI_K2_TEXT_TYPES = ("kimi_k2", "deepseek_v3")
+_KIMI_K3_TEXT_TYPES = ("kimi_linear", "k3_dspark")
 
 
 def _kimi_dense_mla_family(model_config) -> str | None:
-    """Name the Kimi dense-MLA family a model belongs to, or `None`.
+    """Name the dense-MLA family a text backbone belongs to, or `None`.
 
-    The text backbone's `model_type` names it for K3 and its drafts, and for
-    a K2 checkpoint read through a config class that keeps the checkpoint's
-    own value. transformers' `Kimi_K25Config`, the registered class for
-    `kimi_k25`, builds the K2.5/K2.7 text backbone as its `DeepseekV3Config`:
-    that class reports `deepseek_v3` whatever the checkpoint's
-    `text_config.model_type` says, so there the wrapper names the family.
+    Only the text backbone can be asked. A multimodal wrapper builds its
+    language model from a config derived by `VllmConfig.with_hf_config`, in
+    which the text config replaces the wrapper's, so during that construction
+    (where the attention backend is selected) nothing names the wrapper.
+
+    transformers' `Kimi_K25Config`, the registered class for `kimi_k25`,
+    builds the K2.5/K2.7 text backbone as its `DeepseekV3Config`, which
+    reports `deepseek_v3` whatever the checkpoint's `text_config.model_type`
+    (`kimi_k2`) says. Kimi K2 is the DeepSeek-V3 architecture, so the two
+    names are one family here; the MLA dimensions are checked separately.
     """
     text_type = getattr(model_config.hf_text_config, "model_type", None)
-    if text_type in _KIMI_DENSE_MLA_TEXT_TYPES:
-        return text_type
-    wrapper = getattr(model_config, "hf_config", None)
-    if getattr(wrapper, "model_type", None) == "kimi_k25":
+    if text_type in _KIMI_K2_TEXT_TYPES:
         return "kimi_k2"
+    if text_type in _KIMI_K3_TEXT_TYPES:
+        return text_type
     return None
 
 
