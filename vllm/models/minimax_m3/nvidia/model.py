@@ -1671,8 +1671,14 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     #     rules, which therefore only see dense and shared-expert projections.
     #     They also keep `e_score_correction_bias` under `mlp.gate.` and carry
     #     ModelOpt `*_quantizer` placeholders beside the routed experts.
+    # Both are VL checkpoints. Served through this text class (an
+    # `architectures` override), their vision tower and projector name no
+    # module here and are dropped; the VL wrapper never passes them down.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_regex={
+            re.compile(
+                r"^(?:model\.)?(?:vision_tower|multi_modal_projector|patch_merge_mlp)\."
+            ): None,
             re.compile(r"\.mlp\.experts\.(\d+)\.gate_proj\."): (
                 r".block_sparse_moe.experts.\1.w1."
             ),

@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """transformers-style MiniMax-M3 export names -> this backbone's parameters.
 
-The names are the 34 text-backbone key patterns of lukealonso/MiniMax-M3-NVFP4
-(revision e7c7b65d, 176,572 tensors), read from its safetensors headers. The
-strict `AutoWeightsLoader` rejects any name that resolves to no module, so
-every pattern must either land on this backbone's layout or be dropped.
+The names are the 66 key patterns of lukealonso/MiniMax-M3-NVFP4 (revision
+e7c7b65d, 176,572 tensors), read from its safetensors headers: 39 for the text
+backbone and head, 27 for the vision tower and projector. The strict
+`AutoWeightsLoader` rejects any name that resolves to no module, so every
+pattern must either land on this backbone's layout or be dropped.
 """
 
 import pytest
@@ -86,3 +87,120 @@ def test_no_moe_layer_name_is_left_under_mlp():
     for pattern in patterns:
         result = mapped(f"{LM}layers.3.{pattern}")
         assert result is None or ".layers.3.mlp." not in result[0], (pattern, result)
+
+
+# Every key pattern in the checkpoint, with layer and expert indices as `N`.
+TEXT_PATTERNS = [
+    "lm_head.weight",
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.layers.N.input_layernorm.weight",
+    "model.language_model.layers.N.mlp.down_proj.weight",
+    "model.language_model.layers.N.mlp.experts.N.down_proj.input_scale",
+    "model.language_model.layers.N.mlp.experts.N.down_proj.weight",
+    "model.language_model.layers.N.mlp.experts.N.down_proj.weight_scale",
+    "model.language_model.layers.N.mlp.experts.N.down_proj.weight_scale_2",
+    "model.language_model.layers.N.mlp.experts.N.gate_proj.input_scale",
+    "model.language_model.layers.N.mlp.experts.N.gate_proj.weight",
+    "model.language_model.layers.N.mlp.experts.N.gate_proj.weight_scale",
+    "model.language_model.layers.N.mlp.experts.N.gate_proj.weight_scale_2",
+    "model.language_model.layers.N.mlp.experts.N.up_proj.input_scale",
+    "model.language_model.layers.N.mlp.experts.N.up_proj.weight",
+    "model.language_model.layers.N.mlp.experts.N.up_proj.weight_scale",
+    "model.language_model.layers.N.mlp.experts.N.up_proj.weight_scale_2",
+    "model.language_model.layers.N.mlp.experts.down_proj.N.input_quantizer",
+    "model.language_model.layers.N.mlp.experts.down_proj.N.weight_quantizer",
+    "model.language_model.layers.N.mlp.experts.gate_proj.N.input_quantizer",
+    "model.language_model.layers.N.mlp.experts.gate_proj.N.weight_quantizer",
+    "model.language_model.layers.N.mlp.experts.up_proj.N.input_quantizer",
+    "model.language_model.layers.N.mlp.experts.up_proj.N.weight_quantizer",
+    "model.language_model.layers.N.mlp.gate.e_score_correction_bias",
+    "model.language_model.layers.N.mlp.gate.weight",
+    "model.language_model.layers.N.mlp.gate_up_proj.weight",
+    "model.language_model.layers.N.mlp.shared_experts.down_proj.weight",
+    "model.language_model.layers.N.mlp.shared_experts.gate_up_proj.weight",
+    "model.language_model.layers.N.post_attention_layernorm.weight",
+    "model.language_model.layers.N.self_attn.indexer.k_norm.weight",
+    "model.language_model.layers.N.self_attn.indexer.k_proj.weight",
+    "model.language_model.layers.N.self_attn.indexer.q_norm.weight",
+    "model.language_model.layers.N.self_attn.indexer.q_proj.weight",
+    "model.language_model.layers.N.self_attn.k_norm.weight",
+    "model.language_model.layers.N.self_attn.k_proj.weight",
+    "model.language_model.layers.N.self_attn.o_proj.weight",
+    "model.language_model.layers.N.self_attn.q_norm.weight",
+    "model.language_model.layers.N.self_attn.q_proj.weight",
+    "model.language_model.layers.N.self_attn.v_proj.weight",
+    "model.language_model.norm.weight",
+]
+VISION_PATTERNS = [
+    "model.multi_modal_projector.linear_1.bias",
+    "model.multi_modal_projector.linear_1.weight",
+    "model.multi_modal_projector.linear_2.bias",
+    "model.multi_modal_projector.linear_2.weight",
+    "model.multi_modal_projector.merge_linear_1.bias",
+    "model.multi_modal_projector.merge_linear_1.weight",
+    "model.multi_modal_projector.merge_linear_2.bias",
+    "model.multi_modal_projector.merge_linear_2.weight",
+    "model.vision_tower.embeddings.proj.weight",
+    "model.vision_tower.layers.N.layer_norm1.bias",
+    "model.vision_tower.layers.N.layer_norm1.weight",
+    "model.vision_tower.layers.N.layer_norm2.bias",
+    "model.vision_tower.layers.N.layer_norm2.weight",
+    "model.vision_tower.layers.N.mlp.fc1.bias",
+    "model.vision_tower.layers.N.mlp.fc1.weight",
+    "model.vision_tower.layers.N.mlp.fc2.bias",
+    "model.vision_tower.layers.N.mlp.fc2.weight",
+    "model.vision_tower.layers.N.self_attn.k_proj.bias",
+    "model.vision_tower.layers.N.self_attn.k_proj.weight",
+    "model.vision_tower.layers.N.self_attn.out_proj.bias",
+    "model.vision_tower.layers.N.self_attn.out_proj.weight",
+    "model.vision_tower.layers.N.self_attn.q_proj.bias",
+    "model.vision_tower.layers.N.self_attn.q_proj.weight",
+    "model.vision_tower.layers.N.self_attn.v_proj.bias",
+    "model.vision_tower.layers.N.self_attn.v_proj.weight",
+    "model.vision_tower.pre_layrnorm.bias",
+    "model.vision_tower.pre_layrnorm.weight",
+]
+# What this backbone owns directly under the root and under `model`.
+BACKBONE_ROOTS = ("lm_head.", "model.embed_tokens.", "model.layers.", "model.norm.")
+
+
+def concrete(pattern: str) -> str:
+    return pattern.replace(".N.", ".3.", 1).replace(".N.", ".7.", 1)
+
+
+@pytest.mark.parametrize("pattern", VISION_PATTERNS)
+def test_vision_weights_are_dropped_by_the_text_class(pattern):
+    # 523 tensors under `model.vision_tower.` and `model.multi_modal_projector.`.
+    # The text class has neither module; left alone, the first one stops the
+    # load with "There is no module or parameter named
+    # 'model.multi_modal_projector'".
+    assert mapped(concrete(pattern)) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # The other VL export layout keeps them at the top level.
+        "vision_tower.layers.0.self_attn.q_proj.weight",
+        "multi_modal_projector.linear_1.weight",
+        "patch_merge_mlp.0.weight",
+    ],
+)
+def test_top_level_vision_weights_are_dropped_too(name):
+    assert mapped(name) is None
+
+
+@pytest.mark.parametrize("pattern", TEXT_PATTERNS)
+def test_every_text_name_stays_inside_the_backbone(pattern):
+    result = mapped(concrete(pattern))
+    if result is not None:
+        assert result[0].startswith(BACKBONE_ROOTS), result
+
+
+def test_the_drop_rule_is_anchored_at_the_vision_prefixes():
+    kept = "model.layers.3.self_attn.o_proj.weight"
+    assert mapped(LM + "layers.3.self_attn.o_proj.weight") == (kept, None)
+    assert mapped(kept) == (kept, None)
+    # A backbone name that merely contains a vision module's name is kept.
+    inner = "model.layers.3.vision_tower.weight"
+    assert mapped(inner) == (inner, None)
