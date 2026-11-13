@@ -45,6 +45,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 logger = init_logger(__name__)
@@ -80,15 +84,50 @@ def plan_exl3_extent(
     return tp_rank * slot_count, slot_count
 
 
-class Exl3Config(QuantizationConfig):
-    """EXL3 routed experts; every other layer stays unquantized."""
+DENSE_FP8_SCHEME = "per_tensor_e4m3"
+DENSE_FP8_MIN_ELEMENTS = 65536
+_DENSE_FP8_EXCLUDE = ("block_sparse_moe.gate.", "embed_tokens")
 
-    def __init__(self, manifest: str = EXL3_MANIFEST_FILENAME) -> None:
+
+def dense_fp8_applies(prefix: str, input_size: int, output_size: int) -> bool:
+    """True iff ``prefix`` names a dense-FP8-quantized Linear weight.
+
+    Mirrors ``quantizable`` in tools/quantize_exl3_dense_fp8.py: the
+    transform quantizes exactly the checkpoint tensors this predicate
+    selects, so keep the two in lockstep.
+    """
+    if not prefix.startswith("language_model.model."):
+        return False
+    if input_size * output_size < DENSE_FP8_MIN_ELEMENTS:
+        return False
+    return not any(part in prefix for part in _DENSE_FP8_EXCLUDE)
+
+
+class Exl3Config(QuantizationConfig):
+    """EXL3 routed experts; dense layers BF16 or per-tensor FP8."""
+
+    def __init__(
+        self,
+        manifest: str = EXL3_MANIFEST_FILENAME,
+        dense_fp8: bool = False,
+    ) -> None:
         super().__init__()
         self.manifest = manifest
+        self.dense_fp8 = dense_fp8
+        self._fp8_config = (
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+            )
+            if dense_fp8
+            else None
+        )
 
     def __repr__(self) -> str:
-        return f"Exl3Config(manifest={self.manifest!r})"
+        return (
+            f"Exl3Config(manifest={self.manifest!r}, "
+            f"dense_fp8={self.dense_fp8!r})"
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -123,14 +162,31 @@ class Exl3Config(QuantizationConfig):
         codec = exl3.get("codec")
         if codec is not None and codec != EXL3_CODEC:
             raise ValueError(f"unsupported EXL3 codec {codec!r}")
-        return cls(manifest=manifest)
+        dense_fp8 = config.get("dense_fp8")
+        if dense_fp8 is None:
+            return cls(manifest=manifest)
+        if not isinstance(dense_fp8, dict) or dense_fp8.get(
+            "scheme"
+        ) != DENSE_FP8_SCHEME:
+            raise ValueError(
+                "EXL3 quantization_config.dense_fp8 must be "
+                f"{{'scheme': {DENSE_FP8_SCHEME!r}}}, got {dense_fp8!r}"
+            )
+        return cls(manifest=manifest, dense_fp8=True)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(layer.moe_config)
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+        if isinstance(layer, LinearBase):
+            if self.dense_fp8 and dense_fp8_applies(
+                prefix, layer.input_size, layer.output_size
+            ):
+                assert self._fp8_config is not None
+                return Fp8LinearMethod(self._fp8_config)
+            return UnquantizedLinearMethod()
+        if isinstance(layer, ParallelLMHead):
             return UnquantizedLinearMethod()
         return None
 
@@ -349,4 +405,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
 
 
-__all__ = ["Exl3Config", "Exl3MoEMethod", "plan_exl3_extent"]
+__all__ = [
+    "Exl3Config",
+    "Exl3MoEMethod",
+    "dense_fp8_applies",
+    "plan_exl3_extent",
+]
