@@ -40,6 +40,7 @@ _B12X_MOE_MODES: dict[
     tuple[str, str, str],
 ] = {
     **{(codec, None): ("w4a16", codec, "w31") for codec in B12X_BLOCK_CODECS},
+    ("exl3", None): ("w4a16", "exl3", "w31"),
     ("mxfp4", "mxfp8"): ("w4a8_mx", "fp4_e8m0_k32", "w31"),
     ("mxfp4", None): ("w4a16", "fp4_e8m0_k32", "w31"),
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
@@ -219,6 +220,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if quant_config.weight_quant_dtype not in (
             "mxfp4",
             "nvfp4",
+            "exl3",
             *B12X_BLOCK_CODECS,
         ):
             raise ValueError(
@@ -424,7 +426,46 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         layer._b12x_prepared_experts = prepared
         return prepared
 
+    def install_prepared_experts(
+        self, layer: torch.nn.Module, prepared: Any
+    ) -> None:
+        """Install a prepared EXL3 package built by the quant method."""
+        fused_moe = _require_b12x_fused_moe()
+        if self._source_format != "exl3" or not isinstance(
+            prepared, fused_moe.PreparedExperts
+        ):
+            raise TypeError(
+                "EXL3 installation requires a B12X prepared experts package"
+            )
+        if not isinstance(prepared.plan.source, fused_moe.TrellisSource):
+            raise TypeError("EXL3 installation requires a trellis weight plan")
+        if (
+            prepared.num_experts != self.moe_config.num_experts
+            or prepared.hidden_size != self.moe_config.hidden_dim
+            or prepared.intermediate_size
+            != self.moe_config.intermediate_size_per_partition
+            or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
+            or _b12x_activation_name(layer.activation)
+            != prepared.plan.activation.nonlinearity
+        ):
+            raise ValueError(
+                "Prepared EXL3 geometry or activation does not match the layer"
+            )
+        self._apply_router_weight_on_input = layer.apply_router_weight_on_input
+        if self._apply_router_weight_on_input:
+            raise ValueError(
+                "b12x EXL3 MoE does not support apply_router_weight_on_input"
+            )
+        self._source_parameters_released = False
+        self._reuse_prepared_storage(layer, prepared._impl)
+        layer.b12x_warmup_provider = self
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._source_format == "exl3":
+            raise RuntimeError(
+                "EXL3 weights require install_prepared_experts from the "
+                "quant method, not checkpoint tensor preparation"
+            )
         self._apply_router_weight_on_input = layer.apply_router_weight_on_input
         if self._apply_router_weight_on_input and self._quant_mode != "w4a16":
             raise ValueError(
