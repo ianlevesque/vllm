@@ -22,6 +22,8 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm.platforms import current_platform
+
 from .ops.activation import swiglu_quantize
 from .ops.block_scales import shuffle_rows, swizzle_block_scales
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
@@ -29,6 +31,12 @@ from .ops.seq_parallel import SeqParallel
 from .ops.trtllm_bmm import bmm, expert_plan, load_kernels
 
 QuantFormat = Literal["nvfp4", "mxfp8"]
+
+
+def use_portable_experts() -> bool:
+    """Whether the experts run TokenSpeed's portable Triton kernels instead
+    of the TRT-LLM-gen GEMMs, which exist only for SM10x."""
+    return not current_platform.is_device_capability_family(100)
 
 
 class ExpertsLoRA(Protocol):
@@ -135,11 +143,17 @@ class Inkling2Experts(nn.Module):
         self.register_buffer(
             "ones", torch.ones(self.num_experts, dtype=torch.float32), persistent=False
         )
-        load_kernels(
-            (self.w13_weight, self.w2_weight),
-            (self.w13_weight_scale, self.w2_weight_scale),
-            self.topk,
-        )
+        # Off SM10x the portable kernels read the checkpoint layout as loaded
+        # (no row shuffle or block-scale swizzle) and need no cubins.
+        self.portable = use_portable_experts()
+        self.quant_format = quant_format
+        self.num_global_experts = config.n_routed_experts
+        if not self.portable:
+            load_kernels(
+                (self.w13_weight, self.w2_weight),
+                (self.w13_weight_scale, self.w2_weight_scale),
+                self.topk,
+            )
 
     def _register(
         self,
@@ -163,11 +177,47 @@ class Inkling2Experts(nn.Module):
 
     def _load_weight(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
         self._load_expert_shard(param, loaded)
-        param.data.copy_(shuffle_rows(param.data))
+        if not use_portable_experts():
+            param.data.copy_(shuffle_rows(param.data))
 
     def _load_block_scales(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
         self._load_expert_shard(param, loaded)
-        param.data.copy_(swizzle_block_scales(shuffle_rows(param.data)))
+        if not use_portable_experts():
+            param.data.copy_(swizzle_block_scales(shuffle_rows(param.data)))
+
+    def forward_portable(
+        self, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
+    ) -> torch.Tensor:
+        """This rank's experts on TokenSpeed's portable Triton kernels: each
+        token's local routes summed in fp32 slot order and rounded once to
+        bf16 (`[T, H]`, before the expert-parallel all-reduce), with the
+        routing weight applied inside the SwiGLU as on the SM10x path."""
+        from .ops.portable.block_scaled_moe import triton_block_scaled_moe_routes
+
+        amax13, den13 = self.scales("w13")
+        amax2, den2 = self.scales("w2")
+        rows = triton_block_scaled_moe_routes(
+            x,
+            self.w13_weight,
+            self.w13_weight_scale,
+            amax13,
+            den13,
+            self.w2_weight,
+            self.w2_weight_scale,
+            amax2,
+            den2,
+            weights,
+            ids,
+            formats=(self.quant_format, self.quant_format),
+            experts=self.num_global_experts,
+            expert_start=self.ep_rank * self.num_experts,
+            gate_cap=self.gate_cap,
+            up_cap=self.up_cap,
+            zero_remote_routes=False,
+            fold_slots=True,
+            fold_into=None,
+        )
+        return rows.view(x.shape[0], x.shape[1])
 
     @staticmethod
     def _load_full(param: nn.Parameter, loaded: torch.Tensor) -> None:
@@ -270,6 +320,26 @@ class Inkling2MoE(nn.Module):
             )
         x = x.contiguous()
         gate, experts = self.gate, self.experts
+        if experts.portable:
+            assert reduce and push is None, (
+                "the portable experts run without the fused all-reduce or "
+                "sequence parallelism (both need NVLink multicast)"
+            )
+            from .ops.portable.block_scaled_moe import triton_block_scaled_topk
+
+            # The router as TokenSpeed's reference: fp32 logits of the bf16
+            # projection, sigmoid + bias selection, log-space renormalization
+            # of the selected logits scaled by route_scale.
+            logits = x.float() @ gate.weight.float().t()
+            weights, ids = triton_block_scaled_topk(
+                logits.contiguous(),
+                gate.bias,
+                top_k=gate.topk,
+                route_scale=gate.route_scale,
+                dispatch=None,
+            )
+            out = experts.forward_portable(x, weights, ids)
+            return out if experts.ep_size == 1 else tensor_model_parallel_all_reduce(out)
         plan = experts.plan(x.shape[0])
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():

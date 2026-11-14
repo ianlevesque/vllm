@@ -62,6 +62,26 @@ def _multicast_memory(size: int, group: dist.ProcessGroup):
     )
 
 
+def _multicast_available(group: dist.ProcessGroup) -> bool:
+    """Whether every rank of `group` is an SM10x GPU with NVLink multicast.
+
+    SM12x (and any rank pair without an NVLink fabric, such as DGX Spark
+    nodes joined over RoCE) answers False without touching the multicast
+    APIs, and the callers fall back to NCCL collectives."""
+    if not has_flashinfer():
+        return False
+    from flashinfer.comm.mnnvl import (
+        TorchDistBackend,
+        all_ranks_agree,
+        is_multicast_supported,
+    )
+
+    device = torch.accelerator.current_device_index()
+    supported = torch.cuda.get_device_capability(device)[0] == 10
+    supported = supported and is_multicast_supported(device)
+    return all_ranks_agree(TorchDistBackend(group=group), supported)
+
+
 class Inkling2AllReduceWorkspace:
     """Multicast Lamport buffers and generation flags of the fused kernel."""
 
@@ -76,16 +96,7 @@ class Inkling2AllReduceWorkspace:
             or not has_flashinfer()
         ):
             return None
-        from flashinfer.comm.mnnvl import (
-            TorchDistBackend,
-            all_ranks_agree,
-            is_multicast_supported,
-        )
-
-        device = torch.accelerator.current_device_index()
-        supported = torch.cuda.get_device_capability(device)[0] == 10
-        supported = supported and is_multicast_supported(device)
-        if not all_ranks_agree(TorchDistBackend(group=group), supported):
+        if not _multicast_available(group):
             return None
         return cls(group, hidden_size)
 

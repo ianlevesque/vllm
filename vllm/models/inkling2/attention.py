@@ -54,6 +54,7 @@ from .ops.attention import (
     rel_decode_attention,
 )
 from .ops.linear import linear
+from .ops.portable.attention import portable_rel_attention, use_portable_attention
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 
@@ -139,6 +140,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         self.sliding_window = config.sliding_window_size
         self.rel_extent = config.sliding_window_size if is_local else config.rel_extent
         self.window_size = (config.sliding_window_size - 1, 0) if is_local else (-1, -1)
+        # SM12x: TokenSpeed's portable paged kernel (ops.portable.attention)
+        # instead of tml_fa4 and the tcgen05 decode/verify kernels.
+        self.portable = use_portable_attention()
         self.qk_clip = config.qk_l2_clip_threshold
         self.rel_clip = config.rel_l2_clip_threshold
         self.eps = config.rms_norm_eps
@@ -216,7 +220,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if prefix in forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         forward_context[prefix] = self
-        if vllm_config.kernel_config.enable_jit_warmup:
+        if vllm_config.kernel_config.enable_jit_warmup and not self.portable:
             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
 
     def process_weights_after_loading(self) -> None:
@@ -393,7 +397,35 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 decode_splits,
                 num_decodes,
             )
-        if num_decode_tokens < num_tokens:
+        if self.portable and num_decode_tokens < num_tokens:
+            # Off SM10x every request (prefill, decode and verify) runs the
+            # portable paged kernel; `_plan_decode` never splits off decodes.
+            assert num_decode_tokens == 0
+            if md is not None:
+                key_cache, value_cache = self._split_kv_cache()
+                out, lse = portable_rel_attention(
+                    clipped_q,
+                    rel_logits,
+                    key_cache,
+                    value_cache,
+                    md.block_table,
+                    md.query_start_loc,
+                    md.seq_lens,
+                    num_reqs=md.seq_lens.shape[0],
+                    max_query_len=md.max_query_len,
+                    max_seq_len=md.max_seq_len,
+                    num_actual_tokens=md.num_actual_tokens,
+                    extent=self.rel_extent,
+                    softmax_scale=self.scaling,
+                    window_left=self.window_size[0],
+                )
+            else:
+                out = q.new_zeros(
+                    (num_tokens, self.num_heads, self.head_dim), dtype=torch.float32
+                )
+                lse = q.new_zeros((num_tokens, self.num_heads), dtype=torch.float32)
+            gate_sink(out, gate, lse, sinks, output)
+        elif num_decode_tokens < num_tokens:
             out = q.new_empty(
                 (num_tokens - num_decode_tokens, self.num_heads, self.head_dim),
                 dtype=torch.float32,
@@ -434,6 +466,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         """Return `(num_decodes, num_decode_tokens, num_splits)` for
         `rel_decode_attention`: the whole batch, or in a mixed batch the
         leading decode/verify requests."""
+        if self.portable:
+            return 0, 0, 0
         num_reqs = md.seq_lens.shape[0]
         plan = partial(
             plan_decode_attention,

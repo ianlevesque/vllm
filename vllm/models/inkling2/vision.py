@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.models.inkling2.ops.vision import (
     apply_rotary_qk_,
     embed_tokens,
@@ -49,6 +50,27 @@ class VisionMetadata(NamedTuple):
     max_seqlen: int
 
 
+def _varlen_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Non-causal attention within each `cu_seqlens` segment of `(T, H, D)`
+    q/k/v, as one `flash_attn_varlen_func` launch computes it."""
+    out = torch.empty_like(q)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if end <= start:
+            continue
+        # (1, H, L, D) views for SDPA.
+        qs, ks, vs = (x[start:end].transpose(0, 1).unsqueeze(0) for x in (q, k, v))
+        o = F.scaled_dot_product_attention(qs, ks, vs, is_causal=False, scale=scale)
+        out[start:end] = o.squeeze(0).transpose(0, 1)
+    return out
+
+
 class Inkling2VisionAttention(nn.Module):
     def __init__(self, width: int, num_heads: int) -> None:
         super().__init__()
@@ -61,6 +83,11 @@ class Inkling2VisionAttention(nn.Module):
         qkv = self.qkv_proj(hidden)
         apply_rotary_qk_(qkv, metadata.meta, self.num_heads)
         q, k, v = qkv.view(-1, 3, self.num_heads, self.head_dim).unbind(1)
+        if not current_platform.is_device_capability_family(100):
+            # Off SM10x (tml_fa4 is unvalidated on SM12x): exact
+            # non-causal attention per image with torch SDPA.
+            out = _varlen_sdpa(q, k, v, metadata.cu_seqlens, self.head_dim**-0.5)
+            return self.out_proj(out.view(hidden.shape))
         out, _ = flash_attn_varlen_func(
             q,
             k,

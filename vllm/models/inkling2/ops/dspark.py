@@ -7,7 +7,34 @@ import torch.distributed as dist
 
 from vllm.triton_utils import tl, tldevice, triton
 
-from .allreduce import _multicast_memory
+from .allreduce import _multicast_available, _multicast_memory
+
+
+def _dspark_argmax_nccl(
+    base: torch.Tensor,
+    bias: torch.Tensor,
+    softcap: float,
+    valid: int,
+    offset: int,
+) -> torch.Tensor:
+    """`dspark_argmax` without NVLink multicast: the same softcapped bf16
+    logits (`add_softcap` is the arithmetic the CUDA kernel reproduces),
+    each rank's first argmax (NaN as -inf) of its `valid` columns, then the
+    all-gathered pairs merged to the largest value at the lowest global
+    index."""
+    from vllm.distributed import get_tp_group
+
+    logits = add_softcap(base, bias, softcap)[:, :valid].float()
+    logits = logits.nan_to_num(nan=float("-inf"), posinf=float("inf"))
+    value, index = logits.max(dim=1)
+    pairs = torch.stack([value, (index + offset).to(torch.float32)], dim=0)
+    # Global indices stay below 2**24 (checked by the CUDA kernel's caller
+    # contract), so they round-trip through fp32 exactly.
+    gathered = get_tp_group().all_gather(pairs.unsqueeze(0), dim=0)
+    values, indices = gathered[:, 0], gathered[:, 1]
+    best = values.max(dim=0, keepdim=True).values
+    candidates = torch.where(values == best, indices, float("inf"))
+    return candidates.min(dim=0).values.to(torch.int64)
 
 
 @triton.jit
@@ -268,7 +295,13 @@ class Inkling2DSparkArgmax:
         num_blocks = triton.cdiv(num_cols, 1024)
         num_bytes = 2 * max_rows * self.world_size * num_blocks * 8
         device = torch.accelerator.current_device_index()
-        if self.world_size == 1:
+        # Without NVLink multicast (SM12x, or ranks on separate nodes) the
+        # ranks' (max, index) pairs are all-gathered through NCCL instead.
+        self.use_nccl = self.world_size > 1 and not _multicast_available(group)
+        if self.use_nccl:
+            self.buffer = None
+            self.multicast_ptr = self.local_ptr = 0
+        elif self.world_size == 1:
             self.buffer = torch.full((num_bytes // 4,), -0.0, device=device)
             self.multicast_ptr = self.local_ptr = self.buffer.data_ptr()
         else:
@@ -297,6 +330,8 @@ def dspark_argmax(
     softcap)[:, :valid]` (its vocabulary shard at `offset`), gathered."""
     assert base.dtype == bias.dtype == torch.bfloat16 and base.shape == bias.shape
     assert base.shape[1] == workspace.num_cols
+    if workspace.use_nccl:
+        return _dspark_argmax_nccl(base, bias, softcap, valid, offset)
     out = torch.empty(base.shape[0], dtype=torch.int64, device=base.device)
     torch.ops._C.inkling2_dspark_argmax(
         base,
