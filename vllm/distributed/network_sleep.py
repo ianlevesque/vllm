@@ -62,8 +62,8 @@ def check_network_sleep(worker: Any) -> dict[str, Any]:
         is_symmetric_memory_enabled,
     )
 
-    if not worker.use_v2_model_runner:
-        raise RuntimeError("Network sleep requires the V2 model runner")
+    # The V2 model runner is the only runner since upstream removed V1
+    # (vllm-project/vllm#63373), along with `Worker.use_v2_model_runner`.
     if os.environ.get("NCCL_NET") != "IB":
         raise RuntimeError("Network sleep requires the configured IB/RoCE transport")
     if os.environ.get("NCCL_IB_RELEASE_ON_FINALIZE") != "1":
