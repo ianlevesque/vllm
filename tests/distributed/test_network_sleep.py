@@ -212,7 +212,7 @@ def test_failed_nccl_destroy_does_not_advertise_closed_transport(context):
 
 @pytest.mark.parametrize(
     "unsupported",
-    ["empty", "symm", "custom", "v1", "socket", "retained-contexts", "stateless"],
+    ["empty", "symm", "custom", "socket", "retained-contexts", "stateless"],
 )
 def test_preflight_rejects_unsupported_transport_before_mutation(
     context, monkeypatch, unsupported
@@ -220,7 +220,6 @@ def test_preflight_rejects_unsupported_transport_before_mutation(
     module, ps, allocator = context
     group = put(ps)
     worker = SimpleNamespace(
-        use_v2_model_runner=True,
         rank=0,
         vllm_config=SimpleNamespace(
             kv_transfer_config=None,
@@ -234,8 +233,6 @@ def test_preflight_rejects_unsupported_transport_before_mutation(
         allocator.is_symmetric_memory_enabled = lambda: True
     elif unsupported == "custom":
         group.device_communicator = SimpleNamespace(ca_comm=object())
-    elif unsupported == "v1":
-        worker.use_v2_model_runner = False
     elif unsupported == "socket":
         monkeypatch.setenv("NCCL_NET", "Socket")
     elif unsupported == "retained-contexts":
@@ -250,6 +247,26 @@ def test_preflight_rejects_unsupported_transport_before_mutation(
     with pytest.raises(RuntimeError):
         module.check_network_sleep(worker)
     assert not ps.events
+
+
+def test_preflight_accepts_a_worker_without_the_removed_runner_flag(context):
+    # Upstream removed Model Runner V1 and `Worker.use_v2_model_runner`
+    # (vllm-project/vllm#63373); reading it failed every transport sleep with
+    # AttributeError ('Worker' object has no attribute 'use_v2_model_runner').
+    module, ps, _ = context
+    group = put(ps)  # held: put() registers a weak reference
+    worker = SimpleNamespace(
+        rank=0,
+        vllm_config=SimpleNamespace(
+            kv_transfer_config=None,
+            ec_transfer_config=None,
+            parallel_config=SimpleNamespace(use_ubatching=False),
+        ),
+    )
+    assert not hasattr(worker, "use_v2_model_runner")
+    assert module.check_network_sleep(worker) == {"groups": ["tp:0"], "rank": 0}
+    assert not ps.events
+    assert ps._groups["tp:0"]() is group
 
 
 def core_method(name):
