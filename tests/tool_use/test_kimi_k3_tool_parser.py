@@ -548,6 +548,112 @@ def test_delegating_parser_tool_choice_none_strips_xtml_and_suppresses_calls():
     assert all(not message.tool_calls for message in messages)
 
 
+# The chat template ends a thinking-mode prompt with the think opener, so the
+# output starts inside the think channel.
+PREFILLED_THINK_PROMPT = [99, 1, 2, 3]
+MESSAGE_CLOSE = f"{CLOSE}message{SEP}"
+
+
+def _token_stream(text: str) -> list[tuple[str, int]]:
+    """Split *text* into (piece, token id) pairs matching `DummyTokenizer`."""
+    pieces: list[tuple[str, int]] = []
+    i = 0
+    while i < len(text):
+        if text.startswith(THINK_OPEN, i):
+            pieces += [(OPEN, 1), ("think", 2), (SEP, 3)]
+            i += len(THINK_OPEN)
+        elif text.startswith(THINK_CLOSE, i):
+            pieces += [(CLOSE, 4), ("think", 2), (SEP, 3)]
+            i += len(THINK_CLOSE)
+        else:
+            pieces.append((text[i], ord(text[i])))
+            i += 1
+    return pieces
+
+
+def _stream_delegating(
+    output: str, request: ChatCompletionRequest, tokens_per_step: int
+) -> list[DeltaMessage]:
+    parser = KimiK3DelegatingParser(_dummy_tokenizer())
+    pieces = _token_stream(output)
+    messages: list[DeltaMessage] = []
+    for start in range(0, len(pieces), tokens_per_step):
+        step = pieces[start : start + tokens_per_step]
+        delta = parser.parse_delta(
+            delta_text="".join(piece for piece, _ in step),
+            delta_token_ids=[token_id for _, token_id in step],
+            request=request,
+            prompt_token_ids=PREFILLED_THINK_PROMPT,
+            finished=start + tokens_per_step >= len(pieces),
+        )
+        if delta is not None:
+            messages.append(delta)
+    return messages
+
+
+def _weather_call(index: int, units: str) -> str:
+    return _call(
+        "get_weather",
+        index,
+        _arg("city", "string", "Paris"),
+        _arg("units", "string", units),
+    )
+
+
+@pytest.mark.parametrize("tokens_per_step", [1, 2, 3, 5, 4096])
+@pytest.mark.parametrize("with_tools", [False, True], ids=["no-tools", "tools"])
+def test_streaming_response_only_reply_is_content(tokens_per_step, with_tools):
+    # Thinking on, but the model skipped the think channel and answered
+    # directly: the reply must stream as content, as the non-streaming path
+    # returns it, not as reasoning.
+    output = _response("122") + MESSAGE_CLOSE
+    request = (
+        _request()
+        if with_tools
+        else ChatCompletionRequest(model="test-model", messages=[])
+    )
+
+    messages = _stream_delegating(output, request, tokens_per_step)
+
+    assert "".join(message.reasoning or "" for message in messages) == ""
+    assert "".join(message.content or "" for message in messages) == "122"
+    reasoning, content, _ = KimiK3DelegatingParser(_dummy_tokenizer()).parse(
+        output, request, enable_auto_tools=True
+    )
+    assert reasoning is None
+    assert content == "122"
+
+
+@pytest.mark.parametrize("tokens_per_step", [1, 2, 3, 5, 4096])
+@pytest.mark.parametrize("think", [False, True], ids=["response-only", "thinking"])
+def test_streaming_parallel_tool_calls_keep_separate_indices(tokens_per_step, think):
+    output = (
+        (f"weather twice{THINK_CLOSE}" if think else "")
+        + _response("Checking.")
+        + _tools(_weather_call(1, "celsius"), _weather_call(2, "fahrenheit"))
+        + MESSAGE_CLOSE
+    )
+    request = _request()
+
+    messages = _stream_delegating(output, request, tokens_per_step)
+
+    expected_reasoning = "weather twice" if think else ""
+    assert "".join(m.reasoning or "" for m in messages) == expected_reasoning
+    assert "".join(m.content or "" for m in messages) == "Checking."
+    calls = [call for m in messages for call in (m.tool_calls or [])]
+    assert [call.index for call in calls] == [0, 1]
+    assert len({call.id for call in calls}) == 2
+    arguments = []
+    for call in calls:
+        assert call.function is not None
+        assert call.function.name == "get_weather"
+        arguments.append(json.loads(call.function.arguments))
+    assert arguments == [
+        {"city": "Paris", "units": "celsius"},
+        {"city": "Paris", "units": "fahrenheit"},
+    ]
+
+
 @pytest.mark.parametrize(
     "req",
     [
