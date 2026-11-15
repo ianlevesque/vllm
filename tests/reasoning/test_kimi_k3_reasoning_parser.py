@@ -520,10 +520,6 @@ def test_is_reasoning_end_streaming_response_open_straddling_steps():
     assert parser.is_reasoning_end_streaming(full, RESP_OPEN_IDS[2:])
 
 
-RESPONSE_CLOSE = f"◁/response{SEP}"
-MESSAGE_CLOSE = f"◁/message{SEP}"
-
-
 def test_end_detection_agrees_with_extraction_on_same_bytes():
     """vllm/reasoning/AGENTS.md asks for this agreement: whatever the gate
     calls reasoning-end must be what extraction calls the content boundary,
