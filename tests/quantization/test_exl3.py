@@ -114,3 +114,93 @@ def test_activation_spec_uses_fp16_rotations_with_bf16_io():
         "io_dtype": torch.bfloat16,
         "rotation_dtype": torch.float16,
     }
+
+
+GLM_STOCK_FP8 = {
+    "quant_method": "fp8",
+    "fmt": "e4m3",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [128, 128],
+    "modules_to_not_convert": ["lm_head", "model.layers.3.mlp.gate"],
+}
+
+
+def test_dense_native_wraps_stock_block_fp8():
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    cfg = Exl3Config.from_config(
+        {
+            "quant_method": "exl3",
+            "exl3": {"codec": "EXL3_K2_LUT_E4M3"},
+            "dense_native": True,
+            "dense_quantization_config": GLM_STOCK_FP8,
+        }
+    )
+    native = cfg._dense_native
+    assert isinstance(native, Fp8Config)
+    assert native.weight_block_size == [128, 128]
+    assert native.is_checkpoint_fp8_serialized
+    assert native.ignored_layers == ["lm_head", "model.layers.3.mlp.gate"]
+    assert cfg.dense_fp8 is False
+    # dense_quantization_config alone (K3 conversions) changes nothing.
+    k3 = Exl3Config.from_config(
+        {"exl3": {}, "dense_quantization_config": GLM_STOCK_FP8}
+    )
+    assert k3._dense_native is None
+
+
+def test_dense_native_validation():
+    with pytest.raises(ValueError, match="dense_quantization_config"):
+        Exl3Config.from_config({"exl3": {}, "dense_native": True})
+    with pytest.raises(ValueError, match="quant_method"):
+        Exl3Config.from_config(
+            {
+                "dense_native": True,
+                "dense_quantization_config": {**GLM_STOCK_FP8, "quant_method": "mxfp4"},
+            }
+        )
+    with pytest.raises(ValueError, match="block-FP8"):
+        Exl3Config.from_config(
+            {
+                "dense_native": True,
+                "dense_quantization_config": {
+                    k: v for k, v in GLM_STOCK_FP8.items() if k != "weight_block_size"
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Exl3Config.from_config(
+            {
+                "dense_native": True,
+                "dense_quantization_config": GLM_STOCK_FP8,
+                "dense_fp8": {"scheme": "per_tensor_e4m3"},
+            }
+        )
+    with pytest.raises(ValueError, match="bool"):
+        Exl3Config.from_config({"dense_native": "yes"})
+
+
+def test_dense_native_delegates_linear_layers():
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    cfg = Exl3Config.from_config(
+        {"dense_native": True, "dense_quantization_config": GLM_STOCK_FP8}
+    )
+    calls = []
+
+    class Recorder(Fp8Config):
+        def get_quant_method(self, layer, prefix):
+            calls.append((prefix, dict(self.packed_modules_mapping)))
+            return "delegated"
+
+    recorder = Recorder.from_config(GLM_STOCK_FP8)
+    cfg._dense_native = recorder
+    cfg.packed_modules_mapping = {"fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]}
+    layer = torch.nn.Module()
+    assert cfg.get_quant_method(layer, "model.layers.0.self_attn.o_proj") == "delegated"
+    assert calls == [
+        (
+            "model.layers.0.self_attn.o_proj",
+            {"fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]},
+        )
+    ]

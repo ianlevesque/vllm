@@ -11,6 +11,12 @@ planned B12X trellis API.  Adapted from local-inference-lab's
 ``feat/kk-kimi-exl3-experts`` loader (6b9c5d23e), retargeted to the
 renamed TrellisSource API and to checkpoints whose dense sea was never
 quantized (no intermediate Hadamard, equal slot extents).
+
+A checkpoint converted from a natively block-FP8 source (GLM-5.3) keeps
+its dense sea byte-identical and declares ``dense_native: true`` with the
+stock ``quantization_config`` under ``dense_quantization_config``; every
+non-routed layer is then served by that stock FP8 config exactly as the
+unconverted checkpoint would be.
 """
 
 import re
@@ -130,6 +136,28 @@ def dense_fp8_applies(
     return not any(part in prefix for part in _DENSE_FP8_EXCLUDE)
 
 
+def native_dense_config(config: Any) -> Fp8Config:
+    """The stock block-FP8 config an EXL3 conversion preserved verbatim."""
+    if not isinstance(config, dict):
+        raise ValueError(
+            "EXL3 dense_native requires the stock quantization_config under "
+            "dense_quantization_config"
+        )
+    if config.get("quant_method") != "fp8":
+        raise ValueError(
+            "EXL3 dense_native supports stock quant_method 'fp8', got "
+            f"{config.get('quant_method')!r}"
+        )
+    if config.get("activation_scheme") != "dynamic":
+        raise ValueError(
+            "EXL3 dense_native requires dynamic FP8 activations, got "
+            f"{config.get('activation_scheme')!r}"
+        )
+    if config.get("weight_block_size") is None:
+        raise ValueError("EXL3 dense_native requires block-FP8 weights")
+    return Fp8Config.from_config(config)
+
+
 class Exl3Config(QuantizationConfig):
     """EXL3 routed experts; dense layers BF16 or per-tensor FP8."""
 
@@ -138,11 +166,17 @@ class Exl3Config(QuantizationConfig):
         manifest: str = EXL3_MANIFEST_FILENAME,
         dense_fp8: bool = False,
         dense_fp8_scope: str = DENSE_FP8_SCOPE_ALL,
+        dense_native: Fp8Config | None = None,
     ) -> None:
         super().__init__()
+        if dense_native is not None and dense_fp8:
+            raise ValueError(
+                "EXL3 dense_native and dense_fp8 are mutually exclusive"
+            )
         self.manifest = manifest
         self.dense_fp8 = dense_fp8
         self.dense_fp8_scope = dense_fp8_scope
+        self._dense_native = dense_native
         self._fp8_config = (
             Fp8Config(
                 is_checkpoint_fp8_serialized=True,
@@ -156,7 +190,8 @@ class Exl3Config(QuantizationConfig):
         return (
             f"Exl3Config(manifest={self.manifest!r}, "
             f"dense_fp8={self.dense_fp8!r}, "
-            f"dense_fp8_scope={self.dense_fp8_scope!r})"
+            f"dense_fp8_scope={self.dense_fp8_scope!r}, "
+            f"dense_native={self._dense_native is not None!r})"
         )
 
     @classmethod
@@ -192,7 +227,21 @@ class Exl3Config(QuantizationConfig):
         codec = exl3.get("codec")
         if codec is not None and codec != EXL3_CODEC:
             raise ValueError(f"unsupported EXL3 codec {codec!r}")
+        dense_native = config.get("dense_native", False)
+        if not isinstance(dense_native, bool):
+            raise ValueError("EXL3 quantization_config.dense_native must be a bool")
         dense_fp8 = config.get("dense_fp8")
+        if dense_native:
+            if dense_fp8 is not None:
+                raise ValueError(
+                    "EXL3 dense_native and dense_fp8 are mutually exclusive"
+                )
+            return cls(
+                manifest=manifest,
+                dense_native=native_dense_config(
+                    config.get("dense_quantization_config")
+                ),
+            )
         if dense_fp8 is None:
             return cls(manifest=manifest)
         if not isinstance(dense_fp8, dict) or dense_fp8.get(
@@ -215,6 +264,14 @@ class Exl3Config(QuantizationConfig):
     ) -> QuantizeMethodBase | None:
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(layer.moe_config)
+        if isinstance(layer, ParallelLMHead):
+            return UnquantizedLinearMethod()
+        if self._dense_native is not None:
+            # The model loader installs the packed-module mapping on the
+            # top-level config only; the stock config needs it to match
+            # fused projections against its ignore list.
+            self._dense_native.packed_modules_mapping = self.packed_modules_mapping
+            return self._dense_native.get_quant_method(layer, prefix)
         if isinstance(layer, LinearBase):
             if self.dense_fp8 and dense_fp8_applies(
                 prefix, layer.input_size, layer.output_size, self.dense_fp8_scope
@@ -225,6 +282,10 @@ class Exl3Config(QuantizationConfig):
         if isinstance(layer, ParallelLMHead):
             return UnquantizedLinearMethod()
         return None
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper) -> None:
+        if self._dense_native is not None:
+            self._dense_native.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def get_scaled_act_names(self) -> list[str]:
         return []
@@ -442,5 +503,6 @@ __all__ = [
     "Exl3Config",
     "Exl3MoEMethod",
     "dense_fp8_applies",
+    "native_dense_config",
     "plan_exl3_extent",
 ]
